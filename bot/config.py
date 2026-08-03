@@ -181,13 +181,15 @@ class Config:
     # capture is adjacent.
     thrust_enabled: bool = True
     thrust_min_turn: int = 80
-    # Found by comparing our decisions to rank-1 Kubic's on identical
-    # positions: the thrust is our best-agreeing mode (36% vs expand's 23%),
-    # so it should own more of the game. Lowering the bar from 20/0.10 to
-    # 8/0.04 raises its share of midgame decisions from 45% to 60% and is
-    # worth +99 elo against the previous build over 1200 games.
-    thrust_min_army: int = 8           # stack must be worth committing
-    thrust_army_ratio: float = 0.04    # ...and be a real share of our army
+    # 20/0.10, NOT the 8/0.04 that local measurement asked for. Lowering it
+    # scored +99 elo in self-play over 1200 games with SPRT, and 0.977 against
+    # hunter:3 versus 0.960 — two agreeing instruments — and then lost 241 elo on
+    # the ladder (1737 -> 1496, 3.6 sigma), including losses to the Hunter
+    # baseline we beat 0.977 locally. A small stack driven deep is free against
+    # every opponent we can build and is eaten by real ones. Do not lower this
+    # on local evidence.
+    thrust_min_army: int = 20          # stack must be worth committing
+    thrust_army_ratio: float = 0.10    # ...and be a real share of our army
     # Before a fist exists, make one: route army to a rally tile on the front
     # instead of nibbling. This is the other half of the Kubic shape - the
     # idle turns are not wasted, they are the fist being built.
