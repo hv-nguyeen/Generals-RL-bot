@@ -1,0 +1,234 @@
+"""Rule and belief tests.
+
+Runs under pytest, or standalone: `python -m tests.test_all`.
+
+The engine-fidelity question is answered by `tools/verify_engine.py`, which
+diffs the whole simulator against the official JAX implementation. These tests
+cover the things that module cannot: the *derived* rules the policy reasons
+with, and the inferences the belief state makes.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+from bot import rules
+from bot.belief import Belief
+from bot.board import bfs_field_from, room_field
+from sim import engine, mapgen
+
+
+def _blank(h=7, w=7):
+    grid = np.zeros((h, w), dtype=np.int32)
+    grid[0, 0] = 1
+    grid[h - 1, w - 1] = 2
+    return grid
+
+
+# --- castle pricing -----------------------------------------------------------
+def test_build_cost_is_flat_far_from_own_structures():
+    structures = np.zeros((15, 15), dtype=bool)
+    structures[7, 7] = True
+    cost = rules.build_cost_grid(structures)
+    assert cost[7, 7] == 35 + 14                       # on top of it: +14
+    assert cost[7, 8] == 35 + 12                       # adjacent: +12
+    assert cost[7, 13] == 35 + 2                       # manhattan 6: +2
+    assert cost[7, 14] == 35                           # manhattan 7: flat
+    assert cost[0, 0] == 35
+
+
+def test_build_cost_stacks_over_structures():
+    structures = np.zeros((15, 15), dtype=bool)
+    structures[7, 7] = True
+    structures[7, 9] = True
+    cost = rules.build_cost_grid(structures)
+    # distance 1 from one, distance 1 from the other
+    assert cost[7, 8] == 35 + 12 + 12
+
+
+# --- growth phase -------------------------------------------------------------
+def test_structures_grow_on_even_ticks_only():
+    grid = _blank()
+    st = engine.from_grid(grid)
+    seen = []
+    for _ in range(6):
+        engine.step(st, [1, 0, 0, 0, 0], [1, 0, 0, 0, 0])
+        seen.append(int(st.armies[0, 0]))
+    # spawns with 1; +1 at ticks 2, 4, 6
+    assert seen == [1, 2, 2, 3, 3, 4], seen
+
+
+def test_every_tile_grows_on_the_fiftieth_tick():
+    grid = _blank()
+    st = engine.from_grid(grid)
+    st.own[0][1, 1] = True
+    st.neutral[1, 1] = False
+    st.time = 48
+    engine.step(st, [1, 0, 0, 0, 0], [1, 0, 0, 0, 0])   # -> 49, nothing
+    assert int(st.armies[1, 1]) == 0
+    engine.step(st, [1, 0, 0, 0, 0], [1, 0, 0, 0, 0])   # -> 50, all tiles +1
+    assert int(st.armies[1, 1]) == 1
+
+
+# --- combat and move order ----------------------------------------------------
+def test_ties_favour_the_defender():
+    grid = _blank()
+    st = engine.from_grid(grid)
+    st.armies[0, 0] = 4          # moves 3
+    st.own[0][1, 0] = True       # not adjacent to the fight, keeps it simple
+    st.neutral[1, 0] = False
+    st.armies[0, 1] = 3          # neutral tile holding 3
+    engine.step(st, [0, 0, 0, 3, 0], [1, 0, 0, 0, 0])
+    assert not st.own[0][0, 1], "3 vs 3 must not capture"
+    assert int(st.armies[0, 1]) == 0
+
+
+def test_bigger_army_resolves_second_and_holds_the_tile():
+    """chasing > reinforcing > smaller-army-first: the big stack moves last."""
+    grid = np.zeros((5, 5), dtype=np.int32)
+    grid[0, 0] = 1
+    grid[4, 4] = 2
+    st = engine.from_grid(grid)
+    for cell, player, army in (((2, 1), 0, 10), ((2, 3), 1, 4)):
+        st.own[player][cell] = True
+        st.neutral[cell] = False
+        st.armies[cell] = army
+    # both move onto (2, 2)
+    engine.step(st, [0, 2, 1, 3, 0], [0, 2, 3, 2, 0])
+    assert st.own[0][2, 2], "player 0 had the bigger army and should hold the cell"
+
+
+# --- deathtouch ---------------------------------------------------------------
+def _two_player_board():
+    grid = np.zeros((9, 9), dtype=np.int32)
+    grid[0, 0] = 1
+    grid[8, 8] = 2
+    return engine.from_grid(grid)
+
+
+def test_deathtouch_ignores_army_after_turn_800():
+    st = _two_player_board()
+    st.time = rules.DEATHTOUCH_TURN
+    st.armies[8, 8] = 9999
+    st.own[0][8, 7] = True
+    st.neutral[8, 7] = False
+    st.armies[8, 7] = 2                       # moves 1 unit onto a 9999 general
+    done = engine.step(st, [0, 8, 7, 3, 0], [1, 0, 0, 0, 0])
+    assert done and st.winner == 0
+
+
+def test_before_turn_800_the_same_move_just_bounces():
+    st = _two_player_board()
+    st.time = rules.DEATHTOUCH_TURN - 50
+    st.armies[8, 8] = 9999
+    st.own[0][8, 7] = True
+    st.neutral[8, 7] = False
+    st.armies[8, 7] = 2
+    done = engine.step(st, [0, 8, 7, 3, 0], [1, 0, 0, 0, 0])
+    assert not done and st.winner == -1
+
+
+def test_chase_defence_beats_a_touch():
+    """Taking the attacker's source cell first cancels the touch."""
+    st = _two_player_board()
+    st.time = rules.DEATHTOUCH_TURN
+    for cell, player, army in (((8, 7), 0, 2), ((7, 7), 1, 20)):
+        st.own[player][cell] = True
+        st.neutral[cell] = False
+        st.armies[cell] = army
+    # p0 touches (8,7)->(8,8); p1 chases (7,7)->(8,7), which resolves first
+    done = engine.step(st, [0, 8, 7, 3, 0], [0, 7, 7, 1, 0])
+    assert st.winner != 0, "the chase should have taken the source before the touch"
+    assert not done or st.winner == 1
+
+
+def test_mutual_capture_is_a_draw():
+    st = _two_player_board()
+    st.time = rules.DEATHTOUCH_TURN
+    for cell, player in (((8, 7), 0), ((0, 1), 1)):
+        st.own[player][cell] = True
+        st.neutral[cell] = False
+        st.armies[cell] = 5
+    done = engine.step(st, [0, 8, 7, 3, 0], [0, 0, 1, 2, 0])
+    assert done and st.winner == -1
+
+
+# --- fog ----------------------------------------------------------------------
+def test_vision_is_the_full_3x3_around_owned_tiles():
+    st = _two_player_board()
+    obs = engine.observe(st, 0)
+    visible = (obs.type_grid >= rules.T_PLAIN) & (obs.type_grid <= rules.T_GENERAL)
+    assert visible[:2, :2].all()
+    assert not visible[2, 2]
+    assert int(visible.sum()) == 4          # corner general sees a 2x2
+
+
+# --- belief -------------------------------------------------------------------
+def test_terrain_is_fully_known_on_the_first_frame():
+    for seed in range(12):
+        grid = mapgen.generate(seed)
+        st = engine.from_grid(grid)
+        b = Belief(0, *grid.shape)
+        b.update(engine.observe(st, 0))
+        assert np.array_equal(b.mountains, grid == -2), f"seed {seed}"
+
+
+def test_enemy_general_prior_contains_the_truth():
+    """The generator's own spawn constraints, run in reverse."""
+    hits = 0
+    sizes = []
+    for seed in range(25):
+        grid = mapgen.generate(seed)
+        st = engine.from_grid(grid)
+        b = Belief(0, *grid.shape)
+        b.update(engine.observe(st, 0))
+        sizes.append(int(b.candidates.sum()))
+        if b.candidates[st.gpos[1]]:
+            hits += 1
+    assert hits == 25, f"prior missed the general in {25 - hits} boards"
+    mean = sum(sizes) / len(sizes)
+    passable = 18 * 18 * 0.75
+    assert mean < passable / 3, f"prior is not narrowing anything (mean {mean:.0f})"
+
+
+def test_a_new_structure_in_fog_is_read_as_an_enemy_castle():
+    grid = mapgen.generate(3)
+    st = engine.from_grid(grid)
+    b = Belief(0, *grid.shape)
+    b.update(engine.observe(st, 0))
+    assert not b.enemy_castles.any()
+
+    # opponent builds far away, out of our sight
+    r, c = st.gpos[1]
+    st.castles[r, c - 1 if c else c + 1] = True
+    b.update(engine.observe(st, 0))
+    assert b.enemy_castles.sum() == 1
+
+
+def test_room_field_matches_a_direct_count():
+    grid = mapgen.generate(5)
+    passable = grid != -2
+    room = room_field(passable, 7)
+    for cell in [(0, 0), (5, 5), (10, 9)]:
+        if not passable[cell]:
+            continue
+        d = bfs_field_from(passable, cell)
+        assert room[cell] == int(((d <= 7) & passable).sum()) - 1
+
+
+def main() -> None:
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    failed = 0
+    for t in tests:
+        try:
+            t()
+            print(f"  ok   {t.__name__}")
+        except AssertionError as e:
+            failed += 1
+            print(f"  FAIL {t.__name__}: {e}")
+    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+    raise SystemExit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()

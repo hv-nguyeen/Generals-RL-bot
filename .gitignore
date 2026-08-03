@@ -1,0 +1,7 @@
+.venv/
+dist/
+runs/
+__pycache__/
+*.pyc
+.DS_Store
+third_party/generals-bots/**/__pycache__/
