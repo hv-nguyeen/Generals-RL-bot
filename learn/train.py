@@ -135,7 +135,11 @@ def main() -> None:
     def accuracy(p, xb, yb):
         return jnp.mean(jnp.argmax(forward(p, xb), axis=1) == yb)
 
+    def save(p_, path):
+        np.savez_compressed(path, **{k: np.asarray(v_) for k, v_ in p_.items()})
+
     t = 0
+    best = -1.0
     for epoch in range(args.epochs):
         started, running, nb = time.time(), 0.0, 0
         for sp in rng.permutation(len(train_shards)):
@@ -153,15 +157,21 @@ def main() -> None:
         accs = [float(accuracy(params, jnp.asarray(xv[i:i + 1024]),
                                jnp.asarray(yv[i:i + 1024])))
                 for i in range(0, len(yv), 1024)]
+        val = float(np.mean(accs))
+        # Validation accuracy peaks and then falls; keep the best weights rather
+        # than whatever the last epoch happened to leave behind.
+        marker = ""
+        if val > best:
+            best, marker = val, "  <- kept"
+            save(params, args.out)
         print(f"epoch {epoch}  loss {running / max(nb, 1):.4f}  "
-              f"val top-1 {np.mean(accs):.3f}  {time.time() - started:.0f}s", flush=True)
+              f"val top-1 {val:.3f}  {time.time() - started:.0f}s{marker}", flush=True)
 
     out = Path(args.out)
-    np.savez_compressed(out, **{k: np.asarray(v_) for k, v_ in params.items()})
     (out.with_suffix(".json")).write_text(json.dumps(
-        {"shards": len(shards), "epochs": args.epochs,
+        {"shards": len(shards), "epochs": args.epochs, "best_val_top1": best,
          "channels": CHANNELS, "layers": LAYERS}, indent=2))
-    print(f"\nwrote {out}")
+    print(f"\nwrote {out} (best val top-1 {best:.3f})")
     print("Use it as a sparring partner:")
     print(f"  python -m arena.runner --a ours --b clone:{out} --games 200 --workers 32")
 
