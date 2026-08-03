@@ -98,6 +98,16 @@ class Config:
     # troops on the general and a 30-stack two tiles away.
     lock_enabled: bool = True
     lock_radius: int = 6
+    # Narrow version of the same idea, and the one that is actually on. The old
+    # lock blocked the general whenever anything was within lock_radius 6, which
+    # is most of the midgame, and cost 265 elo. Real losses instead look like
+    # this: general reinforced 10 -> 49, then the SCORER marches all 49 out on
+    # the next turn with a 47-army stack adjacent, and we die three ticks later.
+    # The thrust was stopped from doing that; the scorer was not. Block the
+    # general as a move source only when something close is genuinely comparable
+    # to the garrison.
+    general_block_radius: int = 3
+    general_block_ratio: float = 0.5
 
     # ---- castle economy ----------------------------------------------------
     # A castle is +0.5 army/turn forever for one turn of investment; expanding

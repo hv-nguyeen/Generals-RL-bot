@@ -473,6 +473,14 @@ class Controller:
         # reported every turn, so the floor can track the force that actually
         # exists rather than the part we happen to see. Committing modes ignore
         # it — at that point the game is decided by the attack, not the base.
+        # Hard block, not a weight: with 50 army on the general the army bonus
+        # is +5.9 and from_general is -2.0, so no reasonable weight wins that
+        # argument.
+        block_general = False
+        if mode not in (ATTACK, DEATHTOUCH) and cfg.general_block_radius > 0:
+            near = an.max_threat_within(cfg.general_block_radius)
+            block_general = near >= cfg.general_block_ratio * max(ar[gr][gc], 1)
+
         floor = 0
         if mode not in (ATTACK, DEATHTOUCH):
             if cfg.garrison_frac > 0 and obs.turn >= cfg.garrison_from_turn:
@@ -491,7 +499,7 @@ class Controller:
         for si in range(len(sources)):
             r = int(sources[si][0])
             c = int(sources[si][1])
-            if hold_general and r == gr and c == gc:
+            if (hold_general or block_general) and r == gr and c == gc:
                 continue
             army = ar[r][c]
             f_src = fld[r][c]
