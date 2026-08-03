@@ -104,8 +104,14 @@ class Config:
     castle_safe_dist: int = 7          # min steps from the nearest seen enemy tile
     castle_keep: int = 2               # army left standing on a fresh castle
     # Only start walking army to a build site once we own this much army in
-    # total — before that the tiles are better spent expanding.
-    castle_gather_min_army: int = 75
+    # total. This is the single highest-leverage number in the file. At 75 the
+    # condition is true almost every turn after turn 100, so GATHER took 72% of
+    # the midgame and captured a tile on 6% of those turns, while EXPAND
+    # captures on 80%. Raising it makes castles essentially opportunistic —
+    # built when a stack already stands on a legal site — and recovered ~30 land
+    # by turn 200 and +160 Elo against hunter. Do not lower it without rerunning
+    # `python -m analysis.expansion ours`.
+    castle_gather_min_army: int = 400
 
     # ---- defence -----------------------------------------------------------
     # Switch to DEFEND when a visible enemy stack out-races everything we could
