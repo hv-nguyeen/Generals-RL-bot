@@ -164,6 +164,28 @@ class Config:
     # by default: giving up a turn is almost always worse than a bad move.
     pass_score: float = -1e6
 
+    # ---- thrust: depth-first penetration -----------------------------------
+    # EXPAND walks toward the NEAREST free tile, which spreads us thin - breadth
+    # first. Rank-1 Kubic does the opposite: 0.39 capture rate, 117 idle turns
+    # and a 47-army stack, i.e. it stops nibbling and drives one fist deep. A
+    # thrust commits a single stack to a single deep target and holds that
+    # commitment across turns; the scored move generator cannot, because it
+    # re-picks a source every turn and the big stack gets distracted by whatever
+    # capture is adjacent.
+    thrust_enabled: bool = True
+    thrust_min_turn: int = 80
+    thrust_min_army: int = 20          # stack must be worth committing
+    thrust_army_ratio: float = 0.10    # ...and be a real share of our army
+    # Before a fist exists, make one: route army to a rally tile on the front
+    # instead of nibbling. This is the other half of the Kubic shape - the
+    # idle turns are not wasted, they are the fist being built.
+    # Measured: routing army to a rally tile via GATHER is catastrophic
+    # (0.230, -210 elo). GATHER captures on 9% of its turns; thrust captures
+    # on 52%. The fist has to come from expansion, not from a massing phase.
+    mass_enabled: bool = False
+    mass_min_army: int = 60            # total army before massing is worth it
+    thrust_abort_army: int = 8         # give up when the fist is spent
+
     # ---- endgame -----------------------------------------------------------
     deathtouch_prep_turn: int = 730    # start walking a unit at the enemy general
     deathtouch_guard_turn: int = 770   # start clearing our own general's approach

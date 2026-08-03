@@ -39,6 +39,8 @@ class Controller:
         self.belief = Belief(player_id, h, w)
         self.H, self.W = h, w
         self._defend_until = -1
+        self.thrust: dict | None = None
+        self.rally: tuple[int, int] | None = None
         self.last_debug: dict = {}
 
     # ------------------------------------------------------------------ act
@@ -63,6 +65,12 @@ class Controller:
 
         plan = castle.plan(an, self.cfg)
         mode, field = self._select_mode(obs, an, plan)
+
+        if mode != DEFEND:
+            drive = self._thrust(obs, an)
+            if drive is not None:
+                self._debug(obs, an, "thrust", self.thrust and self.thrust["target"])
+                return drive
 
         if plan.action is not None and mode not in (DEFEND, ATTACK, DEATHTOUCH):
             self._debug(obs, an, "build", plan.site)
@@ -182,6 +190,69 @@ class Controller:
                 best, best_mv = (rules.MOVE, sr, sc, d, 0), mv
         return best
 
+    # ----------------------------------------------------------------- thrust
+    def _thrust(self, obs: Obs, an: Analysis):
+        """Drive one committed stack at a deep target, one step per turn.
+
+        Depth-first, not breadth-first: the stack keeps its heading across turns
+        instead of being re-chosen every turn against whatever is nearest. It
+        gives up the rest of the board while it runs, which is the trade the top
+        of the leaderboard makes and we never did.
+        """
+        cfg = self.cfg
+        if not cfg.thrust_enabled or obs.turn < cfg.thrust_min_turn:
+            self.thrust = None
+            return None
+
+        if self.thrust is not None:
+            r, c = self.thrust["pos"]
+            if (obs.owner_grid[r, c] != rules.OWNER_ME
+                    or int(obs.army_grid[r, c]) < cfg.thrust_abort_army):
+                self.thrust = None          # the fist died or was taken
+
+        if self.thrust is None:
+            if an.biggest_stack_pos is None or an.biggest_stack < cfg.thrust_min_army:
+                return None
+            if an.biggest_stack < cfg.thrust_army_ratio * max(obs.my_army, 1):
+                return None
+            target = self.belief.enemy_general or self.belief.general_guess
+            if target is None:
+                return None
+            self.thrust = {"pos": an.biggest_stack_pos, "target": target}
+
+        # Re-aim the moment we actually see their general.
+        if self.belief.enemy_general is not None:
+            self.thrust["target"] = self.belief.enemy_general
+        r, c = self.thrust["pos"]
+        target = self.thrust["target"]
+        if (r, c) == target:
+            self.thrust = None
+            return None
+
+        field = bfs_field_from(self.belief.passable, target)
+        here = int(field[r, c])
+        army = int(obs.army_grid[r, c])
+        best, best_key = None, None
+        for d, (dr, dc) in enumerate(DIRS):
+            nr, nc = r + dr, c + dc
+            if not (0 <= nr < self.H and 0 <= nc < self.W):
+                continue
+            if not self.belief.passable[nr, nc] or int(field[nr, nc]) >= here:
+                continue
+            dest_army = int(obs.army_grid[nr, nc])
+            mine = obs.owner_grid[nr, nc] == rules.OWNER_ME
+            if not mine and army - 1 <= dest_army:
+                continue                     # cannot punch through this tile
+            # closer first, then prefer taking the most army off them
+            key = (-int(field[nr, nc]), dest_army if not mine else -1)
+            if best_key is None or key > best_key:
+                best_key, best = key, (rules.MOVE, r, c, d, 0, nr, nc)
+        if best is None:
+            self.thrust = None               # blocked; fall back to scoring
+            return None
+        self.thrust["pos"] = (best[5], best[6])
+        return best[:5]
+
     # ------------------------------------------------------------------ modes
     def _select_mode(self, obs: Obs, an: Analysis, plan) -> tuple[str, np.ndarray]:
         cfg = self.cfg
@@ -204,6 +275,17 @@ class Controller:
 
         if self._can_attack(obs, an):
             return ATTACK, an.dist_enemy_gen
+
+        # Massing: no fist yet, but we have the army to build one. Route it to a
+        # rally tile on the front rather than spending the turns on more nibbling.
+        if (cfg.thrust_enabled and cfg.mass_enabled and self.thrust is None
+                and obs.turn >= cfg.thrust_min_turn
+                and obs.my_army >= cfg.mass_min_army
+                and an.biggest_stack < cfg.thrust_min_army
+                and self.belief.general_guess is not None):
+            rally = self._rally_point(obs, an)
+            if rally is not None:
+                return GATHER, bfs_field_from(passable, rally)
 
         # Saving up for a castle: walk army onto the chosen site.
         if plan.site is not None and plan.action is None:
@@ -267,6 +349,16 @@ class Controller:
         margin = self.cfg.attack_margin if located else self.cfg.attack_margin_unsure
         arriving = an.biggest_stack - 1
         return arriving > estimate * margin
+
+    def _rally_point(self, obs: Obs, an: Analysis):
+        """Where the fist forms. Held across turns - a rally point that moves
+        every turn is one the army never actually reaches."""
+        if self.rally is not None:
+            r, c = self.rally
+            if obs.owner_grid[r, c] == rules.OWNER_ME:
+                return self.rally
+        self.rally = self._staging(an)
+        return self.rally
 
     def _staging(self, an: Analysis):
         """Our own tile closest to the enemy general — the natural front."""
