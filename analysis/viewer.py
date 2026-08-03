@@ -21,10 +21,18 @@ from analysis import replay as replay_mod
 
 
 def pack(rep: dict, every: int = 1) -> dict:
+    """Pack one of our own replays (initial grid + action streams)."""
+    meta = {k: rep[k] for k in ("seed", "spec0", "spec1", "winner", "reason", "turns")}
+    return pack_states(replay_mod.frames(rep), meta, every)
+
+
+def pack_states(states, meta: dict, every: int = 1) -> dict:
+    """Pack any (turn, State) stream. Official replays arrive as per-tick states
+    rather than actions, so they enter here instead of through `pack`."""
     codes, armies, series = [], [], []
     h = w = 0
-    for turn, st in replay_mod.frames(rep):
-        if turn % every and turn != rep["turns"]:
+    for turn, st in states:
+        if turn % every and turn != meta["turns"]:
             continue
         h, w = st.armies.shape
         code = np.zeros((h, w), dtype=np.uint8)
@@ -41,7 +49,7 @@ def pack(rep: dict, every: int = 1) -> dict:
         "codes": base64.b64encode(b"".join(codes)).decode(),
         "armies": base64.b64encode(b"".join(armies)).decode(),
         "series": series,
-        "meta": {k: rep[k] for k in ("seed", "spec0", "spec1", "winner", "reason", "turns")},
+        "meta": meta,
     }
 
 
