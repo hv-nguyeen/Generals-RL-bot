@@ -38,6 +38,7 @@ class GameSpec:
     max_turns: int = rules.TURN_LIMIT
     time_limit: float = rules.MOVE_BUDGET_S
     record: bool = False
+    maps: str | None = None      # pool of real boards; None = generate
 
 
 def _valid_action(a) -> bool:
@@ -48,7 +49,7 @@ def _valid_action(a) -> bool:
 
 
 def play(g: GameSpec) -> dict:
-    grid = mapgen.generate(g.seed)
+    grid = mapgen.pool_grid(g.maps, g.seed) if g.maps else mapgen.generate(g.seed)
     h, w = grid.shape
     st = engine.from_grid(grid)
     players = [
@@ -146,7 +147,7 @@ def _worker(payload: dict) -> dict:
 
 def run_match(spec_a: str, spec_b: str, games: int, seed0: int = 0, workers: int = 8,
               max_turns: int = rules.TURN_LIMIT, time_limit: float = rules.MOVE_BUDGET_S,
-              record: bool = False, progress=None) -> list[dict]:
+              record: bool = False, progress=None, maps: str | None = None) -> list[dict]:
     """Play `games` games, colours swapped on alternate games of each seed pair."""
     jobs = []
     for i in range(games):
@@ -154,7 +155,7 @@ def run_match(spec_a: str, spec_b: str, games: int, seed0: int = 0, workers: int
         swapped = i % 2 == 1
         s0, s1 = (spec_b, spec_a) if swapped else (spec_a, spec_b)
         jobs.append(dict(spec0=s0, spec1=s1, seed=seed, max_turns=max_turns,
-                         time_limit=time_limit, record=record))
+                         time_limit=time_limit, record=record, maps=maps))
 
     results = []
     if workers <= 1:
@@ -173,9 +174,16 @@ def run_match(spec_a: str, spec_b: str, games: int, seed0: int = 0, workers: int
 
 
 def _tag(results: list[dict], spec_a: str, spec_b: str) -> list[dict]:
-    """Annotate each game with the outcome from A's point of view."""
-    for r in results:
-        a_seat = 0 if r["spec0"] == spec_a else 1
+    """Annotate each game with the outcome from A's point of view.
+
+    The seat comes from the job order, not from comparing spec strings: when both
+    sides are the same spec (self-play, or A/B against an identical config) the
+    string test always says seat 0, the colour swap silently stops happening, and
+    the result is pure seat bias rather than a score. That showed up as `ours vs
+    ours` scoring 0.333 on a real-board pool, which is impossible by symmetry.
+    """
+    for i, r in enumerate(results):
+        a_seat = i % 2
         r["a_seat"] = a_seat
         if r["winner"] < 0:
             r["a_result"] = "draw"
@@ -202,6 +210,8 @@ def main() -> None:
     ap.add_argument("--time-limit-ms", type=float, default=rules.MOVE_BUDGET_S * 1000)
     ap.add_argument("--out", default=None, help="directory to write results.jsonl into")
     ap.add_argument("--replays", action="store_true", help="store full replays (a few kB each)")
+    ap.add_argument("--maps", default=None,
+                    help="play on a real-board pool from `analysis.official maps`")
     ap.add_argument("--elo1", type=float, default=12.0, help="SPRT alternative hypothesis")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
@@ -214,7 +224,7 @@ def main() -> None:
 
     results = run_match(args.a, args.b, args.games, args.seed0, args.workers,
                         args.max_turns, args.time_limit_ms / 1000.0,
-                        args.replays, progress)
+                        args.replays, progress, args.maps)
     if not args.quiet:
         print()
 

@@ -54,13 +54,13 @@ INT_PARAMS = _int_params()
 
 
 def evaluate(cfg: Config, opponents: list[str], games: int, seed0: int, workers: int,
-             max_turns: int, tmpdir: Path, tag: str) -> tuple[float, dict]:
+             max_turns: int, tmpdir: Path, tag: str, maps: str | None = None) -> tuple[float, dict]:
     path = tmpdir / f"cand_{tag}.json"
     cfg.save(path)
     spec = f"ours:{path}"
     scores, detail = [], {}
     for opp in opponents:
-        results = run_match(spec, opp, games, seed0, workers, max_turns)
+        results = run_match(spec, opp, games, seed0, workers, max_turns, maps=maps)
         w, d, loss = tally(results)
         score = (w + 0.5 * d) / max(len(results), 1)
         scores.append(score)
@@ -85,6 +85,7 @@ def main() -> None:
     ap.add_argument("--params", default=None, help="explicit comma-separated parameter list")
     ap.add_argument("--sigma", type=float, default=0.45, help="initial relative spread")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--maps", default=None, help="real-board pool from `analysis.official maps`")
     args = ap.parse_args()
 
     out = Path(args.out)
@@ -123,7 +124,7 @@ def main() -> None:
 
     log = (out / "log.jsonl").open("a")
     base_score, base_detail = evaluate(base, opponents, args.games, args.seed * 1000,
-                                       args.workers, args.max_turns, tmpdir, "base")
+                                       args.workers, args.max_turns, tmpdir, "base", args.maps)
     print(f"baseline score {base_score:.3f}  {base_detail}")
     best_score, best_cfg = base_score, base
 
@@ -136,7 +137,7 @@ def main() -> None:
             vals = [round(v) if n in INT_PARAMS else float(v) for n, v in zip(names, vec)]
             cfg = base.with_vector(names, vals)
             score, detail = evaluate(cfg, opponents, args.games, seed0, args.workers,
-                                     args.max_turns, tmpdir, f"{it}_{k}")
+                                     args.max_turns, tmpdir, f"{it}_{k}", args.maps)
             scored.append((score, vec, cfg, detail))
             print(f"  it{it:02d} cand{k:02d}  {score:.3f}  {detail}")
 

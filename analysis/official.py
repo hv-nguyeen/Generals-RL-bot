@@ -286,6 +286,37 @@ def cmd_report(args) -> None:
         print(f"\nreplays rendered next to their json in {out / 'replays'}")
 
 
+def cmd_maps(args) -> None:
+    """Write the real boards we played on into a pool the arena can draw from."""
+    from sim import mapgen
+
+    out = Path(args.dir)
+    meta_by_id = {}
+    mpath = out / "matches.json"
+    if mpath.exists():
+        meta_by_id = {str(m["id"]): m for m in json.loads(mpath.read_text())}
+
+    grids, kept = [], []
+    for path in sorted((out / "replays").glob("*.json")):
+        rep = json.loads(path.read_text())
+        if args.player not in rep["players"]:
+            continue
+        s = summarise(rep, args.player, meta_by_id.get(str(rep.get("id"))))
+        if args.only != "all" and s["result"] != args.only:
+            continue
+        if args.opponent and s["opponent"] != args.opponent:
+            continue
+        grids.append(mapgen.from_official(rep).tolist())
+        kept.append({"id": rep.get("id"), "opponent": s["opponent"],
+                     "result": s["result"], "turns": s["turns"]})
+
+    Path(args.out).write_text(json.dumps({"grids": grids, "games": kept}))
+    print(f"{len(grids)} boards -> {args.out}")
+    if kept:
+        import collections
+        print("  ", dict(collections.Counter(k["opponent"] for k in kept)))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -305,6 +336,14 @@ def main() -> None:
     r.add_argument("--render", action="store_true", help="also write HTML replays")
     r.add_argument("--every", type=int, default=2)
     r.set_defaults(func=cmd_report)
+
+    m = sub.add_parser("maps", help="export the real boards as an arena map pool")
+    m.add_argument("dir", nargs="?", default="runs/official")
+    m.add_argument("--player", required=True)
+    m.add_argument("--only", default="loss", choices=["loss", "win", "draw", "all"])
+    m.add_argument("--opponent", default=None, help="restrict to one opponent")
+    m.add_argument("--out", default="runs/lossmaps.json")
+    m.set_defaults(func=cmd_maps)
 
     args = ap.parse_args()
     args.func(args)

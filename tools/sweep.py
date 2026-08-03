@@ -67,6 +67,7 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=10)
     ap.add_argument("--max-turns", type=int, default=900)
     ap.add_argument("--marks", default="60,120,200", help="turns to report land at")
+    ap.add_argument("--maps", default=None, help="real-board pool")
     args = ap.parse_args()
 
     base = Config.load(args.base) if args.base else Config()
@@ -85,7 +86,7 @@ def main() -> None:
         path = tmp / f"{args.param.replace('.', '_')}_{raw}.json"
         cfg.save(path)
         results = run_match(f"ours:{path}", args.opponent, args.games, args.seed0,
-                            args.workers, args.max_turns)
+                            args.workers, args.max_turns, maps=args.maps)
         w, d, loss = tally(results)
         summ = rating.summary(w, d, loss)
         agg = stats_mod.aggregate(results)

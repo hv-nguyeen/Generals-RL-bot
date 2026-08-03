@@ -133,8 +133,11 @@ class Hunter:
 
     GARRISON = 4
 
-    def __init__(self, player_id: int, h: int, w: int):
+    def __init__(self, player_id: int, h: int, w: int, garrison: int | None = None):
         self.H, self.W = h, w
+        # Lower garrison = commits earlier and harder. `hunter:2` is a rush
+        # proxy for the bots that decapitate us around turn 130.
+        self.GARRISON = self.GARRISON if garrison is None else garrison
 
     def act(self, obs: Obs, deadline=None):
         a, ty, ow = obs.army_grid, obs.type_grid, obs.owner_grid
@@ -238,7 +241,7 @@ def make(spec: str, player_id: int, h: int, w: int, seed: int = 0):
     if name == "greedy":
         return Greedy(player_id, h, w)
     if name == "hunter":
-        return Hunter(player_id, h, w)
+        return Hunter(player_id, h, w, int(arg) if arg else None)
     if name == "random":
         return RandomAgent(player_id, h, w, seed)
     if name == "idle":

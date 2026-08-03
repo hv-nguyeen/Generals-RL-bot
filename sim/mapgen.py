@@ -91,3 +91,38 @@ def generate(seed: int) -> np.ndarray:
 
 def dims(grid: np.ndarray) -> tuple[int, int]:
     return int(grid.shape[0]), int(grid.shape[1])
+
+
+# --------------------------------------------------------------- real boards
+# Official replays carry the exact terrain and spawns, so the boards we actually
+# lost on can be played again. Tuning on those instead of freshly generated ones
+# answers "does this config survive the positions that killed us" rather than
+# "does it do well on average".
+_POOL_CACHE: dict[str, list] = {}
+
+
+def from_official(rep: dict) -> np.ndarray:
+    """Grid from an official replay (competition strips neutral castles)."""
+    h, w = int(rep["dims"]["rows"]), int(rep["dims"]["cols"])
+    grid = np.zeros((h, w), dtype=np.int32)
+    for r, c in rep["mountains"]:
+        grid[r, c] = -2
+    for i, (r, c) in enumerate(rep["generals"][:2]):
+        grid[r, c] = i + 1
+    return grid
+
+
+def load_pool(path: str) -> list[np.ndarray]:
+    """Load a map pool written by `analysis.official maps`. Cached per process."""
+    import json
+    from pathlib import Path
+
+    if path not in _POOL_CACHE:
+        raw = json.loads(Path(path).read_text())
+        _POOL_CACHE[path] = [np.asarray(g, dtype=np.int32) for g in raw["grids"]]
+    return _POOL_CACHE[path]
+
+
+def pool_grid(path: str, seed: int) -> np.ndarray:
+    pool = load_pool(path)
+    return pool[seed % len(pool)].copy()
