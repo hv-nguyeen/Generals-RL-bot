@@ -36,6 +36,11 @@ BAR = "=" * 78
 
 
 def _git_rev() -> str:
+    """Identify the build. Released tarballs carry a VERSION file because
+    `git archive` strips .git, and a pasted report has to say what produced it."""
+    stamp = Path(__file__).resolve().parent.parent / "VERSION"
+    if stamp.exists():
+        return stamp.read_text().strip()
     try:
         out = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
                              capture_output=True, text=True, timeout=5)

@@ -35,6 +35,7 @@ import argparse
 import json
 import gzip
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -49,10 +50,40 @@ UA = {"User-Agent": "generals-bot-analysis/1.0"}
 
 
 # ---------------------------------------------------------------- fetching
-def _get(url: str) -> dict:
-    req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode())
+class Forbidden(Exception):
+    """The server declined this resource. Never ask for it again."""
+
+
+def _get(url: str, tries: int = 4) -> dict:
+    """Fetch politely: back off on throttling, never retry a refusal.
+
+    This hits a small competition site's own API, so it behaves like a guest —
+    one request a second by default, exponential backoff when asked to slow
+    down, and a 403 is taken as a final answer rather than something to retry
+    around. Older replay ids appear to stop being served; those get recorded and
+    skipped so a re-run does not ask again.
+    """
+    delay = 2.0
+    for attempt in range(tries):
+        req = urllib.request.Request(url, headers=UA)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403, 404):
+                raise Forbidden(f"{e.code}") from e
+            if e.code in (429, 500, 502, 503, 504) and attempt < tries - 1:
+                wait = float(e.headers.get("Retry-After") or 0) or delay
+                time.sleep(wait)
+                delay *= 2
+                continue
+            raise
+        except urllib.error.URLError:
+            if attempt == tries - 1:
+                raise
+            time.sleep(delay)
+            delay *= 2
+    raise RuntimeError("unreachable")
 
 
 def fetch_profile(player: str) -> dict:
@@ -375,24 +406,39 @@ def cmd_harvest(args) -> None:
 
 
 def _fetch_ids(args, out: Path, ids: list[int]) -> None:
-    got = skipped = 0
-    for i, mid in enumerate(ids, 1):
+    """Download replays, remembering which ids the server refuses."""
+    gone_file = out / "unavailable.json"
+    gone = set(json.loads(gone_file.read_text())) if gone_file.exists() else set()
+
+    got = skipped = refused = 0
+    for mid in ids:
+        if mid in gone:
+            skipped += 1
+            continue
         path = replay_path(out, mid, not args.no_gzip)
         if path.exists() or replay_path(out, mid, False).exists():
             skipped += 1
             continue
         try:
             rep = fetch_replay(mid)
+        except Forbidden:
+            gone.add(mid)
+            refused += 1
+            if refused % 25 == 0:
+                gone_file.write_text(json.dumps(sorted(gone)))
+                print(f"  {refused} ids not served (recorded, will not re-ask)", flush=True)
+            continue
         except Exception as e:                       # noqa: BLE001
             print(f"  {mid}: {e}", flush=True)
             continue
         rep["id"] = mid
         write_replay(path, rep)
         got += 1
-        if got % 50 == 0:
+        if got % 25 == 0:
             print(f"  {got} fetched / {len(ids)}", flush=True)
         time.sleep(args.delay)
-    print(f"  -> {got} new, {skipped} already had", flush=True)
+    gone_file.write_text(json.dumps(sorted(gone)))
+    print(f"  -> {got} new, {skipped} skipped, {refused} not served", flush=True)
 
 
 def main() -> None:
@@ -404,7 +450,7 @@ def main() -> None:
     f.add_argument("--player", required=True)
     f.add_argument("--out", default="runs/official")
     f.add_argument("--limit", type=int, default=0, help="0 = all")
-    f.add_argument("--delay", type=float, default=0.3, help="seconds between requests")
+    f.add_argument("--delay", type=float, default=1.0, help="seconds between requests")
     f.add_argument("--force", action="store_true")
     f.add_argument("--no-gzip", action="store_true", help="store raw json (10x bigger)")
     f.set_defaults(func=cmd_fetch)
@@ -412,8 +458,9 @@ def main() -> None:
     h = sub.add_parser("harvest", help="download many players' games (free ground truth)")
     h.add_argument("--players", required=True, help="comma-separated names")
     h.add_argument("--out", default="/local/data/vng205/replays")
-    h.add_argument("--limit", type=int, default=0)
-    h.add_argument("--delay", type=float, default=0.2)
+    h.add_argument("--limit", type=int, default=150,
+                   help="most recent N games per player; 0 = all")
+    h.add_argument("--delay", type=float, default=1.0)
     h.add_argument("--no-gzip", action="store_true")
     h.set_defaults(func=cmd_harvest)
 
