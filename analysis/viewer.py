@@ -137,10 +137,10 @@ function chart() {{
     (i ? 'L' : 'M') + (i / (n - 1 || 1) * 400).toFixed(1) + ' ' +
     (118 - s[idx] / scale * 116).toFixed(1)).join(' ');
   document.getElementById('chart').innerHTML =
-    `<path d="${{path(1, maxLand)}}" fill=none stroke="${{COL.p0s}}" stroke-width=1.5/>` +
-    `<path d="${{path(3, maxLand)}}" fill=none stroke="${{COL.p1s}}" stroke-width=1.5/>` +
-    `<path d="${{path(2, maxArmy)}}" fill=none stroke="${{COL.p0s}}" stroke-width=1 stroke-dasharray="3 3"/>` +
-    `<path d="${{path(4, maxArmy)}}" fill=none stroke="${{COL.p1s}}" stroke-width=1 stroke-dasharray="3 3"/>`;
+    `<path d="${{path(1, maxLand)}}" fill="none" stroke="${{COL.p0s}}" stroke-width="1.5"></path>` +
+    `<path d="${{path(3, maxLand)}}" fill="none" stroke="${{COL.p1s}}" stroke-width="1.5"></path>` +
+    `<path d="${{path(2, maxArmy)}}" fill="none" stroke="${{COL.p0s}}" stroke-width=1 stroke-dasharray="3 3"></path>` +
+    `<path d="${{path(4, maxArmy)}}" fill="none" stroke="${{COL.p1s}}" stroke-width=1 stroke-dasharray="3 3"></path>`;
 }}
 
 const scrub = document.getElementById('scrub');

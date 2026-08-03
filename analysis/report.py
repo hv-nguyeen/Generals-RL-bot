@@ -48,10 +48,10 @@ def _curve_svg(curve: list[list[float]]) -> str:
             for i, r in enumerate(curve))
     return (
         '<svg viewBox="0 0 600 160" preserveAspectRatio="none" class=curve>'
-        f'<path d="{path(1, max_land)}" fill=none stroke="#ff6b6b" stroke-width=2/>'
-        f'<path d="{path(2, max_land)}" fill=none stroke="#4dabf7" stroke-width=2/>'
-        f'<path d="{path(3, max_army)}" fill=none stroke="#ff6b6b" stroke-width=1 stroke-dasharray="4 3"/>'
-        f'<path d="{path(4, max_army)}" fill=none stroke="#4dabf7" stroke-width=1 stroke-dasharray="4 3"/>'
+        f'<path d="{path(1, max_land)}" fill="none" stroke="#ff6b6b" stroke-width="2"></path>'
+        f'<path d="{path(2, max_land)}" fill="none" stroke="#4dabf7" stroke-width="2"></path>'
+        f'<path d="{path(3, max_army)}" fill="none" stroke="#ff6b6b" stroke-width=1 stroke-dasharray="4 3"></path>'
+        f'<path d="{path(4, max_army)}" fill="none" stroke="#4dabf7" stroke-width=1 stroke-dasharray="4 3"></path>'
         '</svg>'
         f'<div class=muted>land solid / army dashed &middot; us red, them blue &middot; '
         f'peak land {max_land:.0f}, peak army {max_army:.0f}</div>')
