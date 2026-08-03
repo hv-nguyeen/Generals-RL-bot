@@ -192,6 +192,12 @@ class Config:
     mass_enabled: bool = False
     mass_min_army: int = 60            # total army before massing is worth it
     thrust_abort_army: int = 8         # give up when the fist is spent
+    # Do not commit the fist while home is exposed, and recall it if that
+    # changes. Ladder evidence: with the thrust running we lost 26 games to
+    # stacks of 6-25 army while AHEAD on land, general holding ~7. Self-play
+    # cannot see this - both sides thrust, so the counter-attack window is
+    # symmetric and cancels.
+    thrust_home_safe: int = 10         # no enemy stack within this many steps
 
     # ---- endgame -----------------------------------------------------------
     deathtouch_prep_turn: int = 730    # start walking a unit at the enemy general

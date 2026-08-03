@@ -210,6 +210,11 @@ class Controller:
                     or int(obs.army_grid[r, c]) < cfg.thrust_abort_army):
                 self.thrust = None          # the fist died or was taken
 
+        # Home exposed? Do not start a drive, and drop one already running.
+        if an.max_threat_within(cfg.thrust_home_safe) > an.general_army:
+            self.thrust = None
+            return None
+
         if self.thrust is None:
             if an.biggest_stack_pos is None or an.biggest_stack < cfg.thrust_min_army:
                 return None
@@ -411,7 +416,9 @@ class Controller:
                 # general to survive the biggest stack in range.
                 incoming = an.max_threat_within(cfg.lock_radius)
                 if incoming > 0:
-                    floor = max(floor, min(incoming + 1, ar[gr][gc]))
+                    # Not min(): clamping to what is already on the general made
+                    # this a refuse-to-spend rule that could never reinforce.
+                    floor = max(floor, incoming + 1)
 
         best, best_score = None, -math.inf
         checked = 0
