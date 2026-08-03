@@ -86,3 +86,28 @@ class ClonePolicy:
         idx = int(np.argmax(logits))
         self.last_debug = {"mode": "clone", "turn": obs.turn}
         return features.index_to_action(idx)
+
+
+class ValueNet:
+    """Win probability for a position, from the field-outcome model.
+
+    Same trunk as the policy, a scalar head. Used to score positions our own bot
+    reaches against what actually wins against real opponents — the local
+    gauntlet cannot do that, because none of our opponents punish the mistakes
+    the field punishes.
+    """
+
+    def __init__(self, path: str):
+        z = np.load(path)
+        self.w = [z[f"conv{i}_w"].astype(np.float32) for i in range(LAYERS)]
+        self.b = [z[f"conv{i}_b"].astype(np.float32) for i in range(LAYERS)]
+        self.head_w = z["v_w"].astype(np.float32)
+        self.head_b = float(z["v_b"])
+
+    def win_prob(self, obs: Obs) -> float:
+        x = features.encode(obs)
+        for w, b in zip(self.w, self.b):
+            x = _conv3x3(x, w, b)
+            np.maximum(x, 0.0, out=x)
+        logit = float(self.head_w @ x.mean(axis=(1, 2)) + self.head_b)
+        return 1.0 / (1.0 + np.exp(-logit))
