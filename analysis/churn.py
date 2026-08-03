@@ -33,6 +33,7 @@ import numpy as np
 from analysis.official import read_replay, replay_files, summarise
 
 YOUNG = 12          # ticks; a tile lost this fast was never really held
+HOLD_BY = 40        # ticks; a capture still ours at this age counts as held
 
 
 def flips(rep: dict, seat: int):
@@ -46,13 +47,18 @@ def flips(rep: dict, seat: int):
     Both sides count only tiles we actually CAPTURED (born after tick 0). Spawn
     tiles have a birth army set by the map, not by us, and the general's would
     drag the control group up on its own.
+
+    "Held" is measured at HOLD_BY ticks of age, not at the end of the game. In a
+    loss we own nothing at the end, so an end-of-game control group is empty and
+    the comparison silently vanishes for exactly the games it is meant to
+    explain.
     """
     ticks = rep["ticks"]
     o = np.asarray(ticks[0]["owners"], dtype=np.int32)
     born_t = np.where(o == seat, 0, -1)
     born_a = np.where(o == seat, np.asarray(ticks[0]["armies"], dtype=np.int32), 0)
 
-    ages, birth, captures, total_lost = [], [], 0, 0
+    ages, birth, held, captures, total_lost = [], [], [], 0, 0
     prev_o = o
     for t in range(1, len(ticks)):
         o = np.asarray(ticks[t]["owners"], dtype=np.int32)
@@ -68,10 +74,12 @@ def flips(rep: dict, seat: int):
         for r, c in np.argwhere(lost & (born_t > 0)):
             ages.append(t - int(born_t[r, c]))
             birth.append(int(born_a[r, c]))
+
+        survived = (o == seat) & (born_t > 0) & (born_t == t - HOLD_BY)
+        held += [int(x) for x in born_a[survived]]
         prev_o = o
 
-    still = (prev_o == seat) & (born_t > 0)
-    return ages, birth, [int(x) for x in born_a[still]], captures, total_lost
+    return ages, birth, held, captures, total_lost
 
 
 def fronts(rep: dict, seat: int) -> float:

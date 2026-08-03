@@ -73,7 +73,13 @@ class Analysis:
         self.enemy_adj = dilate8(self.opp_mask)
 
         # --- stacks and threats ---------------------------------------------
+        # The general's garrison is not a fist. Counting it made the general our
+        # biggest stack whenever we gathered, which fired ATTACK, and the move
+        # scorer exempts ATTACK from holding the general — so the base marched
+        # off in one move and died a few ticks later. 324daa0 stopped the thrust
+        # launching from the general; this is the same bug on the scorer path.
         movable = self.my_mask & (a >= 2)
+        movable[gr, gc] = False
         if movable.any():
             idx = int(np.argmax(np.where(movable, a, 0)))
             self.biggest_stack_pos = (idx // obs.W, idx % obs.W)
