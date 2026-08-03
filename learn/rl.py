@@ -90,6 +90,14 @@ def main() -> None:
     ap.add_argument("--minibatch", type=int, default=4096,
                     help="examples per gradient step; the whole rollout will not fit")
     ap.add_argument("--save-every", type=int, default=20)
+    ap.add_argument("--opponent", default="frozen", choices=["frozen", "self"],
+                    help="frozen: seat 1 plays the warm-start policy and never "
+                         "learns, so the reward stops being symmetric. self: "
+                         "mirror match, whose shaped reward is zero-sum and "
+                         "therefore has expectation zero.")
+    ap.add_argument("--refresh", type=int, default=0,
+                    help="copy the learner into the frozen opponent every N "
+                         "iterations; 0 keeps it fixed")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -183,6 +191,7 @@ def main() -> None:
             new_opt[k] = (m, v)
         return new_p, new_opt, loss
 
+    opponent = {k: v for k, v in params.items()}
     key, k_states = jr.split(key)
     states = jax.vmap(env.init_state)(jr.split(k_states, args.envs))
 
@@ -196,7 +205,11 @@ def main() -> None:
         for _ in range(args.steps):
             key, k0, k1 = jr.split(key, 3)
             a0, i0, lp0, rlp0, v0, x0, m0 = act(params, anchor_full, states, 0, k0)
-            a1, *_ = act(params, anchor_full, states, 1, k1)
+            # Seat 1 plays the frozen policy: against a mirror of itself the
+            # land lead is zero-sum and the shaped reward averages to exactly
+            # zero, which is why 195 iterations of self-play moved nothing.
+            foe = opponent if args.opponent == "frozen" else params
+            a1, *_ = act(foe, anchor_full, states, 1, k1)
             ts, states = env_step(states, a0, a1)
             done = ts.terminated | ts.truncated
             # A win is hundreds of turns away, so terminal-only reward leaves
@@ -245,6 +258,9 @@ def main() -> None:
                   f"reward/step {float(rew.mean()):+.4f}  terminals {terminals}  "
                   f"|adv| {float(jnp.abs(adv).mean()):.3f}  "
                   f"{time.time() - started:.0f}s", flush=True)
+        if args.refresh and it and it % args.refresh == 0:
+            opponent = {k: v for k, v in params.items()}
+            print(f"  refreshed frozen opponent at iter {it}", flush=True)
         if it and it % args.save_every == 0:
             export(params, args.out)
     export(params, args.out)
