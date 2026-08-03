@@ -91,6 +91,28 @@ runoff boards and the winner of those fresh numbers is what gets written.
 Confirm the winner with an SPRT run before submitting it; a league is a search,
 not a significance test.
 
+THREE ORACLES (--oracle)
+------------------------
+    config    CEM over ~24 config knobs. The default, and the only one that
+              produces a shippable answer.
+    net       PPO over network weights (learn/netoracle.py), because a config
+              can only reweight behaviours `bot/policy/controller.py` already
+              implements and PSRO's prescription when the oracle class stops
+              finding best responses is to widen it. Needs --nn-init.
+    both      Append both members per iteration. Grows the archive fastest.
+
+The net oracle's GATE is not "is this good": it is "did PPO beat its OWN
+initialisation, paired, on boards no checkpoint was selected on". A net that
+fails it never enters the archive and the CEM oracle runs for that iteration
+instead, so an iteration always appends something. Two lines are printed per
+call -- the gate verdict and its per-opponent bracket -- and both come from
+netoracle's stdout, which is worth reading live: it prints a kill checklist.
+
+An `oracle-nn-*` row in the table is a NETWORK. If it wins max-min, this writes
+`<out>.npz` and STOPS: `bot/main.py` builds a Controller and nothing else, so a
+neural winner is a result, not a submission. Read that before booking a night on
+`--oracle net`.
+
     # Does this deserve a night on the cluster? One oracle call against v12
     # alone, plus a control against v16. ~1 hour.
     python -m learn.league --probe --dir runs/probe \
@@ -98,6 +120,13 @@ not a significance test.
 
     # The league.
     python -m learn.league --dir runs/league --out runs/league/best.json \
+        --iters 6 --gens 4 --pop 20 --elite 5 --games 48 --pair-games 48 \
+        --maps runs/bigmaps.json --workers 60
+
+    # The league with the wider oracle class. Each --oracle net iteration costs
+    # ~1 h of GPU on top of the CEM budget.
+    python -m learn.league --dir runs/league-nn --out runs/league-nn/best.json \
+        --oracle both --nn-init /local/data/vng205/clone.npz --nn-iters 200 \
         --iters 6 --gens 4 --pop 20 --elite 5 --games 48 --pair-games 48 \
         --maps runs/bigmaps.json --workers 60
 
@@ -120,6 +149,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import subprocess
+import sys
 import tempfile
 import time
 from collections import Counter
@@ -511,6 +543,43 @@ def oracle(base: Config, specs: list[str], sigma: np.ndarray, *, space: list, po
 
 # --------------------------------------------------------------------------
 # archive + checkpoint
+def net_oracle(args, out: Path, ckpt: Path, maps: str | None, it: int) -> tuple[Path, dict]:
+    """Widen the oracle class: PPO best response to sigma. Returns (weights, gate).
+
+    The config oracle can only reweight behaviours `bot/policy/controller.py`
+    already implements, and PSRO's prescription when the oracle class stops
+    finding best responses is to widen it. See learn/netoracle.py.
+
+    A SUBPROCESS, not an import, and that is not a style choice: `arena/runner`
+    builds its pools with the default fork start method, so the moment this
+    process imports jax every later matrix fork inherits an initialised,
+    multithreaded runtime and deadlocks a worker (commit d683bdb). league.py must
+    never import jax.
+    """
+    npz = (out / "nn" / f"oracle-nn-{it}.npz").resolve()
+    npz.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, "-m", "learn.netoracle",
+           "--league", str(ckpt), "--init", args.nn_init, "--out", str(npz),
+           "--workers", str(args.workers), "--iters", str(args.nn_iters),
+           "--games", str(args.nn_games), "--max-turns", str(args.max_turns),
+           "--sigma-floor", str(args.nn_sigma_floor),
+           "--seed", str(args.seed + 1000 * it)]
+    if maps:
+        cmd += ["--maps", maps]
+    print(f"\n  neural oracle: {' '.join(cmd)}", flush=True)
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        # A dead neural oracle must not take a multi-hour league with it. The
+        # CEM branch below runs for this iteration instead; the best weights the
+        # PPO run reached are still on disk as <out>.best.npz.
+        print(f"  neural oracle exited {e.returncode}; falling back to the CEM "
+              f"oracle for iteration {it}", flush=True)
+        return npz, {"accepted": False, "score": float("nan"),
+                     "init_score": float("nan")}
+    return npz, json.loads(npz.with_suffix(".json").read_text())
+
+
 def save_state(path: Path, state: dict) -> None:
     """Atomic: this run gets killed, and a half-written checkpoint is a lost run."""
     tmp = path.with_suffix(".tmp")
@@ -797,6 +866,23 @@ def main() -> None:
                          "it unbiased is the fresh boards, not the count, and "
                          "raising it above --pair-games needs a bigger --maps pool")
     ap.add_argument("--top", type=int, default=3, help="members entering the runoff")
+    ap.add_argument("--oracle", default="config", choices=("config", "net", "both"),
+                    help="which best response to search for. config: CEM over the "
+                         "config space, unchanged. net: PPO over network weights "
+                         "(learn/netoracle.py), falling back to the CEM oracle for "
+                         "that iteration if the net fails its gate, so the archive "
+                         "always grows. both: append both. net/both need --nn-init")
+    ap.add_argument("--nn-init", default=None,
+                    help="behaviour clone .npz the neural oracle starts from and "
+                         "anchors to; from random weights it never learns the game")
+    ap.add_argument("--nn-iters", type=int, default=200)
+    ap.add_argument("--nn-games", type=int, default=256, help="rollout games per PPO iteration")
+    ap.add_argument("--nn-sigma-floor", type=float, default=0.15,
+                    help="uniform mass mixed into sigma for the neural oracle's "
+                         "TRAINING opponents. `support 1` in the table above means "
+                         "the default still sends 85%% of its games to one bot, "
+                         "which is frozen-opponent PPO; netoracle prints the "
+                         "effective opponent count at startup")
     ap.add_argument("--group", default="commit", choices=sorted(GROUPS),
                     help="which knobs the oracle searches (see GROUPS)")
     ap.add_argument("--params", default=None, help="explicit comma-separated knob list")
@@ -818,6 +904,12 @@ def main() -> None:
     if args.selfcheck:
         selfcheck()
         return
+
+    if args.oracle != "config":
+        if not args.nn_init:
+            raise SystemExit(f"--oracle {args.oracle} needs --nn-init <clone.npz>")
+        if not Path(args.nn_init).exists():
+            raise SystemExit(f"--nn-init not found: {args.nn_init}")
 
     out = Path(args.dir)
     (out / "candidates").mkdir(parents=True, exist_ok=True)
@@ -856,8 +948,10 @@ def main() -> None:
                              "member's `min` is over an empty set")
         for s in specs:
             name, _, arg = s.partition(":")
-            if name == "ours" and arg and not Path(arg).exists():
-                raise SystemExit(f"seed config not found: {arg}")
+            # `clone:` was never checked here, so a missing .npz used to surface
+            # as a worker exception hours into the run.
+            if name in ("ours", "clone") and arg and not Path(arg).exists():
+                raise SystemExit(f"seed {name} file not found: {arg}")
         state = {"iter": 0, "pending": None, "params": params,
                  "archive": [{"name": s, "spec": s, "config": None} for s in specs],
                  "payoff": [[None] * len(specs) for _ in specs]}
@@ -886,22 +980,55 @@ def main() -> None:
             else:
                 start = Config()
 
-        if state["pending"] is None:
-            state["pending"] = {}
-            save_state(ckpt, state)
-        print(f"\n  oracle: best response to sigma over {len(state['archive'])} members")
-        cand, score = oracle(
-            start, [m["spec"] for m in state["archive"]], sigma, space=space,
-            pop=args.pop, elite=args.elite, gens=args.gens, games=args.games,
-            workers=args.workers, max_turns=args.max_turns, maps=omaps,
-            tmpdir=out / "candidates", seed=args.seed + 1000 * it,
-            spread=args.spread, floor=args.floor, it=it,
-            state=state["pending"], on_gen=lambda: save_state(ckpt, state))
+        # Snapshot before any append: sigma is indexed by THIS list, and in
+        # `both` mode the neural member lands in the archive first.
+        specs_now = [m["spec"] for m in state["archive"]]
+        # In `both` mode the CEM phase runs after the append and checkpoints
+        # inside itself, so a kill there leaves oracle-nn-{it} on disk with
+        # `iter` still at {it}. Re-running the net oracle would then overwrite
+        # the very .npz the matrix entries were just measured against and append
+        # a second member with the same name -- individually self-consistent, so
+        # check_antisymmetry cannot see it, which is the failure class the
+        # `params` guard above exists to prevent.
+        done = {m["name"] for m in state["archive"]}
+        accepted = f"oracle-nn-{it}" in done
+        if args.oracle in ("net", "both") and not accepted:
+            npz, gate = net_oracle(args, out, ckpt, omaps, it)
+            accepted = bool(gate["accepted"])
+            if accepted:
+                # config None, so materialise skips it; complete_matrix, report and
+                # runoff read only `name` and `spec`. The name still starts with
+                # "oracle", which is what report's falsify line tests.
+                state["archive"].append({"name": f"oracle-nn-{it}",
+                                         "spec": f"clone:{npz}", "config": None})
+                save_state(ckpt, state)      # member and weights land together
+                print(f"  oracle-nn-{it} accepted: {gate['score']:.3f} vs its own "
+                      f"initialisation {gate['init_score']:.3f} on gate boards")
+            else:
+                print(f"  oracle-nn-{it} REJECTED at the gate ({gate['score']:.3f} vs "
+                      f"init {gate['init_score']:.3f}); PPO did not beat the policy it "
+                      f"started from, so it is not a best response")
 
-        name = f"oracle-{it}"
-        print(f"  {name} search score {score:.3f} -- a selection statistic, not a "
-              f"measurement; the matrix re-plays it on held-out boards next")
-        state["archive"].append({"name": name, "spec": "", "config": asdict(cand)})
+        # `net` falls back to the CEM oracle when the net is rejected: an
+        # iteration that appends nothing leaves sigma unchanged and the next
+        # iteration repeats it.
+        if args.oracle == "both" or (args.oracle == "config") or not accepted:
+            if state["pending"] is None:
+                state["pending"] = {}
+                save_state(ckpt, state)
+            print(f"\n  oracle: best response to sigma over {len(specs_now)} members")
+            cand, score = oracle(
+                start, specs_now, sigma, space=space,
+                pop=args.pop, elite=args.elite, gens=args.gens, games=args.games,
+                workers=args.workers, max_turns=args.max_turns, maps=omaps,
+                tmpdir=out / "candidates", seed=args.seed + 1000 * it,
+                spread=args.spread, floor=args.floor, it=it,
+                state=state["pending"], on_gen=lambda: save_state(ckpt, state))
+
+            name = f"oracle-{it}"
+            print(f"  {name} search score {score:.3f} -- a selection statistic, not a "
+                  f"measurement; the matrix re-plays it on held-out boards next")
+            state["archive"].append({"name": name, "spec": "", "config": asdict(cand)})
         materialise(state["archive"], out / "archive")
         state["iter"] = it + 1
         state["pending"] = None
@@ -923,6 +1050,18 @@ def main() -> None:
         dest.write_text(json.dumps(winner["config"], indent=2) + "\n")
     elif winner["spec"].startswith("ours:"):
         Config.load(winner["spec"][5:]).save(dest)
+    elif winner["spec"].startswith("clone:"):
+        # Without this a neural max-min fell through to the NOTE branch below and
+        # wrote a DIFFERENT member's config as the answer.
+        wdest = dest.with_suffix(".npz")
+        shutil.copy(winner["spec"][6:], wdest)
+        print(f"wrote {wdest} -- the max-min member is a network, not a config. "
+              f"bot/main.py builds a Controller and nothing else, so this is NOT "
+              f"shippable through the submission path yet.")
+        print("Confirm it first:")
+        print(f"  python -m arena.runner --a clone:{wdest} --b ours:configs/v16.json "
+              f"--games 400 --workers {args.workers}")
+        return
     else:
         # A hand-written baseline with the best worst case is itself a result:
         # nothing the oracle built survives contact with the whole archive.
