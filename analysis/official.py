@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import gzip
 import time
 import urllib.parse
 import urllib.request
@@ -68,6 +69,32 @@ def fetch_matches(player: str) -> list[dict]:
 
 def fetch_replay(replay_id: int) -> dict:
     return _get(f"{API}?replay={replay_id}")
+
+
+def replay_path(out: Path, mid: int, compress: bool = True) -> Path:
+    return out / "replays" / (f"{mid}.json.gz" if compress else f"{mid}.json")
+
+
+def write_replay(path: Path, rep: dict) -> None:
+    raw = json.dumps(rep).encode()
+    if path.suffix == ".gz":
+        path.write_bytes(gzip.compress(raw, 6))
+    else:
+        path.write_bytes(raw)
+
+
+def read_replay(path: str | Path) -> dict:
+    path = Path(path)
+    raw = path.read_bytes()
+    if path.suffix == ".gz":
+        raw = gzip.decompress(raw)
+    return json.loads(raw)
+
+
+def replay_files(out: Path):
+    """Every stored replay, gzipped or not."""
+    d = Path(out) / "replays"
+    return sorted(list(d.glob("*.json")) + list(d.glob("*.json.gz")))
 
 
 # ------------------------------------------------------------- conversion
@@ -215,9 +242,11 @@ def cmd_fetch(args) -> None:
             ids.append(int(mid))
     ids = ids[:args.limit] if args.limit else ids
 
+    got = skipped = 0
     for i, mid in enumerate(ids, 1):
-        path = out / "replays" / f"{mid}.json"
-        if path.exists() and not args.force:
+        path = replay_path(out, mid, not args.no_gzip)
+        if (path.exists() or replay_path(out, mid, False).exists()) and not args.force:
+            skipped += 1
             continue
         try:
             rep = fetch_replay(mid)
@@ -225,16 +254,19 @@ def cmd_fetch(args) -> None:
             print(f"  {mid}: {e}")
             continue
         rep["id"] = mid
-        path.write_text(json.dumps(rep))
-        print(f"  [{i}/{len(ids)}] {mid} -> {path} ({path.stat().st_size // 1024} kB)")
+        write_replay(path, rep)
+        got += 1
+        if got % 25 == 0 or i == len(ids):
+            print(f"  [{i}/{len(ids)}] {got} fetched, {skipped} already had", flush=True)
         time.sleep(args.delay)
+    print(f"done: {got} new, {skipped} skipped -> {out / 'replays'}")
 
 
 def cmd_report(args) -> None:
     from analysis import viewer
 
     out = Path(args.dir)
-    reps = sorted((out / "replays").glob("*.json"))
+    reps = replay_files(out)
     if not reps:
         raise SystemExit(f"no replays in {out / 'replays'} — run `fetch` first")
 
@@ -245,7 +277,7 @@ def cmd_report(args) -> None:
 
     rows = []
     for path in reps:
-        rep = json.loads(path.read_text())
+        rep = read_replay(path)
         if args.player not in rep["players"]:
             continue
         s = summarise(rep, args.player, meta_by_id.get(str(rep.get("id"))))
@@ -297,8 +329,8 @@ def cmd_maps(args) -> None:
         meta_by_id = {str(m["id"]): m for m in json.loads(mpath.read_text())}
 
     grids, kept = [], []
-    for path in sorted((out / "replays").glob("*.json")):
-        rep = json.loads(path.read_text())
+    for path in replay_files(out):
+        rep = read_replay(path)
         if args.player not in rep["players"]:
             continue
         s = summarise(rep, args.player, meta_by_id.get(str(rep.get("id"))))
@@ -317,6 +349,52 @@ def cmd_maps(args) -> None:
         print("  ", dict(collections.Counter(k["opponent"] for k in kept)))
 
 
+def cmd_harvest(args) -> None:
+    """Pull many players' games. The field's own replays are free ground truth —
+    they cost no submission budget and there are thousands of them."""
+    out = Path(args.out)
+    (out / "replays").mkdir(parents=True, exist_ok=True)
+    seen: set[int] = set()
+    for name in [p.strip() for p in args.players.split(",") if p.strip()]:
+        try:
+            matches = fetch_matches(name)
+        except Exception as e:                       # noqa: BLE001
+            print(f"{name}: {e}")
+            continue
+        ids = [int(m["id"]) for m in matches if m.get("id") is not None]
+        (out / f"matches_{name.replace('/', '_')}.json").write_text(json.dumps(matches))
+        print(f"{name}: {len(ids)} matches", flush=True)
+        ns = argparse.Namespace(out=str(out), player=name, limit=args.limit,
+                                delay=args.delay, force=False, no_gzip=args.no_gzip)
+        fresh = [i for i in ids if i not in seen]
+        if args.limit:
+            fresh = fresh[:args.limit]
+        seen.update(fresh)
+        _fetch_ids(ns, out, fresh)
+    print(f"total distinct replays touched: {len(seen)}")
+
+
+def _fetch_ids(args, out: Path, ids: list[int]) -> None:
+    got = skipped = 0
+    for i, mid in enumerate(ids, 1):
+        path = replay_path(out, mid, not args.no_gzip)
+        if path.exists() or replay_path(out, mid, False).exists():
+            skipped += 1
+            continue
+        try:
+            rep = fetch_replay(mid)
+        except Exception as e:                       # noqa: BLE001
+            print(f"  {mid}: {e}", flush=True)
+            continue
+        rep["id"] = mid
+        write_replay(path, rep)
+        got += 1
+        if got % 50 == 0:
+            print(f"  {got} fetched / {len(ids)}", flush=True)
+        time.sleep(args.delay)
+    print(f"  -> {got} new, {skipped} already had", flush=True)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -328,7 +406,16 @@ def main() -> None:
     f.add_argument("--limit", type=int, default=0, help="0 = all")
     f.add_argument("--delay", type=float, default=0.3, help="seconds between requests")
     f.add_argument("--force", action="store_true")
+    f.add_argument("--no-gzip", action="store_true", help="store raw json (10x bigger)")
     f.set_defaults(func=cmd_fetch)
+
+    h = sub.add_parser("harvest", help="download many players' games (free ground truth)")
+    h.add_argument("--players", required=True, help="comma-separated names")
+    h.add_argument("--out", default="/local/data/vng205/replays")
+    h.add_argument("--limit", type=int, default=0)
+    h.add_argument("--delay", type=float, default=0.2)
+    h.add_argument("--no-gzip", action="store_true")
+    h.set_defaults(func=cmd_harvest)
 
     r = sub.add_parser("report", help="summarise downloaded replays")
     r.add_argument("dir", nargs="?", default="runs/official")

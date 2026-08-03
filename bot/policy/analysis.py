@@ -86,15 +86,30 @@ class Analysis:
 
     # -- how much army can reach the general within t turns --------------------
     def _build_defense_curve(self, army: np.ndarray, general: tuple[int, int]) -> None:
+        """Order our stacks by how much army each buys per move spent.
+
+        There is ONE move per turn, so fetching several stacks costs the SUM of
+        their distances, not the max. The old version summed every tile within
+        `t` steps as if they all arrived at once, which overstated our defence by
+        several times: measured on real losses we were dying to 7-army stacks
+        after 60+ turns of warning, because the trigger thought we had 17 army in
+        hand when we could actually bring home one stack and the general.
+        """
         mask = self.my_mask.copy()
         mask[general] = False
-        d = self.dist_home[mask]
-        contrib = np.maximum(army[mask] - 1, 0)
-        order = np.argsort(d, kind="stable")
-        self._def_dists = d[order]
+        d = np.maximum(self.dist_home[mask].astype(np.int64), 1)
+        contrib = np.maximum(army[mask].astype(np.int64) - 1, 0)
+        keep = contrib > 0
+        d, contrib = d[keep], contrib[keep]
+        # greedy: best army-per-move first, then spend the move budget in order
+        order = np.argsort(-(contrib / d), kind="stable")
+        self._def_dists = np.cumsum(d[order])
         self._def_cum = np.cumsum(contrib[order])
 
     def defense_within(self, turns: int) -> int:
+        """Army we could actually have standing on the general in `turns` turns."""
+        if self._def_dists.size == 0:
+            return self.general_army
         k = int(np.searchsorted(self._def_dists, turns, side="right"))
         reachable = int(self._def_cum[k - 1]) if k else 0
         return self.general_army + reachable
