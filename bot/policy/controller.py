@@ -185,9 +185,14 @@ class Controller:
         seen = int(b.mem_turn[target]) >= 0
         seen_army = int(b.mem_army[target]) if seen else 0
         seen_age = obs.turn - int(b.mem_turn[target]) if seen else 0
+        # An unseen general used to be priced at rules.general_army_at(turn) —
+        # what a general that never moved would hold. Real opponents spend it
+        # (hunter garrisons 4), so that term priced every kill attempt out of
+        # reach and ATTACK never fired once in 160 games. Their general cannot
+        # hold more than their total army, so bound it by that and let
+        # attack_defense_frac carry the estimate.
         estimate = max(
             seen_army + seen_age // 2,
-            0 if seen else rules.general_army_at(obs.turn),
             int(obs.opp_army * self.cfg.attack_defense_frac),
         )
         margin = self.cfg.attack_margin if located else self.cfg.attack_margin_unsure
@@ -231,6 +236,14 @@ class Controller:
         # the general's army until it is worth a full run, even if that means
         # passing for the first twenty turns.
         hold_general = mode == EXPAND and obs.turn < cfg.first_expand_turn
+        # The general regrows +1 every two turns on its own, so the cheapest
+        # possible defence is simply not to spend it. Their total army is
+        # reported every turn, so the floor can track the force that actually
+        # exists rather than the part we happen to see. Committing modes ignore
+        # it — at that point the game is decided by the attack, not the base.
+        floor = 0
+        if mode not in (ATTACK, DEATHTOUCH) and obs.turn >= cfg.garrison_from_turn:
+            floor = min(cfg.garrison_cap, int(cfg.garrison_frac * obs.opp_army))
 
         best, best_score = None, -math.inf
         checked = 0
@@ -262,6 +275,8 @@ class Controller:
                 for split in splits:
                     mv = army // 2 if split else army - 1
                     if mv <= 0:
+                        continue
+                    if is_general and army - mv < floor:
                         continue
                     s = base + w.army * math.log1p(mv) + w.stack_break * ((army - mv) / army)
                     if dest_owner == rules.OWNER_ME:

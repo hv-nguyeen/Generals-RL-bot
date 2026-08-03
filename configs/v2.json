@@ -105,7 +105,7 @@
   "attack_margin_unsure": 2.0,
   "probe_turn": 170,
   "located_candidates": 4,
-  "attack_defense_frac": 0.35,
+  "attack_defense_frac": 0.2,
   "gather_start_turn": 60,
   "gather_army_ratio": 1.05,
   "expand_floor": 3,

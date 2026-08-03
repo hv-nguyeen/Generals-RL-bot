@@ -115,6 +115,14 @@ class Config:
     # Sticky: once defending, stay defending for this many turns so the bot does
     # not oscillate between running home and running away.
     defend_hold: int = 6
+    # Army the general refuses to spend, as a fraction of the opponent's total
+    # army (reported every turn, so this tracks force we cannot see). The general
+    # regrows on its own, so this costs tempo only, not army. Routing army home
+    # instead was measured and is much worse: it never releases and land
+    # collapses. 0 disables.
+    garrison_frac: float = 0.0
+    garrison_cap: int = 60             # never hoard more than this on the general
+    garrison_from_turn: int = 40
 
     # ---- attacking ---------------------------------------------------------
     attack_margin: float = 1.25        # strike stack must beat estimated defence
@@ -125,7 +133,7 @@ class Config:
     located_candidates: int = 4        # at or below this, treat the guess as known
     # What fraction of the enemy's total army we assume can reach their general
     # in time, when we cannot see it.
-    attack_defense_frac: float = 0.35
+    attack_defense_frac: float = 0.2
     gather_start_turn: int = 60        # before this, expansion beats consolidation
     gather_army_ratio: float = 1.05    # gather once our army is at least this x theirs
     # Keep expanding while there is still this much free ground within reach;
