@@ -77,7 +77,7 @@ def main() -> None:
     ap.add_argument("--pop", type=int, default=12)
     ap.add_argument("--elite", type=int, default=4)
     ap.add_argument("--games", type=int, default=40, help="games per opponent per candidate")
-    ap.add_argument("--opponents", default="greedy")
+    ap.add_argument("--opponents", default="ours,hunter")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--max-turns", type=int, default=900)
     ap.add_argument("--groups", default=",".join(DEFAULT_GROUPS),

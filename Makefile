@@ -2,6 +2,8 @@ PY := .venv/bin/python
 WORKERS ?= $(shell (nproc 2>/dev/null || sysctl -n hw.ncpu) | awk '{print ($$1>2)?$$1-2:1}')
 OUT ?= runs/tune-big
 GROUPS ?= opening,castle,combat
+# greedy is saturated at ~0.96; hunter is what the leaderboard grades on.
+OPPONENTS ?= ours,hunter
 GAMES ?= 200
 
 .PHONY: help setup test verify bench gauntlet report tune package submit-test profile clean
@@ -29,7 +31,7 @@ bench:  ## quick sanity match, no files written
 
 gauntlet:  ## full run vs every baseline, with replays, into runs/<date>
 	@set -e; d=runs/$$(date +%Y%m%d-%H%M%S); mkdir -p $$d; \
-	for opp in greedy expander random; do \
+	for opp in hunter greedy expander; do \
 	  echo "== vs $$opp"; \
 	  $(PY) -m arena.runner --a ours --b $$opp --games $(GAMES) --workers $(WORKERS) \
 	      --out $$d/$$opp --replays; \
@@ -42,12 +44,12 @@ report:  ## rebuild the HTML report for a run: make report RUN=runs/.../greedy
 
 tune:  ## CEM parameter search (this is the one that wants the big machine)
 	$(PY) -m tools.tune --out runs/tune --iters 15 --pop 12 --games 40 \
-	    --opponents ours,greedy --workers $(WORKERS)
+	    --opponents $(OPPONENTS) --workers $(WORKERS)
 
 tune-big:  ## long detached tuning run; resumable, safe to disconnect
 	@mkdir -p runs
 	nohup $(PY) -m tools.tune --out $(OUT) --iters 40 --pop 16 --games 60 \
-	    --opponents ours,greedy --workers $(WORKERS) --groups $(GROUPS) \
+	    --opponents $(OPPONENTS) --workers $(WORKERS) --groups $(GROUPS) \
 	    > $(OUT).log 2>&1 &
 	@echo "started; tail -f $(OUT).log   (resume after a kill: same command, it checkpoints)"
 
