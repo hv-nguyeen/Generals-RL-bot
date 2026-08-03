@@ -68,18 +68,18 @@ def forward(params, x):
     return jnp.concatenate([flat, pass_logit[:, None]], axis=1)
 
 
-def load(data: Path):
+def shard_list(data: Path) -> list[Path]:
     shards = sorted(data.glob("shard_*.npz"))
     if not shards:
         raise SystemExit(f"no shards in {data} — run `python -m learn.dataset` first")
-    xs, ys = [], []
-    for s in shards:
-        z = np.load(s)
-        xs.append(z["x"])
-        ys.append(z["y"])
-    x = np.concatenate(xs).astype(np.float32)
-    y = np.concatenate(ys).astype(np.int32)
-    return x, y
+    return shards
+
+
+def load_shard(path: Path):
+    """One shard, kept float16 in host memory. The full set does not fit:
+    2.2M examples of 12x21x21 float32 is ~46 GB."""
+    z = np.load(path)
+    return z["x"], z["y"].astype(np.int32)
 
 
 def main() -> None:
@@ -98,14 +98,17 @@ def main() -> None:
     import jax.numpy as jnp
 
     print("devices:", jax.devices())
-    x, y = load(Path(args.data))
-    print(f"{len(y)} examples, {x.shape[1:]} features, {features.N_ACTIONS} classes")
+    shards = shard_list(Path(args.data))
+    val_shard = shards[-1]
+    train_shards = shards[:-1] or shards
+    xv16, yv = load_shard(val_shard)
+    xv = xv16[:8192].astype(np.float32)
+    yv = yv[:8192]
+    total = sum(1 for _ in train_shards)
+    print(f"{len(shards)} shards ({total} for training, 1 held out), "
+          f"{features.N_ACTIONS} classes")
 
     rng = np.random.default_rng(args.seed)
-    perm = rng.permutation(len(y))
-    x, y = x[perm], y[perm]
-    n_val = max(1, int(len(y) * args.val))
-    xv, yv, xt, yt = x[:n_val], y[:n_val], x[n_val:], y[n_val:]
 
     key = jax.random.PRNGKey(args.seed)
     params = init_params(key)
@@ -134,25 +137,29 @@ def main() -> None:
 
     t = 0
     for epoch in range(args.epochs):
-        order = rng.permutation(len(yt))
-        started, total, nb = time.time(), 0.0, 0
-        for i in range(0, len(order) - args.batch + 1, args.batch):
-            idx = order[i:i + args.batch]
-            t += 1
-            params, m, v, loss = step(params, m, v, t,
-                                      jnp.asarray(xt[idx]), jnp.asarray(yt[idx]))
-            total += float(loss)
-            nb += 1
+        started, running, nb = time.time(), 0.0, 0
+        for sp in rng.permutation(len(train_shards)):
+            xs16, ys = load_shard(train_shards[sp])
+            order = rng.permutation(len(ys))
+            for i in range(0, len(order) - args.batch + 1, args.batch):
+                idx = order[i:i + args.batch]
+                t += 1
+                params, m, v, loss = step(
+                    params, m, v, t,
+                    jnp.asarray(xs16[idx].astype(np.float32)), jnp.asarray(ys[idx]))
+                running += float(loss)
+                nb += 1
+            del xs16, ys
         accs = [float(accuracy(params, jnp.asarray(xv[i:i + 1024]),
                                jnp.asarray(yv[i:i + 1024])))
                 for i in range(0, len(yv), 1024)]
-        print(f"epoch {epoch}  loss {total / max(nb, 1):.4f}  "
+        print(f"epoch {epoch}  loss {running / max(nb, 1):.4f}  "
               f"val top-1 {np.mean(accs):.3f}  {time.time() - started:.0f}s", flush=True)
 
     out = Path(args.out)
     np.savez_compressed(out, **{k: np.asarray(v_) for k, v_ in params.items()})
     (out.with_suffix(".json")).write_text(json.dumps(
-        {"examples": int(len(y)), "epochs": args.epochs,
+        {"shards": len(shards), "epochs": args.epochs,
          "channels": CHANNELS, "layers": LAYERS}, indent=2))
     print(f"\nwrote {out}")
     print("Use it as a sparring partner:")
