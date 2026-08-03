@@ -75,13 +75,17 @@ def main() -> None:
     ap.add_argument("--init", default=None, help="clone weights to warm start from")
     ap.add_argument("--out", default="/local/data/vng205/rl.npz")
     ap.add_argument("--envs", type=int, default=128)
-    ap.add_argument("--steps", type=int, default=64, help="rollout length per iteration")
+    ap.add_argument("--steps", type=int, default=192, help="rollout length per iteration")
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--gamma", type=float, default=0.999)
     ap.add_argument("--lam", type=float, default=0.95)
-    ap.add_argument("--entropy", type=float, default=0.01)
+    ap.add_argument("--entropy", type=float, default=0.001)
+    ap.add_argument("--kl", type=float, default=0.05,
+                    help="pull toward the warm-start policy; 0 disables")
+    ap.add_argument("--shape", type=float, default=0.02,
+                    help="dense reward per net tile gained; 0 = terminal only")
     ap.add_argument("--epochs", type=int, default=2, help="PPO epochs per batch")
     ap.add_argument("--save-every", type=int, default=20)
     ap.add_argument("--seed", type=int, default=0)
@@ -112,6 +116,7 @@ def main() -> None:
               + (f" (missing {missing}, kept random)" if missing else ""))
     key, k_val = jr.split(key)
     params = add_value_head(params, k_val)
+    anchor = {k: v for k, v in params.items() if not k.startswith("val_")}
 
     opt = {k: (jnp.zeros_like(v), jnp.zeros_like(v)) for k, v in params.items()}
 
@@ -141,6 +146,12 @@ def main() -> None:
         logits, value = policy_value(p, x)
         logits = jnp.where(mask, logits, -1e9)
         lp = jax.nn.log_softmax(logits)
+        # Anchor to the clone. PPO's clip bounds each step, not the total drift,
+        # so with a noisy advantage signal a good warm start decays into noise —
+        # which is exactly what happened: 0.155 -> 0.080 against our own bot.
+        ref_logits, _ = policy_value({**p, **anchor}, x)
+        ref_lp = jax.nn.log_softmax(jnp.where(mask, ref_logits, -1e9))
+        kl = jnp.sum(jnp.exp(ref_lp) * jnp.where(mask, ref_lp - lp, 0.0), axis=1).mean()
         logp = lp[jnp.arange(idx.shape[0]), idx]
         ratio = jnp.exp(logp - old_logp)
         a = (adv - adv.mean()) / (adv.std() + 1e-8)
@@ -149,7 +160,7 @@ def main() -> None:
         vloss = jnp.mean((value - ret) ** 2)
         probs = jnp.exp(lp) * mask
         ent = -jnp.sum(probs * jnp.where(mask, lp, 0.0), axis=1).mean()
-        return pg + 0.5 * vloss - args.entropy * ent
+        return pg + 0.5 * vloss - args.entropy * ent + args.kl * kl
 
     @jax.jit
     def update(p, opt, t, batch):
@@ -172,15 +183,28 @@ def main() -> None:
     started = time.time()
     for it in range(args.iters):
         buf = {"x": [], "mask": [], "idx": [], "logp": [], "val": [], "rew": [], "done": []}
+        lead = None            # land lead; the env reports it in info.land
+        terminals = 0
         for _ in range(args.steps):
             key, k0, k1 = jr.split(key, 3)
             a0, i0, lp0, v0, x0, m0 = act(params, states, 0, k0)
             a1, *_ = act(params, states, 1, k1)
             ts, states = env_step(states, a0, a1)
+            done = ts.terminated | ts.truncated
+            # A win is hundreds of turns away, so terminal-only reward leaves
+            # almost every rollout with no signal at all and the update becomes
+            # value noise. Reward the change in the land lead each step; the
+            # terminal reward still dominates.
+            land = ts.info.land
+            new_lead = (land[:, 0] - land[:, 1]).astype(jnp.float32)
+            delta = jnp.zeros_like(new_lead) if lead is None else new_lead - lead
+            shaped = args.shape * jnp.where(done, 0.0, delta)
+            lead = jnp.where(done, 0.0, new_lead)
+            terminals += int(done.sum())
             buf["x"].append(x0); buf["mask"].append(m0); buf["idx"].append(i0)
             buf["logp"].append(lp0); buf["val"].append(v0)
-            buf["rew"].append(ts.reward[:, 0])
-            buf["done"].append(ts.terminated | ts.truncated)
+            buf["rew"].append(ts.reward[:, 0] + shaped)
+            buf["done"].append(done)
 
         # GAE over the rollout, treating each env column independently
         rew = jnp.stack(buf["rew"])
@@ -203,9 +227,10 @@ def main() -> None:
             params, opt, loss = update(params, opt, step_count, flat)
 
         if it % 5 == 0:
-            wins = float((rew > 0).sum())
-            print(f"iter {it:4d}  loss {float(loss):+.4f}  rollout_reward {float(rew.sum()):+.1f}  "
-                  f"terminal_wins {wins:.0f}  {time.time() - started:.0f}s", flush=True)
+            print(f"iter {it:4d}  loss {float(loss):+.4f}  "
+                  f"reward/step {float(rew.mean()):+.4f}  terminals {terminals}  "
+                  f"|adv| {float(jnp.abs(adv).mean()):.3f}  "
+                  f"{time.time() - started:.0f}s", flush=True)
         if it and it % args.save_every == 0:
             export(params, args.out)
     export(params, args.out)
