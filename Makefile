@@ -6,7 +6,7 @@ GROUPS ?= opening,castle,combat
 OPPONENTS ?= ours,hunter
 GAMES ?= 200
 
-.PHONY: help setup test verify bench gauntlet report tune package submit-test profile clean
+.PHONY: help setup test verify bench gauntlet report tune tune-big diag diag-quick package submit-test profile clean
 
 help:
 	@grep -E '^[a-z-]+:.*?##' $(MAKEFILE_LIST) | sed 's/:.*##/\t/' | column -t -s "$$(printf '\t')"
@@ -58,6 +58,14 @@ package:  ## build dist/generals-bot.zip
 
 submit-test: package  ## build the zip and play it through the real wire protocol
 	$(PY) -m tools.package --name generals-bot $(if $(CONFIG),--config $(CONFIG),) --test 4
+
+diag:  ## full diagnostic report, paste-able. make diag WORKERS=32 [CONFIG=x.json] [VS=y.json]
+	$(PY) -m tools.diagnose --workers $(WORKERS) \
+	    $(if $(CONFIG),--config $(CONFIG),) $(if $(VS),--vs $(VS),) $(DIAGARGS)
+
+diag-quick:  ## same, ~1 minute
+	$(PY) -m tools.diagnose --workers $(WORKERS) --quick \
+	    $(if $(CONFIG),--config $(CONFIG),) $(if $(VS),--vs $(VS),)
 
 profile:  ## per-move timing distribution
 	$(PY) -m tools.profile_turn --games 3

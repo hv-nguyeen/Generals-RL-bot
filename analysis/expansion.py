@@ -60,6 +60,46 @@ def fingerprint(states, seat: int, horizon: int = 200) -> dict:
     }
 
 
+def mode_profile(spec: str, opponent: str, games: int, lo: int, hi: int,
+                 seed0: int = 0) -> list[dict]:
+    """Which mode spends the turns in [lo, hi), and does it take ground?
+
+    This is the diagnostic that found the big one: GATHER was taking 72% of the
+    midgame and capturing on 6% of those turns while EXPAND captured on 80%.
+    A mode with a large share and a low capture rate is where the Elo is.
+    """
+    import collections
+
+    from arena import agents as agents_mod
+    from sim import engine, mapgen
+
+    turns = collections.Counter()
+    gains = collections.Counter()
+    for seed in range(seed0, seed0 + games):
+        grid = mapgen.generate(seed)
+        st = engine.from_grid(grid)
+        me = agents_mod.make(spec, 0, *grid.shape)
+        opp = agents_mod.make(opponent, 1, *grid.shape)
+        prev = int(st.own[0].sum())
+        for t in range(hi):
+            a0 = me.act(engine.observe(st, 0))
+            a1 = opp.act(engine.observe(st, 1))
+            mode = getattr(me, "last_debug", {}).get("mode", "?")
+            done = engine.step(st, a0, a1)
+            cur = int(st.own[0].sum())
+            if lo <= t < hi:
+                turns[mode] += 1
+                if cur > prev:
+                    gains[mode] += 1
+            prev = cur
+            if done:
+                break
+    total = sum(turns.values()) or 1
+    return [{"mode": m, "turns": n, "share": n / total,
+             "captures": gains[m], "capture_rate": gains[m] / n}
+            for m, n in turns.most_common()]
+
+
 def _mean(rows, key):
     vals = [r[key] for r in rows if r.get(key) is not None]
     return float(np.mean(vals)) if vals else float("nan")

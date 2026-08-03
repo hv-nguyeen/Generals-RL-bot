@@ -17,6 +17,23 @@ make bench      # 40 games vs the greedy baseline
 
 ## The loop you will actually use
 
+**One command for the whole picture** — gauntlet, loss causes, expansion
+fingerprint, where the turns go, timing. Prints ~40 lines of plain text, made to
+be pasted straight back into a chat:
+
+```bash
+make diag WORKERS=32                    # full, a few minutes
+make diag-quick WORKERS=8               # ~1 minute
+make diag CONFIG=runs/tune/best.json VS=configs/v2.json   # A/B with SPRT
+```
+
+Read it in this order: any `faults` is a bug that costs real games; `land@200`
+under ~105 means we are behind the field on macro whatever the win rate says;
+and in `WHERE THE TURNS GO`, a mode with a big share and a low `cap/turn` is
+where the Elo is hiding. That table is what found the castle-gather bug.
+
+Individual pieces, if you want them:
+
 ```bash
 # 1. sweep one knob on identical boards
 python -m tools.sweep first_expand_turn 18,24,30,36 --games 120
