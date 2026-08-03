@@ -216,6 +216,29 @@ def test_room_field_matches_a_direct_count():
         assert room[cell] == int(((d <= 7) & passable).sum()) - 1
 
 
+def test_numpy_conv_matches_the_training_conv():
+    """The submission runs numpy; training runs JAX. If the two convolutions
+    disagree the network trains fine and plays like noise, and nothing about the
+    failure points at the forward pass."""
+    try:
+        import jax
+        import jax.numpy as jnp
+    except ImportError:
+        return
+    from bot.policy.net import _conv3x3
+
+    rng = np.random.default_rng(0)
+    for cin, cout, n in ((6, 5, 7), (12, 32, 21), (32, 8, 21)):
+        x = rng.normal(size=(cin, n, n)).astype("f4")
+        w = rng.normal(size=(cout, cin, 3, 3)).astype("f4")
+        b = rng.normal(size=cout).astype("f4")
+        ref = np.asarray(jax.lax.conv_general_dilated(
+            jnp.asarray(x)[None], jnp.asarray(w), (1, 1), "SAME",
+            dimension_numbers=("NCHW", "OIHW", "NCHW"))[0]) + b[:, None, None]
+        got = _conv3x3(x, w, b)
+        assert np.abs(got - ref).max() < 1e-3, f"conv mismatch at {cin}->{cout}"
+
+
 def main() -> None:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

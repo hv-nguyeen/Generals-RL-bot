@@ -37,7 +37,11 @@ def _conv3x3(x: np.ndarray, w: np.ndarray, b: np.ndarray) -> np.ndarray:
         for dx in range(3):
             cols[k * cin:(k + 1) * cin] = padded[:, dy:dy + h, dx:dx + w_].reshape(cin, -1)
             k += 1
-    out = w.reshape(cout, -1) @ cols
+    # cols is laid out (kh, kw, cin); the weights are stored (cout, cin, kh, kw),
+    # so they must be transposed to match before flattening. Getting this wrong
+    # produces a plausible-looking network that computes nonsense — it cost a
+    # 200-0 arena result before the two paths were compared directly.
+    out = w.transpose(0, 2, 3, 1).reshape(cout, -1) @ cols
     return (out + b[:, None]).reshape(cout, h, w_)
 
 
