@@ -216,14 +216,27 @@ class Controller:
             return None
 
         if self.thrust is None:
-            if an.biggest_stack_pos is None or an.biggest_stack < cfg.thrust_min_army:
+            # NEVER launch the fist from the general. Replays show the sequence
+            # plainly: DEFEND pulls army home (21 -> 72), that makes
+            # defense_within look healthy so DEFEND stops firing, and the next
+            # turn the thrust picks the general as 'biggest stack' and marches
+            # the whole garrison away (72 -> 1) with a 64-army stack three steps
+            # out. 16 of 50 losses walked army off the general with a live threat
+            # adjacent. The general is a base, not ammunition.
+            gr, gc = self.belief.my_general
+            pool = an.my_mask.copy()
+            pool[gr, gc] = False
+            pool &= obs.army_grid >= cfg.thrust_min_army
+            if not pool.any():
                 return None
-            if an.biggest_stack < cfg.thrust_army_ratio * max(obs.my_army, 1):
+            idx = int(np.argmax(np.where(pool, obs.army_grid, 0)))
+            start = (idx // self.W, idx % self.W)
+            if int(obs.army_grid[start]) < cfg.thrust_army_ratio * max(obs.my_army, 1):
                 return None
             target = self.belief.enemy_general or self.belief.general_guess
             if target is None:
                 return None
-            self.thrust = {"pos": an.biggest_stack_pos, "target": target}
+            self.thrust = {"pos": start, "target": target}
 
         # Re-aim the moment we actually see their general.
         if self.belief.enemy_general is not None:
