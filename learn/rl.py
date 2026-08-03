@@ -87,6 +87,8 @@ def main() -> None:
     ap.add_argument("--shape", type=float, default=0.02,
                     help="dense reward per net tile gained; 0 = terminal only")
     ap.add_argument("--epochs", type=int, default=2, help="PPO epochs per batch")
+    ap.add_argument("--minibatch", type=int, default=4096,
+                    help="examples per gradient step; the whole rollout will not fit")
     ap.add_argument("--save-every", type=int, default=20)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -116,7 +118,7 @@ def main() -> None:
               + (f" (missing {missing}, kept random)" if missing else ""))
     key, k_val = jr.split(key)
     params = add_value_head(params, k_val)
-    anchor = {k: v for k, v in params.items() if not k.startswith("val_")}
+    anchor_full = {k: (v.copy() if hasattr(v, "copy") else v) for k, v in params.items()}
 
     opt = {k: (jnp.zeros_like(v), jnp.zeros_like(v)) for k, v in params.items()}
 
@@ -128,31 +130,36 @@ def main() -> None:
         return x, mask
 
     @jax.jit
-    def act(params, states, seat, key):
+    def act(params, anchor_p, states, seat, key):
         x, mask = obs_batch(states, seat)
         logits, value = policy_value(params, x)
         logits = jnp.where(mask, logits, -1e9)
         idx = jr.categorical(key, logits)
         logp = jax.nn.log_softmax(logits)[jnp.arange(idx.shape[0]), idx]
+        # anchor log-prob of the SAME action, evaluated here so the reference
+        # network never appears in the training graph — a second forward and
+        # backward over a 49k batch is what exhausted the card
+        ref_logits, _ = policy_value(anchor_p, x)
+        ref_logp = jax.nn.log_softmax(jnp.where(mask, ref_logits, -1e9))[
+            jnp.arange(idx.shape[0]), idx]
         actions = jax.vmap(rlenv.index_to_engine_action)(idx)
-        return actions, idx, logp, value, x, mask
+        return actions, idx, logp, ref_logp, value, x, mask
 
     @jax.jit
     def env_step(states, a0, a1):
         actions = jnp.stack([a0, a1], axis=1)
         return jax.vmap(lambda s, a: env.step(s, a, pool))(states, actions)
 
-    def ppo_loss(p, x, mask, idx, old_logp, adv, ret):
+    def ppo_loss(p, x, mask, idx, old_logp, ref_logp, adv, ret):
         logits, value = policy_value(p, x)
         logits = jnp.where(mask, logits, -1e9)
         lp = jax.nn.log_softmax(logits)
-        # Anchor to the clone. PPO's clip bounds each step, not the total drift,
-        # so with a noisy advantage signal a good warm start decays into noise —
-        # which is exactly what happened: 0.155 -> 0.080 against our own bot.
-        ref_logits, _ = policy_value({**p, **anchor}, x)
-        ref_lp = jax.nn.log_softmax(jnp.where(mask, ref_logits, -1e9))
-        kl = jnp.sum(jnp.exp(ref_lp) * jnp.where(mask, ref_lp - lp, 0.0), axis=1).mean()
         logp = lp[jnp.arange(idx.shape[0]), idx]
+        # Anchor to the clone: PPO's clip bounds each update, not cumulative
+        # drift, so a good warm start decays under a noisy signal. k3 estimator
+        # from stored scalars, so the reference net stays out of the graph.
+        d = ref_logp - logp
+        kl = jnp.mean(jnp.exp(d) - d - 1.0)
         ratio = jnp.exp(logp - old_logp)
         a = (adv - adv.mean()) / (adv.std() + 1e-8)
         pg = -jnp.minimum(ratio * a,
@@ -182,13 +189,14 @@ def main() -> None:
     step_count = 0
     started = time.time()
     for it in range(args.iters):
-        buf = {"x": [], "mask": [], "idx": [], "logp": [], "val": [], "rew": [], "done": []}
+        buf = {"x": [], "mask": [], "idx": [], "logp": [], "ref": [],
+               "val": [], "rew": [], "done": []}
         lead = None            # land lead; the env reports it in info.land
         terminals = 0
         for _ in range(args.steps):
             key, k0, k1 = jr.split(key, 3)
-            a0, i0, lp0, v0, x0, m0 = act(params, states, 0, k0)
-            a1, *_ = act(params, states, 1, k1)
+            a0, i0, lp0, rlp0, v0, x0, m0 = act(params, anchor_full, states, 0, k0)
+            a1, *_ = act(params, anchor_full, states, 1, k1)
             ts, states = env_step(states, a0, a1)
             done = ts.terminated | ts.truncated
             # A win is hundreds of turns away, so terminal-only reward leaves
@@ -202,7 +210,7 @@ def main() -> None:
             lead = jnp.where(done, 0.0, new_lead)
             terminals += int(done.sum())
             buf["x"].append(x0); buf["mask"].append(m0); buf["idx"].append(i0)
-            buf["logp"].append(lp0); buf["val"].append(v0)
+            buf["logp"].append(lp0); buf["ref"].append(rlp0); buf["val"].append(v0)
             buf["rew"].append(ts.reward[:, 0] + shaped)
             buf["done"].append(done)
 
@@ -221,10 +229,16 @@ def main() -> None:
 
         flat = (jnp.concatenate(buf["x"]), jnp.concatenate(buf["mask"]),
                 jnp.concatenate(buf["idx"]), jnp.concatenate(buf["logp"]),
-                adv.reshape(-1), ret.reshape(-1))
+                jnp.concatenate(buf["ref"]), adv.reshape(-1), ret.reshape(-1))
+        n = flat[0].shape[0]
         for _ in range(args.epochs):
-            step_count += 1
-            params, opt, loss = update(params, opt, step_count, flat)
+            key, k_shuf = jr.split(key)
+            order = jr.permutation(k_shuf, n)
+            for start in range(0, n - args.minibatch + 1, args.minibatch):
+                sel = order[start:start + args.minibatch]
+                step_count += 1
+                params, opt, loss = update(params, opt, step_count,
+                                           tuple(a[sel] for a in flat))
 
         if it % 5 == 0:
             print(f"iter {it:4d}  loss {float(loss):+.4f}  "
