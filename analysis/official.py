@@ -172,30 +172,96 @@ def to_states(rep: dict):
 def castle_builds(rep: dict) -> list[tuple[int, int, int]]:
     """(tick, row, col) for every castle built during the game.
 
-    The tick data has no castle channel, so builds are found by their price: a
-    cell loses at least the 35-army base cost in one tick, keeps its owner, and
-    no neighbour picks that army up (which is what a move would look like).
+    Replays carry no castle channel. Recovering builds from the army they cost
+    fails in both directions: attacking a defended tile also looks like a big
+    drop with no neighbour gain (false positive), and a strict price test misses
+    builds whose surcharge depends on castles we have not found yet (false
+    negative). Either way a wrong structure set means wrong +1 growth, and the
+    simulated state diverges for the rest of the game.
+
+    So use the growth itself, which is the definition rather than a proxy: a
+    structure gains exactly +1 on EVERY even tick, a plain tile gains 0 (both
+    gain an extra +1 on 50-ticks). Only one cell per player moves per tick, so
+    almost every cell is undisturbed and its growth pattern is clean. A cell is
+    called a castle from the first even tick whose +1 is corroborated by the
+    following ones.
     """
     ticks = rep["ticks"]
-    out: list[tuple[int, int, int]] = []
-    if len(ticks) < 2:
-        return out
+    if len(ticks) < 4:
+        return []
+    h, w = int(rep["dims"]["rows"]), int(rep["dims"]["cols"])
+    generals = np.zeros((h, w), dtype=bool)
+    for r, c in rep["generals"]:
+        generals[r, c] = True
+
+    # per cell, the sequence of (tick, grew_like_a_structure) on even ticks where
+    # the owner did not change
+    seen: dict[tuple[int, int], list[tuple[int, bool]]] = {}
     prev_a = np.asarray(ticks[0]["armies"], dtype=np.int32)
     prev_o = np.asarray(ticks[0]["owners"], dtype=np.int32)
     for t in range(1, len(ticks)):
         a = np.asarray(ticks[t]["armies"], dtype=np.int32)
         o = np.asarray(ticks[t]["owners"], dtype=np.int32)
+        if t % 2 == 0:
+            bonus = 1 if t % 50 == 0 else 0
+            delta = a - prev_a
+            steady = (o == prev_o) & (o >= 0) & ~generals
+            for r, c in np.argwhere(steady & ((delta == 1 + bonus) | (delta == bonus))):
+                seen.setdefault((int(r), int(c)), []).append(
+                    (t, bool(delta[r, c] == 1 + bonus)))
+        prev_a, prev_o = a, o
+
+    out: list[tuple[int, int, int]] = []
+    for (r, c), hist in seen.items():
+        for i, (t, grew) in enumerate(hist):
+            if not grew:
+                continue
+            after = [g for _, g in hist[i + 1:i + 4]]
+            if len(after) >= 2 and sum(after) >= 2:
+                out.append((t, r, c))
+                break
+    out.sort()
+    return out
+
+
+def castle_builds_by_cost(rep: dict) -> list[tuple[int, int, int]]:
+    """Alternative hypothesis: builds recovered from the exact army they cost.
+
+    Complements `castle_builds`, which reads the +1-per-even-tick growth
+    signature. Neither is reliable alone — the growth test confuses a one-army
+    reinforcement for a structure, the cost test misses builds whose surcharge
+    depends on castles not yet found. `analysis.actions` tries both and keeps
+    whichever reconstructs more of the replay.
+    """
+    ticks = rep["ticks"]
+    out: list[tuple[int, int, int]] = []
+    if len(ticks) < 2:
+        return out
+    h, w = int(rep["dims"]["rows"]), int(rep["dims"]["cols"])
+    generals = np.zeros((h, w), dtype=bool)
+    for r, c in rep["generals"]:
+        generals[r, c] = True
+    castles = np.zeros((h, w), dtype=bool)
+    for r, c in rep.get("castles") or []:
+        castles[r, c] = True
+
+    prev_a = np.asarray(ticks[0]["armies"], dtype=np.int32)
+    prev_o = np.asarray(ticks[0]["owners"], dtype=np.int32)
+    for t in range(1, len(ticks)):
+        a = np.asarray(ticks[t]["armies"], dtype=np.int32)
+        o = np.asarray(ticks[t]["owners"], dtype=np.int32)
+        growth = (1 if t % 2 == 0 else 0) + (1 if t % 50 == 0 else 0)
         delta = a - prev_a
+        cache: dict[int, np.ndarray] = {}
         for r, c in np.argwhere((delta <= -rules.BASE_COST) & (o == prev_o) & (o >= 0)):
             r, c = int(r), int(c)
-            lost = -int(delta[r, c])
-            gained = 0
-            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < a.shape[0] and 0 <= nc < a.shape[1]:
-                    gained = max(gained, int(a[nr, nc] - prev_a[nr, nc]))
-            # a move would deposit what it took onto one neighbour
-            if gained < lost // 2:
+            if castles[r, c] or generals[r, c]:
+                continue
+            pl = int(o[r, c])
+            if pl not in cache:
+                cache[pl] = rules.build_cost_grid((castles | generals) & (prev_o == pl))
+            if int(delta[r, c]) == growth - int(cache[pl][r, c]):
+                castles[r, c] = True
                 out.append((t, r, c))
         prev_a, prev_o = a, o
     return out

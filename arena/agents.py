@@ -9,6 +9,7 @@ A spec is a string so runs are reproducible from a command line:
     hunter                   the starter kit's decapitation bot; the leaderboard grades on it
     random                   uniform over legal moves
     idle                     always passes
+    clone:weights.npz        a behaviour-cloned policy (learn/train.py)
     stdio:dist/x/run.sh      a packaged submission, over the real wire protocol
 
 `expander` is deliberately a faithful port, bug included: it treats
@@ -246,6 +247,9 @@ def make(spec: str, player_id: int, h: int, w: int, seed: int = 0):
         return RandomAgent(player_id, h, w, seed)
     if name == "idle":
         return Idle(player_id, h, w)
+    if name == "clone":
+        from bot.policy.net import ClonePolicy
+        return ClonePolicy(player_id, h, w, arg)
     if name == "stdio":
         from arena.stdio_agent import StdioAgent
         return StdioAgent(arg, player_id, h, w)

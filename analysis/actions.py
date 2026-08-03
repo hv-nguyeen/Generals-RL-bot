@@ -25,7 +25,8 @@ from pathlib import Path
 
 import numpy as np
 
-from analysis.official import castle_builds, read_replay, replay_files
+from analysis.official import (castle_builds, castle_builds_by_cost,
+                               read_replay, replay_files)
 from bot import rules
 from bot.board import DIRS, dilate8
 from bot.obs import Obs
@@ -34,7 +35,7 @@ from sim import engine
 PASS = [rules.PASS, 0, 0, 0, 0]
 
 
-def _states_from(rep: dict):
+def _states_from(rep: dict, builds=None):
     """Materialise every tick as a simulator State (castles inferred)."""
     h, w = int(rep["dims"]["rows"]), int(rep["dims"]["cols"])
     mountains = np.zeros((h, w), dtype=bool)
@@ -49,7 +50,8 @@ def _states_from(rep: dict):
     castles = np.zeros((h, w), dtype=bool)
     for r, c in rep.get("castles") or []:
         castles[r, c] = True
-    builds = castle_builds(rep)
+    if builds is None:
+        builds = castle_builds(rep)
 
     out = []
     for t, tick in enumerate(rep["ticks"]):
@@ -98,9 +100,23 @@ def _candidates(st: engine.State, p: int, touched: np.ndarray, builds_here) -> l
     return out
 
 
-def infer(rep: dict) -> tuple[list[tuple[list[int], list[int]]], int]:
-    """Per-tick (action_p0, action_p1). Unrecoverable ticks come back as None."""
-    states, builds = _states_from(rep)
+def infer(rep: dict) -> tuple[list, int]:
+    """Per-tick (action_p0, action_p1). Unrecoverable ticks come back as None.
+
+    The castle set is not directly observable, and a wrong one poisons growth for
+    the rest of the game, so both detectors are tried and the hypothesis that
+    reconstructs more ticks wins.
+    """
+    best = None
+    for hypothesis in (castle_builds(rep), castle_builds_by_cost(rep)):
+        acts, solved = _infer_with(rep, hypothesis)
+        if best is None or solved > best[1]:
+            best = (acts, solved)
+    return best
+
+
+def _infer_with(rep: dict, builds) -> tuple[list, int]:
+    states, _ = _states_from(rep, builds)
     by_tick: dict[int, list[tuple[int, int]]] = {}
     for t, r, c in builds:
         by_tick.setdefault(t, []).append((r, c))
