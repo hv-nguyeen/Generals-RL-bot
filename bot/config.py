@@ -181,6 +181,10 @@ class Config:
     # defence from what is standing on it rather than a fraction of their
     # global army. Off = fall back to the global prior.
     attack_trust_sight: bool = True
+    # Subtract visible enemy army that is further from their general than our
+    # fist is: it cannot get home in time, so it is not defence. Off = price
+    # every enemy tile as a garrison no matter where it is standing.
+    attack_discount_committed: bool = True
     gather_start_turn: int = 60        # before this, expansion beats consolidation
     gather_army_ratio: float = 1.05    # gather once our army is at least this x theirs
     # Keep expanding while there is still this much free ground within reach;

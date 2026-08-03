@@ -145,10 +145,10 @@ def _worker(payload: dict) -> dict:
     return play(GameSpec(**payload))
 
 
-def run_match(spec_a: str, spec_b: str, games: int, seed0: int = 0, workers: int = 8,
-              max_turns: int = rules.TURN_LIMIT, time_limit: float = rules.MOVE_BUDGET_S,
-              record: bool = False, progress=None, maps: str | None = None) -> list[dict]:
-    """Play `games` games, colours swapped on alternate games of each seed pair."""
+def _jobs(spec_a: str, spec_b: str, games: int, seed0: int, max_turns: int,
+          time_limit: float, record: bool, maps: str | None) -> list[dict]:
+    """Colours swapped on alternate games of each seed pair. Order is load-bearing:
+    `_tag` reads the seat off the index, so nothing may reorder these."""
     jobs = []
     for i in range(games):
         seed = seed0 + i // 2
@@ -156,6 +156,14 @@ def run_match(spec_a: str, spec_b: str, games: int, seed0: int = 0, workers: int
         s0, s1 = (spec_b, spec_a) if swapped else (spec_a, spec_b)
         jobs.append(dict(spec0=s0, spec1=s1, seed=seed, max_turns=max_turns,
                          time_limit=time_limit, record=record, maps=maps))
+    return jobs
+
+
+def run_match(spec_a: str, spec_b: str, games: int, seed0: int = 0, workers: int = 8,
+              max_turns: int = rules.TURN_LIMIT, time_limit: float = rules.MOVE_BUDGET_S,
+              record: bool = False, progress=None, maps: str | None = None) -> list[dict]:
+    """Play `games` games, colours swapped on alternate games of each seed pair."""
+    jobs = _jobs(spec_a, spec_b, games, seed0, max_turns, time_limit, record, maps)
 
     results = []
     if workers <= 1:
@@ -190,6 +198,32 @@ def _tag(results: list[dict], spec_a: str, spec_b: str) -> list[dict]:
         else:
             r["a_result"] = "win" if r["winner"] == a_seat else "loss"
     return results
+
+
+def run_many(matches: list[tuple[str, str, int, int]], workers: int = 8,
+             max_turns: int = rules.TURN_LIMIT, time_limit: float = rules.MOVE_BUDGET_S,
+             maps: str | None = None) -> list[list[dict]]:
+    """Play several matches in ONE pool. `matches` is [(spec_a, spec_b, games, seed0)];
+    returns one tagged result list per match, in order.
+
+    run_match opens a pool per call, so a caller with many small matches (scoring
+    one config against a mixture of five opponents) never has more than one
+    match's games in flight and leaves most of a 60-core box idle.
+    """
+    batches = [_jobs(a, b, g, s, max_turns, time_limit, False, maps)
+               for a, b, g, s in matches]
+    flat = [j for b in batches for j in b]
+    if workers <= 1:
+        done = [_worker(j) for j in flat]
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            done = list(pool.map(_worker, flat, chunksize=1))
+
+    out, k = [], 0
+    for (a, b, _, _), batch in zip(matches, batches):
+        out.append(_tag(done[k:k + len(batch)], a, b))
+        k += len(batch)
+    return out
 
 
 def tally(results: list[dict]) -> tuple[int, int, int]:

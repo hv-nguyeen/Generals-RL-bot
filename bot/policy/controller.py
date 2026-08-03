@@ -413,9 +413,18 @@ class Controller:
         # reach and ATTACK never fired once in 160 games. Their general cannot
         # hold more than their total army, so bound it by that and let
         # attack_defense_frac carry the estimate.
+        # ...but their total is only a garrison if it can get home before we
+        # arrive. Enemy stacks we can see standing further from their general
+        # than our fist is are committed elsewhere and cannot defend it. Pricing
+        # them in anyway is why no local opponent has ever punished a bot for
+        # over-committing: the counter-strike is not expressible.
+        defenders = int(obs.opp_army)
+        if self.cfg.attack_discount_committed:
+            away = an.opp_mask & (an.dist_enemy_gen > d)
+            defenders = max(0, defenders - int(obs.army_grid[away].sum()))
         estimate = max(
             seen_army + seen_age // 2,
-            int(obs.opp_army * self.cfg.attack_defense_frac),
+            int(defenders * self.cfg.attack_defense_frac),
         )
         margin = self.cfg.attack_margin if located else self.cfg.attack_margin_unsure
         arriving = an.biggest_stack - 1
