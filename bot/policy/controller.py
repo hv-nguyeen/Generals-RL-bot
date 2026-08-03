@@ -403,8 +403,15 @@ class Controller:
         # exists rather than the part we happen to see. Committing modes ignore
         # it — at that point the game is decided by the attack, not the base.
         floor = 0
-        if mode not in (ATTACK, DEATHTOUCH) and obs.turn >= cfg.garrison_from_turn:
-            floor = min(cfg.garrison_cap, int(cfg.garrison_frac * obs.opp_army))
+        if mode not in (ATTACK, DEATHTOUCH):
+            if cfg.garrison_frac > 0 and obs.turn >= cfg.garrison_from_turn:
+                floor = min(cfg.garrison_cap, int(cfg.garrison_frac * obs.opp_army))
+            if cfg.lock_enabled:
+                # Only while something is actually coming: keep enough on the
+                # general to survive the biggest stack in range.
+                incoming = an.max_threat_within(cfg.lock_radius)
+                if incoming > 0:
+                    floor = max(floor, min(incoming + 1, ar[gr][gc]))
 
         best, best_score = None, -math.inf
         checked = 0

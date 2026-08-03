@@ -114,6 +114,13 @@ class Analysis:
         reachable = int(self._def_cum[k - 1]) if k else 0
         return self.general_army + reachable
 
+    def max_threat_within(self, steps: int) -> int:
+        """Largest army an enemy could march at our general from within `steps`."""
+        near = self.opp_mask & (self.dist_home <= steps)
+        if not near.any():
+            return 0
+        return int(np.maximum(self.obs.army_grid[near] - 1, 0).max())
+
     # -- the single most dangerous visible enemy stack -------------------------
     def _find_threat(self, army: np.ndarray) -> None:
         self.threat_army, self.threat_dist, self.threat_pos = 0, 0, None

@@ -89,8 +89,15 @@ class Config:
     # A army captures A-1 tiles before it runs dry, and leaving early means
     # re-walking to a frontier that has not moved.
     first_expand_turn: int = 30
-    # Below this, the general never sources a move (its army is the home guard).
-    general_reserve: int = 2
+    # Threat-conditional general lock. A STANDING garrison was rejected three
+    # times - it pays tempo every turn for insurance that mostly is not needed.
+    # This pays only while an enemy stack is actually within `lock_radius`: the
+    # move scorer may not drain the general below what that stack would arrive
+    # with. Without it the lethal guard judges the general safe and the scorer
+    # spends the army the same turn, which is how real games were lost with 39
+    # troops on the general and a 30-stack two tiles away.
+    lock_enabled: bool = True
+    lock_radius: int = 6
 
     # ---- castle economy ----------------------------------------------------
     # A castle is +0.5 army/turn forever for one turn of investment; expanding
