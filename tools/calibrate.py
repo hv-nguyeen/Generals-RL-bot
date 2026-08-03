@@ -97,8 +97,30 @@ def main() -> None:
         rows.append((label, elo, v))
         print(f"{label:<40}{elo:>8}{v:>14.4f}{n:>11}")
 
+    # Builds that play identically inflate the correlation with duplicate rows.
+    # It happens easily: v10's change was in the code, not the config, so its
+    # config is indistinguishable from v13's under the current tree; and v7's
+    # thrust gate never fires against this opponent, making it v6.
+    seen: dict[tuple[float, int], str] = {}
+    unique = []
+    for label, elo, v in rows:
+        key = (round(v, 6), 0)
+        if key in seen:
+            print(f"\n  ! {label!r} played identically to {seen[key]!r} — "
+                  f"not a distinct build, dropped from the correlation")
+            continue
+        seen[key] = label
+        unique.append((label, elo, v))
+    rows = unique
+
     if len(rows) < 3:
-        raise SystemExit("\nneed at least three builds to calibrate")
+        raise SystemExit("\nneed at least three DISTINCT builds to calibrate")
+
+    spread = max(r[2] for r in rows) - min(r[2] for r in rows)
+    print(f"\n  spread across builds: {spread:.4f}")
+    if spread < 0.05:
+        print("  ! the model barely separates builds that are hundreds of elo "
+              "apart; the ordering below is close to noise")
 
     rho = spearman([r[1] for r in rows], [r[2] for r in rows])
     print(f"\nrank correlation with the ladder: rho = {rho:+.2f}")
