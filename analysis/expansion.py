@@ -122,11 +122,11 @@ def _show(title: str, groups: dict[str, list[dict]]) -> None:
 
 
 def cmd_official(args) -> None:
-    from analysis.official import to_states
+    from analysis.official import read_replay, replay_files, to_states
 
     groups: dict[str, list[dict]] = {}
-    for f in sorted(glob.glob(str(Path(args.dir) / "replays" / "*.json"))):
-        rep = json.loads(Path(f).read_text())
+    for f in replay_files(Path(args.dir)):
+        rep = read_replay(f)
         if args.player not in rep["players"]:
             continue
         me = rep["players"].index(args.player)
