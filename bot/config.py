@@ -126,7 +126,18 @@ class Config:
     # regrows on its own, so this costs tempo only, not army. Routing army home
     # instead was measured and is much worse: it never releases and land
     # collapses. 0 disables.
+    # Army the general refuses to spend, as a fraction of the opponent's total.
+    # Real losses show the general sitting on 4 troops with 600 army on the board
+    # and 28 enemy troops one tile away: the game is decided locally even when the
+    # global count is winning. Coarse values (0.1+) cost too much land; this is
+    # the cheap-insurance end of the range.
+    # Measured harmful even at 0.05 (self-play A/B: 0.352, SPRT rejects). The
+    # reasoning for it is sound and the real-game evidence is real, but the
+    # tempo cost is not. Left as a knob, off.
     garrison_frac: float = 0.0
+    # Any enemy stack within this many steps of our general is treated as urgent,
+    # instead of waiting until it is adjacent.
+    guard_radius: int = 3
     garrison_cap: int = 60             # never hoard more than this on the general
     garrison_from_turn: int = 40
 
@@ -140,6 +151,10 @@ class Config:
     # What fraction of the enemy's total army we assume can reach their general
     # in time, when we cannot see it.
     attack_defense_frac: float = 0.2
+    # Believe our eyes: when their general is actually visible, price the
+    # defence from what is standing on it rather than a fraction of their
+    # global army. Off = fall back to the global prior.
+    attack_trust_sight: bool = True
     gather_start_turn: int = 60        # before this, expansion beats consolidation
     gather_army_ratio: float = 1.05    # gather once our army is at least this x theirs
     # Keep expanding while there is still this much free ground within reach;

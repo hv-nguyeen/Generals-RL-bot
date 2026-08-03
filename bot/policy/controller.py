@@ -56,6 +56,11 @@ class Controller:
             self._debug(obs, an, "guard", None)
             return guard
 
+        lethal = self._lethal_guard(obs, an)
+        if lethal is not None:
+            self._debug(obs, an, "lethal", None)
+            return lethal
+
         plan = castle.plan(an, self.cfg)
         mode, field = self._select_mode(obs, an, plan)
 
@@ -124,6 +129,59 @@ class Controller:
                     best, best_mv = (rules.MOVE, sr, sc, d, 0), mv
         return best
 
+    def _lethal_guard(self, obs: Obs, an: Analysis):
+        """An enemy stack close enough to take the general before help arrives.
+
+        `_deathtouch_guard` only fires once they are already adjacent and only in
+        the endgame. This is the general case: real losses had the general on 4
+        troops with 28 enemy troops three steps away while our global army was
+        winning comfortably. Answer it by taking the stack if we can, otherwise by
+        putting army onto the general.
+        """
+        gr, gc = self.belief.my_general
+        h, w = self.H, self.W
+        worst = None
+        for r, c in np.argwhere(an.opp_mask & (obs.army_grid >= 2)):
+            r, c = int(r), int(c)
+            eta = int(an.dist_home[r, c])
+            if eta > self.cfg.guard_radius:
+                continue
+            incoming = int(obs.army_grid[r, c]) - 1
+            if incoming < an.defense_within(eta):
+                continue
+            if worst is None or incoming > worst[0]:
+                worst = (incoming, r, c)
+        if worst is None:
+            return None
+        _, tr, tc = worst
+
+        # Best answer: take the stack outright, from a tile that is not the
+        # general (the general trading with its own attacker loses the tie-break).
+        best, best_mv = None, -1
+        for d, (dr, dc) in enumerate(DIRS):
+            sr, sc = tr - dr, tc - dc
+            if not (0 <= sr < h and 0 <= sc < w):
+                continue
+            if obs.owner_grid[sr, sc] != rules.OWNER_ME or (sr, sc) == (gr, gc):
+                continue
+            mv = rules.army_to_move(int(obs.army_grid[sr, sc]), 0)
+            if mv > int(obs.army_grid[tr, tc]) and mv > best_mv:
+                best, best_mv = (rules.MOVE, sr, sc, d, 0), mv
+        if best is not None:
+            return best
+
+        # Otherwise feed the general from the fattest neighbour.
+        for d, (dr, dc) in enumerate(DIRS):
+            sr, sc = gr - dr, gc - dc
+            if not (0 <= sr < h and 0 <= sc < w):
+                continue
+            if obs.owner_grid[sr, sc] != rules.OWNER_ME:
+                continue
+            mv = rules.army_to_move(int(obs.army_grid[sr, sc]), 0)
+            if mv > best_mv:
+                best, best_mv = (rules.MOVE, sr, sc, d, 0), mv
+        return best
+
     # ------------------------------------------------------------------ modes
     def _select_mode(self, obs: Obs, an: Analysis, plan) -> tuple[str, np.ndarray]:
         cfg = self.cfg
@@ -181,6 +239,17 @@ class Controller:
         d = int(an.dist_enemy_gen[an.biggest_stack_pos])
         if d >= self.H * self.W:
             return False
+
+        # If their general is visible RIGHT NOW, believe our eyes: count what is
+        # standing on it plus the enemy army we can see near it. Pricing a visible
+        # 2-army general at 20% of their global total refused kills we had already
+        # won - that cost real games.
+        if (self.cfg.attack_trust_sight
+                and obs.type_grid[target] == rules.T_GENERAL
+                and obs.owner_grid[target] == rules.OWNER_OPP):
+            near = an.opp_mask & (an.dist_enemy_gen <= max(1, d // 2))
+            estimate = int(obs.army_grid[target]) + int(obs.army_grid[near].sum()) + d // 2
+            return (an.biggest_stack - 1) > estimate * self.cfg.attack_margin
 
         seen = int(b.mem_turn[target]) >= 0
         seen_army = int(b.mem_army[target]) if seen else 0
