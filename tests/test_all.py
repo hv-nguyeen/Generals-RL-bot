@@ -232,11 +232,16 @@ def test_numpy_conv_matches_the_training_conv():
         x = rng.normal(size=(cin, n, n)).astype("f4")
         w = rng.normal(size=(cout, cin, 3, 3)).astype("f4")
         b = rng.normal(size=cout).astype("f4")
+        # HIGHEST forces true float32: on a GPU jax defaults to TF32, whose
+        # ~10-bit mantissa gives errors around 1e-2 at these magnitudes and would
+        # make this test about float formats rather than about weight layout.
         ref = np.asarray(jax.lax.conv_general_dilated(
             jnp.asarray(x)[None], jnp.asarray(w), (1, 1), "SAME",
-            dimension_numbers=("NCHW", "OIHW", "NCHW"))[0]) + b[:, None, None]
+            dimension_numbers=("NCHW", "OIHW", "NCHW"),
+            precision=jax.lax.Precision.HIGHEST)[0]) + b[:, None, None]
         got = _conv3x3(x, w, b)
-        assert np.abs(got - ref).max() < 1e-3, f"conv mismatch at {cin}->{cout}"
+        scale = max(float(np.abs(ref).max()), 1.0)
+        assert np.abs(got - ref).max() < 1e-4 * scale, f"conv mismatch at {cin}->{cout}"
 
 
 def main() -> None:
