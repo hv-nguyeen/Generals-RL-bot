@@ -1,5 +1,7 @@
 PY := .venv/bin/python
-WORKERS ?= 10
+WORKERS ?= $(shell (nproc 2>/dev/null || sysctl -n hw.ncpu) | awk '{print ($$1>2)?$$1-2:1}')
+OUT ?= runs/tune-big
+GROUPS ?= opening,castle,combat
 GAMES ?= 200
 
 .PHONY: help setup test verify bench gauntlet report tune package submit-test profile clean
@@ -7,10 +9,14 @@ GAMES ?= 200
 help:
 	@grep -E '^[a-z-]+:.*?##' $(MAKEFILE_LIST) | sed 's/:.*##/\t/' | column -t -s "$$(printf '\t')"
 
-setup:  ## create the venv and install deps (uv)
-	uv venv --python 3.12 .venv
-	uv pip install --python $(PY) numpy
-	@echo "optional, for tools/verify_engine.py:  uv pip install --python $(PY) 'jax[cpu]'"
+setup:  ## create the venv and install deps (uv if present, else stdlib venv)
+	@if command -v uv >/dev/null 2>&1; then \
+	  uv venv --python 3.12 .venv && uv pip install --python $(PY) numpy; \
+	else \
+	  python3 -m venv .venv && $(PY) -m pip install -q --upgrade pip && $(PY) -m pip install -q numpy; \
+	fi
+	@$(PY) -c "import sys,numpy;print('python',sys.version.split()[0],'numpy',numpy.__version__)"
+	@echo "optional, for 'make verify':  $(PY) -m pip install 'jax[cpu]'"
 
 test:  ## rule and belief tests
 	$(PY) -m tests.test_all
@@ -36,7 +42,14 @@ report:  ## rebuild the HTML report for a run: make report RUN=runs/.../greedy
 
 tune:  ## CEM parameter search (this is the one that wants the big machine)
 	$(PY) -m tools.tune --out runs/tune --iters 15 --pop 12 --games 40 \
-	    --opponents greedy --workers $(WORKERS)
+	    --opponents ours,greedy --workers $(WORKERS)
+
+tune-big:  ## long detached tuning run; resumable, safe to disconnect
+	@mkdir -p runs
+	nohup $(PY) -m tools.tune --out $(OUT) --iters 40 --pop 16 --games 60 \
+	    --opponents ours,greedy --workers $(WORKERS) --groups $(GROUPS) \
+	    > $(OUT).log 2>&1 &
+	@echo "started; tail -f $(OUT).log   (resume after a kill: same command, it checkpoints)"
 
 package:  ## build dist/generals-bot.zip
 	$(PY) -m tools.package --name generals-bot $(if $(CONFIG),--config $(CONFIG),)

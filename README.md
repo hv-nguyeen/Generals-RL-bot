@@ -45,6 +45,48 @@ The report classifies every loss (`early_rush`, `out_expanded`, `out_gathered`,
 links a scrubable HTML replay of the game. That is the intended way to turn a
 lost match into a change.
 
+## Running on the university server
+
+Nothing in the repo is machine-specific. `.venv/`, `runs/` and `dist/` are
+gitignored, so copy the tracked tree and rebuild the venv there.
+
+```bash
+# from the laptop (~13 MB, most of it the vendored starter kit)
+rsync -az --exclude .venv --exclude runs --exclude dist --exclude __pycache__ \
+    ~/VU/NewGame/ user@server:~/generals-bot/
+
+# on the server
+cd ~/generals-bot
+make setup          # uses uv if present, otherwise python3 -m venv
+make test           # 15 tests, ~10 s — proves the rules model survived the trip
+make bench          # 40 games vs greedy, ~10 s
+```
+
+`make verify` additionally needs jax (`.venv/bin/python -m pip install 'jax[cpu]'`).
+It is optional: it diffs the simulator against the official engine, so run it
+after touching `sim/engine.py`, not on every box.
+
+`WORKERS` defaults to cores−2 and every tool takes `--workers`. The arena scales
+close to linearly — 300 games take ~30 s on 10 cores, so a 64-core box does a
+2,000-game gauntlet in about a minute.
+
+```bash
+# detached, resumable, survives a disconnect
+make tune-big OUT=runs/tune-a GROUPS=opening,castle
+tail -f runs/tune-a.log
+
+# it checkpoints every iteration; after a kill just run the same command again
+```
+
+Then bring the result back and confirm it on the laptop, or confirm it there:
+
+```bash
+python -m arena.runner --a ours:runs/tune-a/best.json --b ours --games 800 --workers 60
+```
+
+Reports and replays are plain HTML with everything inlined, so
+`scp -r runs/<run>/ .` and open them locally — no server or X forwarding needed.
+
 ## What the bot knows that a ported generals.io bot does not
 
 Read out of the engine source, not the rules page:
