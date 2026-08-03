@@ -148,6 +148,15 @@ class Config:
     garrison_cap: int = 60             # never hoard more than this on the general
     garrison_from_turn: int = 40
 
+    # Hold the corridor, not the doorstep. DEFEND's field is distance to our own
+    # general, so it pulls army inward from every direction with no notion of
+    # where the attack comes from. Measured over 60 real games, 51% of all enemy
+    # presence within six steps of our general sat on just three cells - against
+    # a chance baseline near 4% - so their approach genuinely funnels. Meeting
+    # them at the narrow point is cheaper than meeting them on the general.
+    corridor_defence: bool = True
+    corridor_max_dist: int = 8      # never hold a chokepoint further out than this
+
     # ---- attacking ---------------------------------------------------------
     attack_margin: float = 1.25        # strike stack must beat estimated defence
     # Committing to a general we have only inferred needs a bigger cushion, and

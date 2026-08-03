@@ -289,6 +289,9 @@ class Controller:
             return DEATHTOUCH, an.dist_enemy_gen
 
         if obs.turn < self._defend_until:
+            choke = self._chokepoint(an)
+            if choke is not None:
+                return DEFEND, bfs_field_from(passable, choke)
             return DEFEND, an.dist_home
 
         if self._can_attack(obs, an):
@@ -322,6 +325,42 @@ class Controller:
                 return GATHER, bfs_field_from(passable, staging)
 
         return EXPAND, an.dist_unowned
+
+    def _chokepoint(self, an: Analysis):
+        """The narrowest point on their approach to our general.
+
+        Cells on a shortest route satisfy dist_to_general + dist_to_their_ground
+        == the route length. Counting how many such cells sit at each distance
+        from the general gives the corridor's width along its length; the
+        narrowest ring is where the fewest tiles gate the most approach.
+        """
+        if not self.cfg.corridor_defence:
+            return None
+        gr, gc = self.belief.my_general
+        d_gen, d_foe = an.dist_home, an.dist_enemy_terr
+        unreachable = self.H * self.W
+        route = int(d_foe[gr, gc])
+        if route <= 1 or route >= unreachable:
+            return None
+
+        on_path = (d_gen + d_foe == route) & self.belief.passable
+        best = None
+        for k in range(1, min(route, self.cfg.corridor_max_dist) + 1):
+            ring = on_path & (d_gen == k)
+            width = int(ring.sum())
+            if width == 0:
+                continue
+            # narrowest wins; further out breaks ties, so we meet them earlier
+            if best is None or width < best[0]:
+                best = (width, k, ring)
+        if best is None:
+            return None
+
+        _, _, ring = best
+        # among equally narrow tiles, take the one furthest along their approach
+        cells = np.argwhere(ring)
+        pick = min(cells, key=lambda rc: int(d_foe[rc[0], rc[1]]))
+        return (int(pick[0]), int(pick[1]))
 
     def _located(self) -> bool:
         """Do we know where the enemy general is, well enough to commit?"""
