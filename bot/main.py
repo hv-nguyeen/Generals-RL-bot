@@ -49,9 +49,21 @@ def make_agent(cfg: Config, player_id: int, h: int, w: int):
     if cfg.use_net and os.path.exists(WEIGHTS):
         try:
             from bot.policy.net import ClonePolicy
+            from bot.policy.guard import GuardedPolicy
             agent = ClonePolicy(player_id, h, w, WEIGHTS)
-            print(f"policy: net {agent.net.arch} from {WEIGHTS}", file=sys.stderr)
-            return agent
+            # The net is argmax over masked logits and nothing else. The
+            # heuristic's hard-override tier -- win-in-one, deathtouch, the
+            # narrow garrison block -- has no counterpart in it, and deathwatch
+            # over 50 ladder losses found the general emptied with a comparable
+            # stack within 3 steps in 16 of them. Self-play cannot punish that:
+            # at short curriculum distances it is correct tempo, and in a mirror
+            # both sides do it.
+            guarded = GuardedPolicy(agent, cfg.general_block_radius,
+                                    cfg.general_block_ratio)
+            print(f"policy: net {agent.net.arch} from {WEIGHTS} "
+                  f"(guarded r={cfg.general_block_radius} "
+                  f"ratio={cfg.general_block_ratio})", file=sys.stderr)
+            return guarded
         except Exception:                             # noqa: BLE001
             import traceback
             traceback.print_exc(file=sys.stderr)

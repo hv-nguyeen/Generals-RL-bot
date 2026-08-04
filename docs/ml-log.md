@@ -370,8 +370,10 @@ minimum generals distance of 17 an episode is ~500 turns for ONE bit of reward.
 
 Taken from AverageJoe (same author as our starter kit; 81.5% and #1 on the
 generals.io ladder) after reading it — no code copied, it has no licence. What
-transferred: the distance curriculum, `adv_top_frac`, `num_epochs 1`, the
-terminal-only reward. What did not: its neutral-city magnet branch (we have no
+transferred: the distance curriculum, `num_epochs 1`, the terminal-only reward.
+**Correction (2026-08-05): `adv_top_frac` was NOT taken** — `learn/selfplay.py:52`
+lists it under NOT, because positive-only learning is attempt 5's design. An
+earlier version of this line claimed it transferred and was wrong. What did not: its neutral-city magnet branch (we have no
 neutral castles), its 17-42 top stage (BFS distance 42 cannot occur on an 18-21
 grid at 0.24-0.26 mountain density), and every architecture-coupled
 hyperparameter.

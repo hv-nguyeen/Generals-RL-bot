@@ -35,11 +35,17 @@ takes only the techniques that attack OUR measured failure:
           training win rate at 0.5 at every stage;
   TAKEN   one epoch per batch. We ran two, which amplified failure 6's collapse.
 
-  NOT     HL-Gauss distributional value. Our returns have support {-1, 0, +1}
-          exactly, and the curriculum -- not the loss -- is the treatment for a
-          critic that has no information to fit. If evar stays under 0.10 at
-          stage 0 the named upgrade is a 3-way softmax over {loss, draw, win},
-          which is HL-Gauss collapsed onto our actual support;
+  FLAG    HL-Gauss distributional value, `--value-head hlgauss`, DEFAULT OFF.
+          Our returns have support {-1, 0, +1} exactly, so at their 128 bins and
+          sigma 0.04 the three label rows are DISJOINT and this is a 3-way
+          softmax with fixed smoothing -- it adds no distributional information
+          and the curriculum, not the loss, is the treatment for a critic with
+          nothing to fit. What it does fix is narrower and real: the MSE target
+          sits ON the tanh asymptote, so the gradient carries a (1 - tanh^2)
+          factor that vanishes exactly where the critic is confidently wrong.
+          Turn it on only if the `l` field of evar says the critic fails on
+          nearly-decided positions (see READING THE OUTPUT), and merge it only
+          on an arena.runner verdict;
   NOT     the magnet KL. We already have it wearing different clothes: the k3
           anchor to the behaviour clone is a permanent prior with a beta
           guardrail, not a decaying one;
@@ -58,7 +64,8 @@ READING THE OUTPUT
 ------------------
     iter   247  stage 2 (7-13)  games 256  W/D/L 128/4/124  samp  71k
                 turns 138  dist 9.8
-                pg -0.0132  v 0.214  evar 0.31  dlp0 4.1e-04  klU 0.011/0.019
+                pg -0.0132  v 0.214  evar 0.31 (e+0.04 l+0.88)  dlp0 4.1e-04
+                klU 0.011/0.019
                 klA 0.38  beta 0.050  ent 2.91  gn 0.42  mb 17  6s
     stage-eval  250  0.71 +-0.050 (200/200 games, dist 7-13, vs stage-entry self)
                 2/2 over 0.60 -> STAGE 3
@@ -106,6 +113,30 @@ only proof the curriculum reached the generator.
 measuring after is self-congratulation. `dlp0` is a MAX, not a mean: a mean over
 per-sample forward noise averages back to 1.0000 and is blind to exactly the
 desync it exists to catch.
+
+`evar` PRINTS THREE NUMBERS AND ONLY ONE OF THEM IS A QUALITY SCORE. With
+terminal-only reward the critic's target is z at every state, so the optimal
+critic V* is a martingale: Var(V*_t) rises from whatever the map alone
+determines at t=0 to Var(z) at t=T. The pooled number is therefore an average
+over that ramp -- it has a ceiling well under 1.0 that nobody has measured, and
+"0.31 is bad" is not a claim until that ceiling is. `e` is the first 10% of each
+episode's plies and `l` is the last 10%. In the last 10% the outcome is nearly
+decided, so the ceiling there is near 1.0 and `l` IS readable as a fitting
+score. `e` << `l` with `l` high says the pooled number is the martingale and the
+critic is fine. `l` low says the critic cannot fit even a nearly-decided
+position, which is the only reading that justifies touching the value loss.
+
+The measurement, ~30 iterations at competition distance with the policy pinned
+(`--warm-evar 0.99` never lets `warmed` become true, so the critic fits a
+STATIONARY distribution and `l` means what it says):
+
+    python -m learn.selfplay --backend gpu --start-stage 5 --iters 30 \\
+        --warm-evar 0.99 --out /local/data/vng205/ceil.npz
+
+`l >= 0.85` -> the critic fits where the answer is knowable; spend the night on
+the receptive field instead. `l < 0.60` -> it does not, and `--value-head
+hlgauss` is the cheapest thing to try (same command plus that flag; the kill
+number is +0.10 absolute on `l`).
 
 KILL THE RUN IF:
 
@@ -202,6 +233,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import multiprocessing as mp
 import os
 import time
@@ -281,6 +313,38 @@ def outcome(winner: int, seat: int) -> float:
     as slow noise and not as a bug. `selfcheck` pins the whole table.
     """
     return 0.0 if winner < 0 else (1.0 if winner == seat else -1.0)
+
+
+def hl_table(m: int, sigma: float, lo: float = -1.0, hi: float = 1.0):
+    """Bin centres `(m,)` and the HL-Gauss label table `(3, m)`, indexed `round(z)+1`.
+
+    Row 0 is the label for a loss, row 1 a draw, row 2 a win -- `outcome` above
+    has support exactly {-1, 0, +1}, so the whole of HL-Gauss for this reward is
+    THREE CONSTANT ROWS built once at startup. No erf at training time, no
+    per-sample Gaussian. And it is why the 128 bins buy nothing distributional
+    here: at sigma/w = 2.56 the three rows occupy 13/26/13 bins and are
+    DISJOINT, so the loss is a 3-way classification wearing 128 outputs. The
+    reason to use it anyway is in `--value-head`'s help.
+
+    Each row is N(z, sigma^2) TRUNCATED to [lo, hi] and integrated over the bins
+    (the erf difference across bin EDGES, not the density at centres -- the
+    density form underflows to 0/0 = NaN once sigma/w < ~0.03, inside a jit,
+    with nothing printing why the critic died). `p` sums to 1 by construction
+    for any z and any sigma > 0; nothing is clipped.
+
+    At z = +-1 the Gaussian is centred ON the range edge, so half its mass falls
+    outside and is renormalised away: row 2 recovers +0.9677, not +1.0. That
+    shrink is a UNIFORM SCALE -- row 1 recovers 0 exactly, so the CE optimum
+    predicts kappa * V*(s) for one constant kappa -- and GAE differences V and
+    then std-normalises the result, so the advantage cannot see it. `selfcheck`
+    pins all of that.
+    """
+    e = np.linspace(lo, hi, m + 1)
+    c = (e[:-1] + e[1:]) / 2.0
+    F = np.array([[0.5 * (1.0 + math.erf((x - z) / (sigma * math.sqrt(2.0))))
+                   for x in e] for z in (-1.0, 0.0, 1.0)])
+    p = np.diff(F, axis=1)
+    return c.astype(np.float32), (p / p.sum(axis=1, keepdims=True)).astype(np.float32)
 
 
 def numpy_forward(params, x: np.ndarray) -> np.ndarray:
@@ -800,9 +864,49 @@ def selfcheck() -> None:
         assert np.array_equal(r2.random(5), np.random.default_rng(7).random(8)[3:])
         assert load_resume(Path(td) / "absent.npz") is None
 
-    # HL-Gauss is NOT adopted (see the module docstring), so there is no bin
-    # encoding to round-trip. The critic is the scalar tanh head, whose target
-    # support is exactly {-1, 0, +1}.
+    # --- HL-Gauss (--value-head hlgauss). Numpy only, so this exercises the
+    #     same arithmetic the jitted trainer differentiates.
+    c, T = hl_table(128, 0.04)
+    w = float(c[1] - c[0])
+    assert c.shape == (128,) and T.shape == (3, 128)
+    assert np.allclose(T.sum(axis=1), 1.0, atol=1e-6), T.sum(axis=1)
+    # INTERIOR ROUND-TRIP: encode an arbitrary scalar, recover it by expectation
+    # over the centres, within one bin width. Catches an edges/centres swap, a
+    # sigma in the wrong units, and a normalisation over the wrong axis.
+    edges = np.linspace(-1.0, 1.0, 129)
+    for z in np.linspace(-0.85, 0.85, 51):
+        p = np.diff([0.5 * (1 + math.erf((x - z) / (0.04 * math.sqrt(2))))
+                     for x in edges])
+        assert abs(float((p / p.sum()) @ c) - z) < w, z      # measured max 1.4e-05
+    # The BOUNDARY deliberately does NOT round-trip, and by exactly the
+    # half-normal mean: the Gaussian at z = +-1 is centred on the edge, so half
+    # its mass is renormalised away. This is the assert that fails if someone
+    # "fixes" the shrink by clipping z instead of understanding it.
+    assert abs(float(T[2] @ c) - (1 - 0.04 * math.sqrt(2 / math.pi))) < w
+    assert abs(float(T[1] @ c)) < 1e-7                       # draw recovers 0 exactly
+    # ODD readout. `adv` is scaled but NOT re-centred, and that rests on the
+    # critic being antisymmetric across the two mirrored seat trajectories.
+    assert np.abs(T[0] - T[2][::-1]).max() < 1e-6
+    # A PERFECT prediction costs the TARGET'S ENTROPY, not zero -- an assert of
+    # ce < 1e-6 would pass only for a one-hot target, i.e. for sigma -> 0. This
+    # is also why v_step_hl reports KL and not raw CE: `v 1.67` for a flawless
+    # critic reads as a regression next to the scalar head's MSE.
+    H = -(T * np.log(T + 1e-30)).sum(axis=1)
+    assert H.min() > 0.5, H                                  # measured [1.67, 2.37, 1.67]
+    ce = -(T * _log_softmax(np.log(T + 1e-30), np)).sum(axis=1)
+    assert np.abs(ce - H).max() < 1e-4, (ce, H)
+    kl = (T * (np.log(T + 1e-12) - _log_softmax(np.log(T + 1e-30), np))).sum(axis=1)
+    assert np.abs(kl).max() < 1e-4, kl                       # KL of a perfect fit is 0
+    # Recovery is bounded by the simplex for ANY logits, including garbage
+    # during warmup -- the property the tanh head bought with a saturating
+    # nonlinearity that also kills its own gradient.
+    v = np.exp(_log_softmax(rng.normal(size=(7, 128)) * 5, np)) @ c
+    assert np.all(np.abs(v) <= abs(float(c[0]))) and np.all(np.isfinite(v))
+    # The label index. `rint`, not `astype`: astype TRUNCATES, so a return of
+    # -1e-8 would be labelled a LOSS with nothing crashing and nothing printing.
+    assert [int(round(outcome(wn, s) + 1)) for wn in (1, -1, 0) for s in (0, 1)] \
+        == [0, 2, 1, 1, 2, 0]
+    assert int(np.rint(np.float32(-1e-8) + 1.0)) == 1
     print("selfplay selfcheck OK")
 
 
@@ -836,6 +940,24 @@ def main() -> None:
     ap.add_argument("--minibatch", type=int, default=4096)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--critic-lr", type=float, default=1e-3)
+    ap.add_argument("--value-head", choices=("scalar", "hlgauss"), default="scalar",
+                    help="scalar is tanh+MSE and is THE DEFAULT. hlgauss is a "
+                         "distributional head; with our 3-atom return support it "
+                         "is a 3-way softmax with fixed smoothing and adds no "
+                         "distributional information, so the ONLY reason to use "
+                         "it is that `ret` sits ON the tanh asymptote, where the "
+                         "MSE gradient carries a (1 - tanh^2) factor that "
+                         "vanishes exactly where the critic is confidently "
+                         "wrong. Do not merge it on an evar number: run "
+                         "arena.runner on the two trained policies")
+    ap.add_argument("--hl-bins", type=int, default=128,
+                    help="AverageJoe's, lifted whole; not load-bearing")
+    ap.add_argument("--hl-sigma", type=float, default=0.04,
+                    help="sigma/w = 2.56 at 128 bins over [-1, 1]. THE RATIO is "
+                         "the parameter, not sigma: Farebrother's flat band is "
+                         "0.5..2 and the failure modes (one-hot label, no "
+                         "ordinal structure, NaN in the density form) are all at "
+                         "ratios well under 1, so 2.56 is the safe side")
     ap.add_argument("--warm-evar", type=float, default=PROMOTE_EVAR,
                     help="hold the policy frozen until the critic explains this "
                          "much of the return, and re-freeze if it stops")
@@ -998,6 +1120,16 @@ def main() -> None:
     theta_ref = dict(theta)          # frozen; never rebound, never in a grad graph
     theta_init = {k: np.asarray(z0[k]) for k in keys}
     phi = vt.init_params(jax.random.PRNGKey(args.seed), arch)   # critic, same trunk
+    if args.value_head == "hlgauss":
+        # SAME KEYS, wider. `arch_of` run-length-scans conv*/res* only, so
+        # reshaping v_w is invisible to it; `opt_v`, `_flat("phi", ...)` and the
+        # resume are comprehensions over phi.items() and need no change; and
+        # `vt.forward` -- (B, ch) @ (ch, m) + (m,) -- returns (B, m) logits with
+        # no edit at all, so valuetrain.main() and tools/calibrate keep the
+        # scalar head they were written against.
+        phi["v_w"] = jax.random.normal(jax.random.fold_in(
+            jax.random.PRNGKey(args.seed), 8), (ch, args.hl_bins)) * 0.01
+        phi["v_b"] = jnp.zeros((args.hl_bins,))
     opt_p = {k: (jnp.zeros_like(v), jnp.zeros_like(v)) for k, v in theta.items()}
     opt_v = {k: (jnp.zeros_like(v), jnp.zeros_like(v)) for k, v in phi.items()}
 
@@ -1025,6 +1157,36 @@ def main() -> None:
     @jax.jit
     def values_of(q, x):
         return jnp.tanh(vt.forward(q, x))
+
+    hl_c, hl_t = hl_table(args.hl_bins, args.hl_sigma)
+    hl_c, hl_t = jnp.asarray(hl_c), jnp.asarray(hl_t)
+
+    @jax.jit
+    def v_step_hl(q, opt, t, x, ret):
+        # rint, not astype: astype TRUNCATES, so a return of -1e-8 would be
+        # labelled a LOSS with nothing crashing and nothing printing.
+        tgt = hl_t[jnp.rint(ret + 1.0).astype(jnp.int32)]
+
+        def kl(qq):
+            # KL, not raw CE: a perfect prediction scores the TARGET'S ENTROPY
+            # (1.67 nats on a win row), so raw CE would print `v 1.67` for a
+            # flawless critic and read as a regression next to the scalar head's
+            # MSE. The entropy is a constant, so the gradient is the CE's.
+            lp = _log_softmax(vt.forward(qq, x), jnp)
+            return jnp.mean(jnp.sum(tgt * (jnp.log(tgt + 1e-12) - lp), axis=1))
+        loss, g = jax.value_and_grad(kl)(q)
+        g, _ = clip_grads(g, 1.0)
+        q, opt = adam(q, opt, g, t, args.critic_lr)
+        return q, opt, loss
+
+    @jax.jit
+    def values_of_hl(q, x):
+        # MEAN of the predicted categorical, not the argmax: GAE is linear in V.
+        # Bounded by [c_0, c_-1] for any logits, garbage included.
+        return jax.nn.softmax(vt.forward(q, x), axis=-1) @ hl_c
+
+    if args.value_head == "hlgauss":
+        v_step, values_of = v_step_hl, values_of_hl
 
     @jax.jit
     def ref_logp_of(p, x, mask, idx):
@@ -1086,6 +1248,13 @@ def main() -> None:
                                  f"the paired gate would both silently change.")
         theta = {k: jnp.asarray(v) for k, v in _unflat("theta", a).items()}
         phi = {k: jnp.asarray(v) for k, v in _unflat("phi", a).items()}
+        # A --value-head mismatch here is a shape error deep inside a jitted
+        # v_step, hours after the preemption this resume exists to survive.
+        want_v = ((ch, args.hl_bins) if args.value_head == "hlgauss" else (ch,))
+        if phi["v_w"].shape != want_v:
+            raise SystemExit(f"--resume: this checkpoint's critic head is "
+                             f"{tuple(phi['v_w'].shape)} but --value-head "
+                             f"{args.value_head} wants {want_v}.")
         opt_p = {k: (jnp.asarray(v), jnp.asarray(_unflat("optp_v", a)[k]))
                  for k, v in _unflat("optp_m", a).items()}
         opt_v = {k: (jnp.asarray(v), jnp.asarray(_unflat("optv_v", a)[k]))
@@ -1270,10 +1439,12 @@ def main() -> None:
 
         adv = np.empty(n, dtype=np.float32)
         ret = np.empty(n, dtype=np.float32)
+        frac = np.empty(n, dtype=np.float32)   # position within the episode, 0..1
         k = 0
         for length, z in episodes:
             adv[k:k + length] = gae(z, vals[k:k + length])
             ret[k:k + length] = z           # MC return; see netoracle.gae
+            frac[k:k + length] = np.arange(length, dtype=np.float32) / max(length - 1, 1)
             k += length
         # SCALE ONLY, not re-centred. Every game contributes one winning and one
         # losing trajectory of equal length, so the RETURNS are exactly zero-sum
@@ -1285,8 +1456,22 @@ def main() -> None:
         # hand every state whose raw advantage is ~0 one identical deterministic
         # value, i.e. failure 4's blanket push rebuilt out of its own cure.
         adv = np.clip(adv / (adv.std() + 1e-8), -ADV_CLIP, ADV_CLIP)
-        vr = float(ret.var())
-        evar = float(1.0 - ((ret - vals).var() / vr)) if vr > 1e-9 else float("nan")
+        def _evar(m):
+            """1 - Var(z - V)/Var(z) over a subset of the buffer.
+
+            POOLED evar IS NOT A QUALITY SCORE. V* is a martingale, so its
+            explainable share of Var(z) rises from map-determined at t=0 to 1.0
+            at t=T, and the pooled number is mostly a statement about episode
+            length. Read `l` (last 10% of plies): the outcome there is nearly
+            determined, so the ceiling is near 1 and any shortfall is the critic
+            failing to FIT, not information it lacks. `e` (first 10%) is the
+            other end: e << l with l high is the martingale, not a bad critic.
+            """
+            r, v = ret[m], vals[m]
+            rv = float(r.var())
+            return float(1.0 - ((r - v).var() / rv)) if rv > 1e-9 else float("nan")
+        evar = _evar(slice(None))
+        evar_e, evar_l = _evar(frac < 0.1), _evar(frac >= 0.9)
         if evar == evar:
             evar_max = max(evar_max, evar)
         t_ing = time.time()      # GAE is a host python loop; it counts as ingest
@@ -1413,7 +1598,8 @@ def main() -> None:
               f"W/D/L {w}/{d}/{len(g0) - w - d}  samp {n // 1000:3d}k  "
               f"turns {turns:.0f}  dist {dist:.1f}  bld {builds / len(g0):.2f}"
               f"{util}{tag}\n"
-              f"            pg {pg:+.4f}  v {vloss:.3f}  evar {evar:+.2f}  "
+              f"            pg {pg:+.4f}  v {vloss:.3f}  "
+              f"evar {evar:+.2f} (e{evar_e:+.2f} l{evar_l:+.2f})  "
               f"{'dnp' if vec_backend else 'dlp0'} "
               f"{dnp if vec_backend else dlp0:.1e}  "
               f"klU {kl_u:.3f}/{kl_last:.3f}  klA {kl_a:.3f}  "
