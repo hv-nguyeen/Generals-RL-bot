@@ -454,6 +454,52 @@ def test_the_scanned_rollout_matches_the_python_loop():
                 f"idx {a['idx'][d[0]]} vs {b['idx'][d[0]]}")
 
 
+def test_the_row_index_reproduces_the_packed_columns():
+    """The identity a device-resident rollout would stand on, asserted before
+    that path exists: gathering `vecroll.row_index` out of the flat
+    `(T*2n, ...)` buffer gives EXACTLY what `_pack_columns` slices out today,
+    in the same order and with the same total length.
+
+    Ragged on purpose — the five columns end on different turns, which is the
+    whole reason the cut cannot be a reshape. The COVERAGE assert below keeps it
+    that way: with every column running to the horizon this test would pass
+    against a plain reshape and prove nothing.
+
+    Numpy only, no jax, no games. If it ever fails, a resident buffer would feed
+    the critic padded rows with a real outcome attached, `evar` would stay
+    plausible and nothing downstream would say a word — read `vecroll.row_index`
+    before touching the assert.
+    """
+    from learn import vecroll
+
+    n, T, C = 5, 7, 3
+    ended = np.array([2, -1, 6, 0, 4], np.int32)       # -1 = never ended
+    winner = np.array([0, -1, 1, 1, -1], np.int32)
+    # a distinct value per (turn, column, channel), so a transposed, shifted or
+    # column-major gather cannot compare equal by accident
+    X = np.arange(T * 2 * n * C, dtype=np.float16).reshape(T, 2 * n, C)
+    I = np.arange(T * 2 * n, dtype=np.int32).reshape(T, 2 * n)
+    out = vecroll._pack_columns(X, (I % 251).astype(np.uint8), I,
+                                I.astype(np.float32), ended, winner, T,
+                                {"dist": np.arange(n)}, np.arange(n))
+
+    # `(ended, T)`, the rollout's own pair, NOT a length vector read back out of
+    # `out` — that would be per-emitted-column where `row_index` wants per-game,
+    # the two differ only when a game is dropped, and both give a gather of the
+    # right total length, so the assert below would not see the difference.
+    turns = vecroll._turns(ended, T)
+    assert 0 < turns.min() < T == turns.max(), (
+        f"turns {turns.tolist()} are not ragged against T={T}; this comparison "
+        "is vacuous unless both the ended and the still-running branch are live")
+    rows = vecroll.row_index(ended, T, n)
+    assert len(rows) == sum(len(r["idx"]) for r in out) == 2 * int(turns.sum()), (
+        len(rows), sum(len(r["idx"]) for r in out))
+    assert np.array_equal(X.reshape(T * 2 * n, C)[rows],
+                          np.concatenate([r["x"] for r in out])), "x"
+    assert np.array_equal(I.reshape(-1)[rows],
+                          np.concatenate([r["idx"] for r in out])), "idx"
+
+
 def test_the_trainers_check_themselves():
     """The two PPO trainers each carry a numpy-only `--selfcheck`; run them here
     so `make test` covers the shared objective, GAE, the curriculum's advance

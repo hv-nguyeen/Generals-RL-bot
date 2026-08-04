@@ -678,6 +678,8 @@ i.e. the first version of that test passed for a reason that had nothing to do
 with the property it claimed.
 
 **PROJECTION, not a measurement: 2.5-4x at 256 games, i.e. 0.010-0.016 s/game.**
+**REFUTED — it measured 0.7x. See the next section; the paragraph is kept as
+written so the projection can be read against what happened.**
 Nobody has run it. It rests on two load-bearing guesses: that the ~2.1 s of
 kernel-resident time in today's 10 s iteration is unchanged by the scan, and that
 the ~1.8 s of host memcpy per iteration (`np.concatenate`, `_pack_columns`'s
@@ -693,6 +695,86 @@ is the host memcpy path and the D2H copy, neither of which this touches. If
 GPU-Util still reads ~0.2 at 256 games while s/game improves, the gaps closed but
 the kernels are the next problem and the answer is a bigger net, not a faster
 loop.
+
+### Throughput: every projection this repo has made, and what it measured (2026-08-04)
+
+One table, kept in one place, because the pattern is the finding.
+
+| change | projected | measured, 256 games stage 0 | s/game | error |
+|---|---|---|---|---|
+| `--backend cpu` (baseline) | — | 17 s/iter | 0.066 | — |
+| `--backend gpu` | **23x** | 10 s/iter | 0.039 | **13x optimistic** |
+| `--backend scan` | **2.5-4x** | ~19 s/iter | ~0.075 | **SLOWER than gpu** |
+| this commit (instrumentation) | **~1.0-1.1x, and it is not a speedup** | not yet run | — | — |
+
+The scan figure is not quite like-for-like: it was taken on a 12x32 net, ~1.5x
+the arithmetic of the 8x32 the other two rows used, so scan is about **1.4x worse
+than `gpu`** corrected rather than 1.9x. Either way it is not faster, and
+`--backend gpu` remains the fastest of the three. GPU-Util reads 0.14-0.39 in
+**all three** backends: the device is idle most of the time in every one of them.
+
+**What the scan did fix, and what it exposed.** It removed the per-turn host
+round trips exactly as designed — blocking host calls 645 -> 20, launches
+160 -> 4. That was the diagnosed problem and the fix was correct. It did not
+touch the next constraint: the **device-to-host copy**. Per chunk `vecroll` calls
+`np.asarray` on the stacked observations and blocks; at 256 games x ~130 turns
+that is ~1.5 GB moved off the device with the GPU idle for the whole transfer,
+then moved back for the update.
+
+**Two projections, two misses, and the same mechanism behind both: the number was
+derived from the term someone had already decided was the bottleneck.** So this
+round derives nothing and measures first. This commit adds no backend. It adds
+the instrument that tells you whether a backend is worth writing:
+
+* `roll/d2h pack ing trn` on every iteration line. Four phases plus, inside
+  `roll`, the copy split off from compute by `vecroll._to_host`
+  (`block_until_ready` then time the `np.asarray` — it waits for a computation
+  `np.asarray` waited for anyway, so it costs nothing and moves no boundary).
+* `--epochs 0` as the cross-check that needs no trust in a timer placement.
+  Read its `--help`: the obvious recipe measures the wrong thing twice over.
+
+**PROJECTION, labelled, for the device-resident buffer this is measuring for —
+and it is UNDER 1.5x by this repo's own arithmetic.** Ceiling is Amdahl on the
+transfer share: this file already puts host memcpy at ~1.8 s and the PCIe legs at
+~0.5 s of a 10 s iteration, so removing the round trip **completely** projects
+`10 / (10 - 2.3)` = **1.3x, range 1.2-1.4x**. That is worth roughly one third of
+what `--backend gpu` already delivered, for a rewrite of the buffer contract.
+**Do not build it unless `d2h` comes back much larger than that arithmetic
+predicts.** The `d2h` field is the falsifier and it is now printed: read
+`roll 7.0/d2h 0.3` and the copy is 4% of the rollout and the whole hypothesis is
+dead; read `roll 7.0/d2h 3.5` and the arithmetic above was wrong and it is worth
+building. There is no third reading, and no number should be written here before
+that one is.
+
+**If it does get built, form B (store STATES, recompute the 20-channel encoding
+in the training pass) over form A (keep the stacked observations on device), and
+the reason is memory, not speed.** Both have the same transfer ceiling above.
+A `GameState` is ~4.9 kB a game = ~2.4 kB a sample against the observation's
+17.6 kB, i.e. **7.2x smaller** — note that is the achievable reduction; the
+"observations are 97% of the payload" figure is the payload *share* and is not
+the same number. It matters at stage 5: form A must size the padded buffer for
+`max_turns` 1200 because a preallocated device buffer cannot break early, giving
+11.2 GB of buffer plus a gathered training copy against an **18.4 GB** effective
+pool (`XLA_PYTHON_CLIENT_MEM_FRACTION` defaults to 0.75 of the L4's 24 GB) —
+it OOMs at 256 games, and the cliff sits between stage 2 and stage 5, i.e.
+exactly where the current run is heading. Form B is ~4.5 GB there. Whichever is
+built needs a startup check against `memory_stats()["bytes_limit"]` that raises,
+not warns: the equivalent host-RAM failure was found as a `MemoryError` minutes
+into an iteration.
+
+**bf16 is still unused and still untried.** The L4 has bf16 tensor cores; the
+rollout forwards run f32 convs at 32 channels and never touch them. It is
+independent of everything above. Any dtype change has to be read against `dnp`
+(kill at `1e-4 x scale`, healthy 1e-4 to 1e-3, seam measures 1.2e-07) — and
+unlike f16 -> f32, **bf16 is lossy**, so that check is load-bearing rather than a
+formality.
+
+**AND THE PRIOR QUESTION, which no speedup answers.** comp-eval has been flat at
+~0.63 for 240 iterations at stage 2. If the ceiling is the method, a 3x speedup
+buys three times as many iterations of the same plateau. The receptive-field
+limit under KNOWN LIMITATIONS is the standing candidate for that ceiling and it
+is not a throughput problem. Spend the `d2h` measurement — it is one iteration —
+before spending anything else here.
 
 **Host RAM, not device RAM, is what OOMs this.** The rollout buffer is
 `steps x 2*games x 18.2 kB`: 10.8 GB at 256 games / 1200 turns, 34.7 GB at 2048

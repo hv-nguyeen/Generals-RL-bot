@@ -818,7 +818,21 @@ def main() -> None:
     ap.add_argument("--games", type=int, default=256,
                     help="self-play games per iteration; each yields TWO trajectories")
     ap.add_argument("--epochs", type=int, default=1,
-                    help="AverageJoe uses 1; we ran 2, which amplified failure 6")
+                    help="AverageJoe uses 1; we ran 2, which amplified failure 6. "
+                         "0 IS LEGAL AND IS A MEASUREMENT: it keeps the rollout, "
+                         "the D2H copy, the host pack, the ingest pass and dnp, "
+                         "and drops the update. The cross-check for the "
+                         "roll/pack/ing/trn split, needing no trust in where a "
+                         "timer was placed. TWO THINGS THE OBVIOUS RECIPE GETS "
+                         "WRONG. (1) Compare the PRINTED per-iteration seconds, "
+                         "not wall clock: comp-eval and stage-eval run after that "
+                         "print and --probe fires a 400-game comp-eval at it 0. "
+                         "(2) Run A must actually train: `warmed` needs "
+                         "it >= WARMUP (3) AND evar >= --warm-evar, so a plain "
+                         "--probe 3 never runs p_step and the A/B then prices "
+                         "v_step alone and reads as 'not update bound' whatever "
+                         "is true. Use --probe 6 --warm-evar -1 and read "
+                         "iterations 3-5. Then (A-B)/A is the update's share")
     ap.add_argument("--minibatch", type=int, default=4096)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--critic-lr", type=float, default=1e-3)
@@ -1186,6 +1200,30 @@ def main() -> None:
         snapshot = {k: np.asarray(v) for k, v in theta.items()}
         results = (play_train(it, stage) if vec_backend
                    else play(build_jobs(it, args.games, stage), snapshot))
+        # WHERE THE ITERATION GOES, printed every iteration, because two
+        # speedup attempts were designed against a guess about this and both
+        # under-delivered. Four phases, and they are the four terms of the
+        # argument: `roll` is the rollout and its device->host copy, `pack` is
+        # the host memcpy that gathers the columns into one buffer, `ing` is the
+        # no-grad value/anchor pass (plus GAE), `trn` is dnp and the update.
+        # Honest despite JAX's async dispatch WITHOUT any added sync: every one
+        # of these boundaries already blocks -- the rollout ends in np.asarray
+        # per chunk, the ingest loop in np.asarray per chunk, the update in
+        # float(vl) per minibatch. Do not add a block_until_ready at a phase
+        # BOUNDARY; if one of those syncs is ever removed, this split silently
+        # becomes a lie. (`vecroll._to_host` does block, inside `roll` and not at
+        # a boundary, to split `d2h` off from compute -- and it waits for a
+        # computation `np.asarray` waited for anyway, so it moves no boundary.)
+        t_roll = time.time()
+        # ...and inside `roll`, the one term the hypothesis is actually about.
+        # `roll` alone cannot decide anything: it is env transition + observation
+        # + encode + forward + copy, and only the last term is what a resident
+        # buffer removes. Imported here rather than at module scope because
+        # vecroll imports THIS module (see --scan-chunk).
+        d2h = ""
+        if vec_backend:
+            from learn import vecroll
+            d2h = f"/d2h {vecroll.D2H:.1f}"
         resident += 1
         if not results:
             print(f"iter {it:5d}  no usable games", flush=True)
@@ -1212,13 +1250,19 @@ def main() -> None:
         # Fixed-size chunks, tail padded by repeating row 0 and sliced off again:
         # a ragged final chunk changes shape every iteration and pays a full XLA
         # recompile each time.
+        t_pack = time.time()
         vals = np.empty(n, dtype=np.float32)
         ref_logp = np.empty(n, dtype=np.float32)
         for i in range(0, n, CHUNK):
-            sel = np.arange(i, min(i + CHUNK, n))
-            m = len(sel)
-            if m < CHUNK:
-                sel = np.concatenate([sel, np.zeros(CHUNK - m, dtype=np.int64)])
+            m = min(CHUNK, n - i)
+            # A slice indexes a VIEW; `np.arange(i, i + CHUNK)` is a fancy index
+            # and materialises 8192 x 17.6 kB = 144 MB of host copy per chunk to
+            # hand `to_x` exactly the rows a view already points at -- ~1.5 GB an
+            # iteration at stage 0. Only the ragged tail needs the fancy index,
+            # and only to pad with row 0.
+            sel = (slice(i, i + CHUNK) if m == CHUNK else
+                   np.concatenate([np.arange(i, n),
+                                   np.zeros(CHUNK - m, dtype=np.int64)]))
             xb = to_x(xs[sel])
             vals[i:i + m] = np.asarray(values_of(phi, xb))[:m]
             ref_logp[i:i + m] = np.asarray(ref_logp_of(
@@ -1245,6 +1289,7 @@ def main() -> None:
         evar = float(1.0 - ((ret - vals).var() / vr)) if vr > 1e-9 else float("nan")
         if evar == evar:
             evar_max = max(evar_max, evar)
+        t_ing = time.time()      # GAE is a host python loop; it counts as ingest
 
         # Warm up on the CRITIC'S SCORE, not on a fixed iteration count -- the
         # 1500-iteration run released the policy after 3 iterations with evar
@@ -1373,7 +1418,10 @@ def main() -> None:
               f"{dnp if vec_backend else dlp0:.1e}  "
               f"klU {kl_u:.3f}/{kl_last:.3f}  klA {kl_a:.3f}  "
               f"beta {beta:.3f}  ent {ent:.2f}  gn {gn:.2f}  mb {nb}  "
-              f"{time.time() - t0:.0f}s", flush=True)
+              f"{time.time() - t0:.1f}s (roll {t_roll - t0:.1f}"
+              f"{d2h} "
+              f"pack {t_pack - t_roll:.1f} ing {t_ing - t_pack:.1f} "
+              f"trn {time.time() - t_ing:.1f})", flush=True)
 
         if kill2:
             print(f"\n  KILL 2: evar under {args.warm_evar} for {low} consecutive "

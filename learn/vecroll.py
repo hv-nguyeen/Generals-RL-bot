@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -68,6 +69,14 @@ ALIVE_EVERY = 32     # a device sync in the inner loop costs more than the
 # observation, the legal mask, the sampled action, the length -- is compared
 # EXACTLY. One definition, used by `selfcheck` and by tests/test_all.py.
 LOGP_TOL = 1e-5
+
+# Seconds of DEVICE->HOST COPY in the last rollout, compute excluded. Reset at
+# the top of `rollout`/`rollout_scan`, printed by `selfplay` as `d2h` inside its
+# `roll` phase. A module global because the alternative is a second return value
+# on both rollouts and through `play_train`, for a number that exists to be read
+# once and then delete itself.
+# ponytail: global. It is single-threaded, single-rollout instrumentation.
+D2H = 0.0
 
 
 def transition(state, actions):
@@ -164,6 +173,8 @@ def rollout(step, pool, idx: np.ndarray, theta, key, max_turns: int) -> list[dic
     import jax.numpy as jnp
     import jax.random as jr
 
+    global D2H
+    D2H = 0.0
     n = len(idx)
     states = jax.tree_util.tree_map(lambda a: a[jnp.asarray(idx)], pool["states"])
     h, w = pool["h"][jnp.asarray(idx)], pool["w"][jnp.asarray(idx)]
@@ -176,18 +187,46 @@ def rollout(step, pool, idx: np.ndarray, theta, key, max_turns: int) -> list[dic
         key, sub = jr.split(key)
         states, x, packed, a_idx, logp, ended, winner = step(
             states, h, w, theta, sub, jnp.int32(t), ended, winner)
+        hx, hp, hi, hl = _to_host(x, packed, a_idx, logp)
         # `[None]` so the parts are `(1, 2n, ...)` and `_join` is the same
         # concatenate the scan path uses. It is a view; it costs nothing.
-        xs.append(np.asarray(x)[None])
-        ms.append(np.asarray(packed)[None])
-        ids.append(np.asarray(a_idx)[None])
-        lps.append(np.asarray(logp)[None])
+        xs.append(hx[None])
+        ms.append(hp[None])
+        ids.append(hi[None])
+        lps.append(hl[None])
         steps = t + 1
         if t % ALIVE_EVERY == ALIVE_EVERY - 1 and bool((ended >= 0).all()):
             break
 
     return _pack_columns(_join(xs), _join(ms), _join(ids), _join(lps),
                          ended, winner, steps, pool, idx)
+
+
+def _to_host(*arrs):
+    """`np.asarray` on device arrays, charging the WAIT FOR COMPUTE and the COPY
+    to separate clocks. Adds to `D2H`; returns the numpy arrays.
+
+    This exists because the iteration split alone cannot answer the question it
+    was built for. `roll` lumps the env transition, two `get_observation`s, the
+    encode, the net forward and the ~1.5 GB device->host copy into one number,
+    and the whole "the round trip is pure waste" hypothesis is a claim about the
+    last term only. Read `roll 7.0/d2h 0.3` and the copy is 4% of the rollout,
+    so a device-resident buffer cannot pay for itself; read `roll 7.0/d2h 3.5`
+    and it can. There is no third reading.
+
+    Costs nothing that was not already paid: `np.asarray` blocks on the same
+    computation `block_until_ready` waits for, so this moves the boundary rather
+    than adding one. Do NOT "optimise" the wait away -- without it every second
+    of compute lands in the copy column and the split reads as a green light.
+    """
+    global D2H
+    import jax
+
+    jax.block_until_ready(arrs)
+    t = time.time()
+    out = [np.asarray(a) for a in arrs]
+    D2H += time.time() - t
+    return out
 
 
 def _join(parts: list) -> np.ndarray:
@@ -211,6 +250,21 @@ def _join(parts: list) -> np.ndarray:
     return out
 
 
+def _turns(ended, steps: int) -> np.ndarray:
+    """Length of every column's game, per GAME (length n), one derivation.
+
+    Counts the tick the game ended ON, matching the CPU rollout: it records the
+    observation, acts, steps, and stops. `steps` is the fallback for a column
+    that never ended, so it MUST be the absolute number of turns stepped -- see
+    `make_scan` on why that is the whole risk of the scan.
+
+    One function because `_pack_columns` slices with it and `row_index` gathers
+    with it, and a second derivation is how those two silently stop agreeing.
+    """
+    ended = np.asarray(ended)
+    return np.where(ended >= 0, ended + 1, steps).astype(int)
+
+
 def _pack_columns(X, M, I, L, ended, winner, steps: int, pool, idx) -> list[dict]:
     """Turn-major device buffers -> `selfplay._pack`'s per-trajectory dicts.
 
@@ -225,11 +279,7 @@ def _pack_columns(X, M, I, L, ended, winner, steps: int, pool, idx) -> list[dict
     n = len(idx)
     ended = np.asarray(ended)
     winner = np.asarray(winner)
-    # `turns` counts the tick the game ended ON, matching the CPU rollout: it
-    # records the observation, acts, steps, and stops. `steps` is the fallback
-    # for a column that never ended, so it MUST be the absolute number of turns
-    # stepped -- see `make_scan` on why that is the whole risk of the scan.
-    turns = np.where(ended >= 0, ended + 1, steps).astype(int)
+    turns = _turns(ended, steps)
     dist = pool["dist"][idx]
 
     out = []
@@ -239,11 +289,58 @@ def _pack_columns(X, M, I, L, ended, winner, steps: int, pool, idx) -> list[dict
             continue
         for s in (0, 1):                # both seats or neither: the buffer must
             col = s * n + i             # stay exactly zero-sum
+            # `x` is a VIEW, not a copy, and that is the whole point: the caller
+            # (`selfplay`'s `xs[k:k+m] = r.pop("x")`) immediately gathers it into
+            # one contiguous buffer, so copying here writes 1.2 GB a stage-0
+            # iteration only to read it again and free it. One pass over the
+            # largest array in the process, removed.
+            # Peak host RAM is UNCHANGED, not lowered -- the view keeps `X` alive
+            # until the last column is popped, where the copies used to keep
+            # themselves alive: |X| + util|X| either way. Do not sell this as a
+            # memory fix; `_join` is the memory fix. The other three are 24x
+            # smaller and are copied so `M`/`I`/`L` can be freed here.
+            # The view CANNOT outlive `X`: `selfplay` pops it straight into `xs`
+            # and never holds it past that line.
             out.append({"z": outcome(int(winner[i]), s), "turns": T,
                         "dist": int(dist[i]), "seat": s, "opp": 0,
-                        "x": X[:T, col].copy(), "idx": I[:T, col].copy(),
+                        "x": X[:T, col], "idx": I[:T, col].copy(),
                         "mask": M[:T, col].copy(), "logp": L[:T, col].copy()})
     return out
+
+
+def row_index(ended, steps: int, n: int) -> np.ndarray:
+    """The flat `t * 2n + col` row of every sample `_pack_columns` emits, in the
+    order it emits them.
+
+    Takes the rollout's OWN `(ended, steps)` -- not a length vector -- so that
+    the caller cannot pick the wrong one. A `turns` argument has two plausible
+    readings, per-game (length n) and per-emitted-column (n minus the dropped
+    T == 0 games), they differ only when a game is dropped, and BOTH give a
+    gather of the right total length. Every game after the dropped one would
+    then read a different column: another game's observations paired with this
+    game's outcome. `_turns` is the single derivation both sides use.
+
+    Nothing on the hot path calls this. It is here because it is the ONE piece a
+    device-resident buffer needs and the one piece that can be wrong in silence:
+    today the ragged cut is a SLICE per column, and a buffer that never comes to
+    the host has to GATHER instead. Build the gather from the padded `T` instead
+    of from `turns` and dead columns enter the training buffer with zeroed
+    observations and a real outcome attached. The critic fits them, advantages
+    stay finite, `evar` stays plausible, `dnp` checks the forward and not the
+    segmentation, and the scan-vs-loop test compares rollout outputs and not GAE.
+    Nothing complains, ever, and the run just learns slightly the wrong thing.
+
+    tests/test_all.py::test_the_row_index_reproduces_the_packed_columns asserts
+    the gather equals the slices, on ragged lengths, with no jax and no games.
+
+    # ponytail: the index vector only. The `--backend resident` that consumes it
+    # is gated on the --epochs 0 / roll-pack-ing-trn split; build it if and only
+    # if that says the iteration is transfer bound.
+    """
+    rows = [np.arange(T, dtype=np.int64) * (2 * n) + s * n + i
+            for i, T in enumerate(int(t) for t in _turns(ended, steps))
+            if T for s in (0, 1)]
+    return np.concatenate(rows) if rows else np.zeros(0, np.int64)
 
 
 def make_scan(step, chunk: int):
@@ -329,6 +426,8 @@ def rollout_scan(run, pool, idx: np.ndarray, theta, key, max_turns: int,
             "turn limit, and the turn limit IS the draw rule, so a game decided "
             "at turn 1205 would be recorded as a win.")
 
+    global D2H
+    D2H = 0.0
     n = len(idx)
     states = jax.tree_util.tree_map(lambda a: a[jnp.asarray(idx)], pool["states"])
     h, w = pool["h"][jnp.asarray(idx)], pool["w"][jnp.asarray(idx)]
@@ -340,10 +439,11 @@ def rollout_scan(run, pool, idx: np.ndarray, theta, key, max_turns: int,
     for t0 in range(0, max_turns, chunk):
         (states, key, _, ended, winner), (x, m, i_, l_) = run(
             states, h, w, theta, key, jnp.int32(t0), ended, winner)
-        xs.append(np.asarray(x))
-        ms.append(np.asarray(m))
-        ids.append(np.asarray(i_))
-        lps.append(np.asarray(l_))
+        hx, hm, hi, hl = _to_host(x, m, i_, l_)
+        xs.append(hx)
+        ms.append(hm)
+        ids.append(hi)
+        lps.append(hl)
         steps = t0 + chunk
         if bool((ended >= 0).all()):
             break
@@ -422,7 +522,12 @@ def selfcheck() -> None:
     assert np.array_equal(_join(list(parts)), np.concatenate(parts)), "_join"
 
     # and the whole rollout contract, on a 3-turn stub
+    global D2H
+    D2H = 1e6                   # a poisoned value: `rollout` must RESET it, and
     res = rollout(step, pool, np.arange(n), theta, key, max_turns=3)
+    # if it ever stops, `d2h` accumulates across iterations, grows without bound
+    # and reads as "the iteration is transfer bound" while nothing else changes.
+    assert 0.0 < D2H < 1e6, f"D2H {D2H} not reset-and-accumulated by rollout"
     assert len(res) == 2 * n, len(res)
     assert [r["seat"] for r in res[:2]] == [0, 1]
     for r in res:
@@ -441,8 +546,10 @@ def selfcheck() -> None:
     # check is tests/test_all.py::test_the_scanned_rollout_is_bit_identical,
     # which runs long enough for games to end and asserts that it happened.
     for ch in (3, 1):
+        D2H = 1e6
         got = rollout_scan(make_scan(step, ch), pool, np.arange(n), theta, key,
                            max_turns=3, chunk=ch)
+        assert 0.0 < D2H < 1e6, f"D2H {D2H} not reset by rollout_scan"
         assert len(got) == len(res), (ch, len(got))
         for a, b in zip(res, got):
             for k in ("z", "turns", "dist", "seat", "opp"):
