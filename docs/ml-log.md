@@ -7,6 +7,39 @@ Last updated 2026-08-04.
 
 ## The one-line summary
 
+**The neural bot reached 1849 Elo, rank 21/86 — the best result in the project,
+and 112 Elo above the best heuristic build.** Seven ML attempts failed first; the
+difference was a generals-distance curriculum, which made the reward dense enough
+for the critic to learn.
+
+```
+neural (sp3, iter ~250)   1849   rank 21/86   27W-8L-1D   n=36
+  opponent-controlled     1878 +-70  (mean opponent 1755)
+v13 heuristic             1737   n=102   ->  +112, 1.7 sigma
+v18 heuristic             1587   n=90    ->  +262, 3.8 sigma
+```
+
+Local numbers at that checkpoint: **0.705 against v16** at competition distance
+(+151 Elo) and 0.843 against greedy.
+
+### The greedy yardstick was the tenth instrument to lie
+
+Before submitting, the two local measures disagreed by 315 Elo:
+
+| measured by | verdict |
+|---|---|
+| head-to-head vs v16 | net is **+151 above** the heuristic |
+| the greedy yardstick | net is **164 below** it (0.843 vs the heuristic's 0.932) |
+
+The ladder says head-to-head was right. **Compare against the STRONGEST available
+opponent head-to-head; do not weight scores against weak baselines.** greedy and
+hunter are inert — you beat them either way and the margin carries no
+information. This document previously recommended a "greedy >= 0.90 AND
+v16 >= 0.55" submission bar; the greedy half of that bar would have blocked a
+1849-Elo bot.
+
+---
+
 Six ML attempts failed. **The seventh is working.** A generals-distance
 curriculum took competition-distance win rate against v16 from 0.152 to 0.420 in
 300 iterations, where the same PPO without a curriculum managed 0.175 to 0.255
