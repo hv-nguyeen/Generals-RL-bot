@@ -64,8 +64,8 @@ READING THE OUTPUT
 ------------------
     iter   247  stage 2 (7-13)  games 256  W/D/L 128/4/124  samp  71k
                 turns 138  dist 9.8
-                pg -0.0132  v 0.214  evar 0.31 (e+0.04 l+0.88)  dlp0 4.1e-04
-                klU 0.011/0.019
+                pg -0.0132  v 0.214  evar 0.31 (e+0.04 m+0.22 l+0.88
+                sc m+0.18 l+0.80)  dlp0 4.1e-04  klU 0.011/0.019
                 klA 0.38  beta 0.050  ent 2.91  gn 0.42  mb 17  6s
     stage-eval  250  0.71 +-0.050 (200/200 games, dist 7-13, vs stage-entry self)
                 2/2 over 0.60 -> STAGE 3
@@ -114,29 +114,64 @@ measuring after is self-congratulation. `dlp0` is a MAX, not a mean: a mean over
 per-sample forward noise averages back to 1.0000 and is blind to exactly the
 desync it exists to catch.
 
-`evar` PRINTS THREE NUMBERS AND ONLY ONE OF THEM IS A QUALITY SCORE. With
+`evar` PRINTS FIVE NUMBERS AND NOT ONE OF THEM IS READABLE ON ITS OWN. With
 terminal-only reward the critic's target is z at every state, so the optimal
 critic V* is a martingale: Var(V*_t) rises from whatever the map alone
-determines at t=0 to Var(z) at t=T. The pooled number is therefore an average
-over that ramp -- it has a ceiling well under 1.0 that nobody has measured, and
-"0.31 is bad" is not a claim until that ceiling is. `e` is the first 10% of each
-episode's plies and `l` is the last 10%. In the last 10% the outcome is nearly
-decided, so the ceiling there is near 1.0 and `l` IS readable as a fitting
-score. `e` << `l` with `l` high says the pooled number is the martingale and the
-critic is fine. `l` low says the critic cannot fit even a nearly-decided
-position, which is the only reading that justifies touching the value loss.
+determines at t=0 to Var(z) at t=T. Every evar here is therefore capped by a
+ceiling set by how fast games resolve and how often a loser is sniped through
+fog -- NOT by the critic. Simulated over a bounded win-probability martingale
+with z drawn consistently with V*, a PERFECT critic reads a last-decile evar
+anywhere from 0.29 to 1.00 across plausible operating points. So no absolute
+threshold on any of these fields is a claim, and an earlier version of this
+docstring asserting `l >= 0.85` was the stage-eval 0.60 mistake again: a bar
+that may be unreachable by construction (see docs/ml-log.md).
 
-The measurement, ~30 iterations at competition distance with the policy pinned
-(`--warm-evar 0.99` never lets `warmed` become true, so the critic fits a
-STATIONARY distribution and `l` means what it says):
+    e   first 10% of each episode's plies      m   frac 0.20-0.45, the MIDGAME,
+    l   last 10%                                   where the collapse lives
 
-    python -m learn.selfplay --backend gpu --start-stage 5 --iters 30 \\
-        --warm-evar 0.99 --out /local/data/vng205/ceil.npz
+`sc` IS THE ONLY CEILING-FREE READING and it is why the bands are printed at
+all. It is the same evar for the same subset from an ordinary least squares on
+the EIGHT BROADCAST SCALARS the observation already carries (turn/1200, turn%2,
+(turn%50)/50, turn>=800, log1p of both army and both land totals) -- a
+predictor that cannot see the board at all. Both face the identical ceiling, so
+the ceiling CANCELS and only the difference means anything:
 
-`l >= 0.85` -> the critic fits where the answer is knowable; spend the night on
-the receptive field instead. `l < 0.60` -> it does not, and `--value-head
-hlgauss` is the cheapest thing to try (same command plus that flag; the kill
-number is +0.10 absolute on `l`).
+    m/l well above sc   the critic reads the board. A low absolute number there
+                        is information the state does not contain, not a fitting
+                        failure, and no value loss recovers it.
+    m/l at or below sc  the critic is not extracting anything the clock does not
+                        already give. THIS is the only reading that justifies
+                        touching the value loss, and the midgame `m` gap is the
+                        one the credit-assignment hypothesis is about.
+    nan                 the buffer had no decided games (Var(z) = 0). At stage 5
+                        an all-draw batch does this; it is not a critic result.
+
+The measurement, ~30 iterations at competition distance ON THE POLICY WHOSE
+CRITIC IS IN QUESTION. Starting fresh from `--init` fits a critic to
+CLONE-vs-CLONE games and answers about a policy nobody is training, so resume --
+and resume onto a COPY, because `--out` owns `.resume.npz` and `.stageref.npz`
+and the diagnostic would otherwise overwrite the run it is diagnosing:
+
+    cp /local/data/vng205/sp.resume.npz /local/data/vng205/ceil.resume.npz
+    python -m learn.selfplay --backend gpu --resume \\
+        --out /local/data/vng205/ceil.npz --iters $((N + 30)) \\
+        --warm-evar 0.99 --comp-eval-every 999
+
+`--iters` is an ABSOLUTE end, so pass the resumed iteration N plus 30, and drop
+`--start-stage`: on a resume the stage comes from the checkpoint and the flag is
+ignored. `--warm-evar 0.99` is never satisfied, so the policy re-freezes after
+REFREEZE_AFTER iterations and the critic then fits a near-stationary
+distribution; KILL 2 ends the run ~FROZEN_KILL iterations later, after printing
+everything this needs. `--comp-eval-every 999` skips the 400-game CPU comp-evals
+this run has no use for.
+
+Then: `m` at or below `sc` -> `--value-head hlgauss` is the cheapest thing to
+try (same command plus that flag). `m` well above `sc` -> the critic already
+reads the board and the night belongs to the receptive field instead. Either
+way the head merges on an arena.runner verdict, never on evar; and the honest
+A/B needs a THIRD arm, scalar head at 5x `--critic-lr`, because CE and
+tanh-MSE differ in effective critic learning rate by 0.4x to 12.6x across the
+state space and a two-arm test is confounded with a critic-LR sweep.
 
 KILL THE RUN IF:
 
@@ -334,10 +369,21 @@ def hl_table(m: int, sigma: float, lo: float = -1.0, hi: float = 1.0):
 
     At z = +-1 the Gaussian is centred ON the range edge, so half its mass falls
     outside and is renormalised away: row 2 recovers +0.9677, not +1.0. That
-    shrink is a UNIFORM SCALE -- row 1 recovers 0 exactly, so the CE optimum
-    predicts kappa * V*(s) for one constant kappa -- and GAE differences V and
-    then std-normalises the result, so the advantage cannot see it. `selfcheck`
-    pins all of that.
+    shrink is a UNIFORM SCALE -- row 1 recovers 0 exactly and mixture means are
+    linear, so the CE optimum is exactly kappa * V*(s) for the one constant
+    kappa = row 2 @ centres (~1 - sigma*sqrt(2/pi), i.e. set by ABSOLUTE sigma,
+    not by sigma/w).
+
+    AND GAE IS NOT INVARIANT TO IT, which an earlier version of this docstring
+    claimed. The terminal delta is z - V_{T-1} and z is NOT scaled by kappa, so
+    adv_t(kappa V) = kappa * adv_t(V) + (1 - kappa) * lam^(T-1-t) * z. The
+    kappa factor does wash out of the std-normalisation; the additive term does
+    not, because normalisation is a scale and not a shift, and it is signed
+    toward the winner over the last ~20 plies of every episode (measured: the
+    terminal advantage is 1.33x the scalar head's at kappa = 0.9677). So
+    `values_of_hl` DIVIDES the recovered mean by kappa, which restores
+    adv(V_hl) == adv(V_scalar) to f32 round-off and makes evar directly
+    comparable between the two heads. `selfcheck` pins all of that.
     """
     e = np.linspace(lo, hi, m + 1)
     c = (e[:-1] + e[1:]) / 2.0
@@ -878,12 +924,23 @@ def selfcheck() -> None:
         p = np.diff([0.5 * (1 + math.erf((x - z) / (0.04 * math.sqrt(2))))
                      for x in edges])
         assert abs(float((p / p.sum()) @ c) - z) < w, z      # measured max 1.4e-05
-    # The BOUNDARY deliberately does NOT round-trip, and by exactly the
+    # The BOUNDARY does not round-trip on its own, and by exactly the
     # half-normal mean: the Gaussian at z = +-1 is centred on the edge, so half
-    # its mass is renormalised away. This is the assert that fails if someone
-    # "fixes" the shrink by clipping z instead of understanding it.
-    assert abs(float(T[2] @ c) - (1 - 0.04 * math.sqrt(2 / math.pi))) < w
+    # its mass is renormalised away. `values_of_hl` divides by that constant, so
+    # what the trainer sees IS +-1 -- and this is the assert that fails if
+    # someone drops the rescale, or "fixes" the shrink by clipping z instead.
+    kappa = float(T[2] @ c)
+    assert abs(kappa - (1 - 0.04 * math.sqrt(2 / math.pi))) < w
+    assert abs(float(T[2] @ c) / kappa - 1.0) < 1e-6
     assert abs(float(T[1] @ c)) < 1e-7                       # draw recovers 0 exactly
+    # And the reason the rescale is not cosmetic: GAE's terminal delta is
+    # z - V_{T-1} with z UNSCALED, so a kappa-shrunk critic is not a uniform
+    # rescale of the advantage and std-normalisation cannot remove the residue.
+    V = np.array([0.5, 0.8, 0.9], dtype=np.float32)
+    shrunk = gae(1.0, (kappa * V).astype(np.float32))
+    assert abs(shrunk[-1] - kappa * gae(1.0, V)[-1]) > 0.02      # measured 0.032
+    assert np.abs(gae(1.0, (kappa * V / kappa).astype(np.float32))
+                  - gae(1.0, V)).max() < 1e-6
     # ODD readout. `adv` is scaled but NOT re-centred, and that rests on the
     # critic being antisymmetric across the two mirrored seat trajectories.
     assert np.abs(T[0] - T[2][::-1]).max() < 1e-6
@@ -900,8 +957,8 @@ def selfcheck() -> None:
     # Recovery is bounded by the simplex for ANY logits, including garbage
     # during warmup -- the property the tanh head bought with a saturating
     # nonlinearity that also kills its own gradient.
-    v = np.exp(_log_softmax(rng.normal(size=(7, 128)) * 5, np)) @ c
-    assert np.all(np.abs(v) <= abs(float(c[0]))) and np.all(np.isfinite(v))
+    v = np.exp(_log_softmax(rng.normal(size=(7, 128)) * 5, np)) @ c / kappa
+    assert np.all(np.abs(v) <= abs(float(c[0])) / kappa) and np.all(np.isfinite(v))
     # The label index. `rint`, not `astype`: astype TRUNCATES, so a return of
     # -1e-8 would be labelled a LOSS with nothing crashing and nothing printing.
     assert [int(round(outcome(wn, s) + 1)) for wn in (1, -1, 0) for s in (0, 1)] \
@@ -949,15 +1006,23 @@ def main() -> None:
                          "MSE gradient carries a (1 - tanh^2) factor that "
                          "vanishes exactly where the critic is confidently "
                          "wrong. Do not merge it on an evar number: run "
-                         "arena.runner on the two trained policies")
+                         "arena.runner on the two trained policies -- and run a "
+                         "THIRD arm, scalar at 5x --critic-lr, because CE and "
+                         "tanh-MSE differ in effective critic step by 0.4x-12.6x "
+                         "across the state space and a two-arm test cannot tell "
+                         "the loss function from a critic-LR sweep")
     ap.add_argument("--hl-bins", type=int, default=128,
                     help="AverageJoe's, lifted whole; not load-bearing")
     ap.add_argument("--hl-sigma", type=float, default=0.04,
-                    help="sigma/w = 2.56 at 128 bins over [-1, 1]. THE RATIO is "
-                         "the parameter, not sigma: Farebrother's flat band is "
+                    help="sigma/w = 2.56 at 128 bins over [-1, 1]. The RATIO "
+                         "governs the smoothing: Farebrother's flat band is "
                          "0.5..2 and the failure modes (one-hot label, no "
                          "ordinal structure, NaN in the density form) are all at "
-                         "ratios well under 1, so 2.56 is the safe side")
+                         "ratios well under 1, so 2.56 is the safe side. "
+                         "ABSOLUTE sigma governs something else -- the boundary "
+                         "shrink kappa = 1 - sigma*sqrt(2/pi), 0.968 here and "
+                         "0.871 at --hl-bins 32 --hl-sigma 0.16 despite the "
+                         "identical ratio -- which values_of_hl divides out")
     ap.add_argument("--warm-evar", type=float, default=PROMOTE_EVAR,
                     help="hold the policy frozen until the critic explains this "
                          "much of the return, and re-freeze if it stops")
@@ -1158,8 +1223,21 @@ def main() -> None:
     def values_of(q, x):
         return jnp.tanh(vt.forward(q, x))
 
-    hl_c, hl_t = hl_table(args.hl_bins, args.hl_sigma)
-    hl_c, hl_t = jnp.asarray(hl_c), jnp.asarray(hl_t)
+    # Everything hlgauss is INSIDE the flag, table included. Built unconditionally
+    # it let an hlgauss-only knob kill the DEFAULT critic: `--hl-sigma 0` divides
+    # by zero inside the erf and, because the edges are a numpy array, produces a
+    # silent all-NaN table rather than raising.
+    if args.value_head == "hlgauss":
+        if args.hl_bins < 2 or args.hl_sigma <= 0:
+            raise SystemExit(f"--hl-bins {args.hl_bins} must be >= 2 and "
+                             f"--hl-sigma {args.hl_sigma} > 0; the label table "
+                             f"is otherwise empty or silently NaN.")
+        hl_c, hl_t = hl_table(args.hl_bins, args.hl_sigma)
+        # Half the z = +-1 Gaussian is truncated away, so the CE optimum is
+        # kappa * V*. Divided out in `values_of_hl`; see `hl_table` for why GAE
+        # does NOT hide it.
+        hl_kappa = float(hl_t[2] @ hl_c)
+        hl_c, hl_t = jnp.asarray(hl_c), jnp.asarray(hl_t)
 
     @jax.jit
     def v_step_hl(q, opt, t, x, ret):
@@ -1182,8 +1260,8 @@ def main() -> None:
     @jax.jit
     def values_of_hl(q, x):
         # MEAN of the predicted categorical, not the argmax: GAE is linear in V.
-        # Bounded by [c_0, c_-1] for any logits, garbage included.
-        return jax.nn.softmax(vt.forward(q, x), axis=-1) @ hl_c
+        # Bounded by [c_0, c_-1] / kappa for any logits, garbage included.
+        return (jax.nn.softmax(vt.forward(q, x), axis=-1) @ hl_c) / hl_kappa
 
     if args.value_head == "hlgauss":
         v_step, values_of = v_step_hl, values_of_hl
@@ -1456,22 +1534,40 @@ def main() -> None:
         # hand every state whose raw advantage is ~0 one identical deterministic
         # value, i.e. failure 4's blanket push rebuilt out of its own cure.
         adv = np.clip(adv / (adv.std() + 1e-8), -ADV_CLIP, ADV_CLIP)
-        def _evar(m):
+        def _evar(m, v=None):
             """1 - Var(z - V)/Var(z) over a subset of the buffer.
 
-            POOLED evar IS NOT A QUALITY SCORE. V* is a martingale, so its
-            explainable share of Var(z) rises from map-determined at t=0 to 1.0
-            at t=T, and the pooled number is mostly a statement about episode
-            length. Read `l` (last 10% of plies): the outcome there is nearly
-            determined, so the ceiling is near 1 and any shortfall is the critic
-            failing to FIT, not information it lacks. `e` (first 10%) is the
-            other end: e << l with l high is the martingale, not a bad critic.
+            NO ABSOLUTE VALUE HERE IS A QUALITY SCORE. V* is a martingale, so
+            its explainable share of Var(z) rises from map-determined at t=0 to
+            1.0 at t=T, and every subset carries a ceiling set by how fast games
+            resolve and how often a loser is sniped through fog -- simulated at
+            0.29..1.00 for a PERFECT critic in the last decile alone. What is
+            readable is the GAP to `sc`, the same quantity for a predictor that
+            cannot see the board (see below): the ceiling is common to both and
+            cancels. Read the module docstring before reading these numbers.
             """
-            r, v = ret[m], vals[m]
+            r = ret[m]
+            v = vals[m] if v is None else v
             rv = float(r.var())
             return float(1.0 - ((r - v).var() / rv)) if rv > 1e-9 else float("nan")
+
+        # The ceiling-free control: least squares on the EIGHT BROADCAST SCALAR
+        # planes (turn, parities, the four log1p totals), which are constant over
+        # the grid, so channel `C-8:` at any cell is the whole feature vector.
+        # A predictor with no board at all, fit on the same subset, facing the
+        # same martingale ceiling. `evar_l - sc_l <= 0` says the critic extracts
+        # nothing the clock does not already give; both low and equal says the
+        # state does not contain it and no value loss recovers it.
+        sc = np.c_[xs[:, features.C - 8:, 0, 0].astype(np.float32), np.ones(n, np.float32)]
+
+        def _evar_scalars(m):
+            a, r = sc[m], ret[m]
+            return _evar(m, a @ np.linalg.lstsq(a, r, rcond=None)[0])
+
         evar = _evar(slice(None))
-        evar_e, evar_l = _evar(frac < 0.1), _evar(frac >= 0.9)
+        mid = (frac >= 0.2) & (frac < 0.45)      # the midgame collapse window
+        evar_e, evar_m, evar_l = _evar(frac < 0.1), _evar(mid), _evar(frac >= 0.9)
+        sc_m, sc_l = _evar_scalars(mid), _evar_scalars(frac >= 0.9)
         if evar == evar:
             evar_max = max(evar_max, evar)
         t_ing = time.time()      # GAE is a host python loop; it counts as ingest
@@ -1599,7 +1695,8 @@ def main() -> None:
               f"turns {turns:.0f}  dist {dist:.1f}  bld {builds / len(g0):.2f}"
               f"{util}{tag}\n"
               f"            pg {pg:+.4f}  v {vloss:.3f}  "
-              f"evar {evar:+.2f} (e{evar_e:+.2f} l{evar_l:+.2f})  "
+              f"evar {evar:+.2f} (e{evar_e:+.2f} m{evar_m:+.2f} l{evar_l:+.2f} "
+              f"sc m{sc_m:+.2f} l{sc_l:+.2f})  "
               f"{'dnp' if vec_backend else 'dlp0'} "
               f"{dnp if vec_backend else dlp0:.1e}  "
               f"klU {kl_u:.3f}/{kl_last:.3f}  klA {kl_a:.3f}  "

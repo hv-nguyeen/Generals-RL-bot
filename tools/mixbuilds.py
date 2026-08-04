@@ -107,17 +107,27 @@ def main() -> None:
     for stale in out.glob("shard_*.npz"):
         stale.unlink()
 
-    # Spread the repeated builds evenly over the shards rather than dumping them
-    # into one: learn/train.py holds out whole shards, so a build-only shard would
-    # become a build-only validation set or vanish from training entirely.
-    per = int(np.ceil(reps * len(by) / len(base_shards)))
+    # NEVER splice into the shards learn/train.py holds out. Two failures
+    # otherwise, and this project has already paid for the first: validation
+    # would contain spliced frames and so could not detect that the splice had
+    # failed, and at reps >= 2 the SAME frame lands in both training and
+    # validation. The split is a fixed permutation, so it is reproducible here.
+    from learn.train import VAL_SHARDS, VAL_SPLIT_SEED
+    pick = np.random.default_rng(VAL_SPLIT_SEED).permutation(len(base_shards))
+    held = set(pick[:VAL_SHARDS].tolist())
+    targets = [i for i in range(len(base_shards)) if i not in held]
+    if not targets:
+        raise SystemExit(f"{len(base_shards)} shards is not enough to hold "
+                         f"{VAL_SHARDS} out and still splice")
+    per = int(np.ceil(reps * len(by) / len(targets)))
     rng = np.random.default_rng(0)
     order = rng.permutation(np.tile(np.arange(len(by)), reps))
     cut = 0
     for i, s in enumerate(base_shards):
         z = np.load(s)
-        sel = order[cut:cut + per]
-        cut += per
+        sel = order[cut:cut + per] if i in set(targets) else order[:0]
+        if i in set(targets):
+            cut += per
         x = np.concatenate([z["x"], bx[sel]]) if len(sel) else z["x"]
         y = np.concatenate([z["y"], by[sel]]) if len(sel) else z["y"]
         p = rng.permutation(len(y))
@@ -135,6 +145,9 @@ def main() -> None:
         got += int(((y % features.PER_CELL) == BUILD_SLOT).sum())
     print(f"\nwrote {tot} labels to {out}, {100 * got / tot:.2f}% builds "
           f"(was {100 * 34 / 203924:.2f}% in the base)")
+    print(f"  shards {sorted(held)} left UNTOUCHED - they are learn/train.py's "
+          f"validation split, and splicing into them is how the previous "
+          f"attempt hid its own failure")
 
 
 if __name__ == "__main__":

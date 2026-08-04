@@ -434,7 +434,7 @@ def main() -> None:
     print(f"\nwrote {out} (best val top-1 {best:.3f} +-{best_se:.3f} "
           f"at epoch {best_epoch} of {args.epochs})")
     print("Use it as a sparring partner:")
-    print(f"  python -m arena.runner --a ours --b clone:{out} --games 200 --workers 32")
+    print(f"  python -m arena.runner --a ours:configs/v16.json --b clone:{out} --games 200 --workers 32")
 
 
 # --------------------------------------------------------------------------

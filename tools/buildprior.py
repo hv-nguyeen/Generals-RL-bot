@@ -58,9 +58,11 @@ from sim import engine, mapgen
 def probe(net: Net, seeds, opponent: str, max_turns: int):
     """Mean P(build) over the build-legal states this policy reaches.
 
-    The policy drives both seats, so the states are its own — measuring on
-    heuristic-vs-heuristic states is what made the data approach look fine right
-    up until it was tested where it mattered.
+    The policy plays seat 0 against `--opponent`, so the states are ones it
+    actually reaches in a real matchup — NOT self-play states, and not the
+    heuristic-vs-heuristic states whose mismatch made the data approach look fine
+    right up until it was tested where it mattered. The calibrated bias is
+    therefore specific to this opponent's style; recalibrate if it changes.
     """
     from arena import agents
     legal, steps, pm = 0, 0, []

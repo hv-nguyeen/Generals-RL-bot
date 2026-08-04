@@ -33,8 +33,11 @@ discipline `learn/selfplay.selfcheck` already applies -- `generate`'s bracket is
 a request and its fallback chain will seat a general outside it rather than
 fail.
 
-Boards are byte-identical to the ones the CPU rollout plays, so a CPU/GPU A/B
-compares two backends on the same maps rather than on two distributions.
+Boards are byte-identical to what `mapgen.generate` produces for the pool's own
+seeds. NOTE they are NOT the boards `--backend cpu` plays: that path draws from
+`SP_TRAIN_SEED0` and the pool from `SP_POOL_SEED0`, which are disjoint. A CPU/GPU
+A/B therefore shares the distribution, not the maps, and any quality difference
+between backends is confounded with the map sample.
 
 File format, per stage:
     grid  (N, 21, 21) int32   -2 mountain, 0 plain, 1 general A, 2 general B,
