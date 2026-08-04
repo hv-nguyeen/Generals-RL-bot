@@ -19,6 +19,12 @@ versions of this file was measured on mechanism metrics (general-drain rate,
 army brought home), NOT on Elo, and the aggregate is 150 Elo down. Only the
 first two or three were ever confirmed by rating.
 
+**The single most transferable finding in this document:** a network that
+predicts the heuristic's move **65% of the time wins 1 game in 100 against it**
+(198W-0D-2L, +798 Elo). Top-1 accuracy maps onto playing strength so steeply
+that it is nearly worthless as a model-selection metric in a sequential game —
+and every behaviour-cloning number here was measured with it.
+
 **Two things were settled on 2026-08-04, and they point in opposite directions:**
 
 * **Network capacity is NOT the ceiling** — *this claim is now in doubt, see
@@ -412,6 +418,61 @@ the data and only one was recorded:
 This is also the most plausible explanation of the non-transitivity: a policy
 with radius 8 plays locally-good moves and gets outmanoeuvred on a board it
 cannot perceive as a whole.
+
+### RESULT (2026-08-04): top-1 accuracy is a nearly worthless proxy for strength
+
+Distilled 2000 v16-vs-v16 games — 1,750,514 labels, 44 shards, zero label noise
+by construction, passes dropped, whole games kept inside a shard so the
+validation split holds out whole games. `tools/distil.py`.
+
+**A 4-layer, 32-channel net (radius 4) converged at val top-1 0.651** — flat over
+the last five epochs with the learning rate decayed to nothing. Compare 0.499 for
+the same architecture on ladder replays, so **~0.15 of the old BC ceiling was
+label noise** and the rest was not.
+
+It is UNDERFITTING, not overfitting: train loss 1.0366 against val nll 1.0997,
+converging together and both still creeping down at LR≈0. A data-limited model
+shows train loss falling while validation stalls. This is the opposite — it
+cannot fit even the training set, so the shortfall is representational.
+
+Then the number that matters:
+
+```
+ours  vs  clone:/tmp/d4.npz
+  198W 0D 2L   score 0.990   elo +798.3
+```
+
+**A policy that predicts the heuristic's move 65% of the time wins 1 game in
+100 against it** — and `ours` bare is the WEAK default config with
+`lock_enabled=True`. Generals is sequential; one wrong move in three compounds
+into a lost position.
+
+So every BC top-1 number in this document, including the whole scaling study,
+was measuring something with an extremely steep and unknown mapping onto
+playing strength. **Do not use top-1 to choose an architecture.**
+
+### And imitation is the wrong task anyway
+
+| policy | trained by | vs the heuristic |
+|---|---|---|
+| d4 clone, 0.651 top-1 | imitation | **0.010** |
+| `sp.best.npz`, 8 layers | self-play RL, 50 iterations | **0.517** |
+
+Both are shallow conv nets with limited receptive fields. The imitator is
+unplayable; the RL policy reached parity in fifty iterations.
+
+**RL does not have to reproduce the heuristic's decision function.** It never
+needs to compute `dist_enemy_gen`; it only has to win, and it can find a policy
+that works within whatever it can see. Imitation is strictly harder because it
+must match a function built from whole-board BFS.
+
+So the receptive field is a hard ceiling on COPYING the heuristic and is not
+demonstrated to be a ceiling on BEATING it — an 8-layer net already reached
+0.517 by self-play. The experiment below answered a real question and, in the
+same run, showed that question was less load-bearing than the argument for it
+claimed.
+
+**Conclusion: stop imitating, put the compute into RL.**
 
 ### The experiment that settles it in one hour
 
