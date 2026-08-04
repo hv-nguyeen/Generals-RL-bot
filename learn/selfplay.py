@@ -1207,8 +1207,13 @@ def main() -> None:
         # `warmed` has no timeout, `promote` blocks on evar, and the run prints
         # `[critic warmup]` until morning and answers nothing. Fires after this
         # iteration's log line, so the kill has its own context above it.
-        kill2 = (not warmed and stage == 0 and it > WARMUP * 10
-                 and low >= FROZEN_KILL)
+        # Armed at EVERY stage, not just stage 0. The first curriculum run froze
+        # at stage 2 -- games there run 333 turns against stage 0's 156, evar
+        # fell below the line, and with the kill gated on `stage == 0` nothing
+        # stopped it: `[critic warmup 234/20]`, pg +0.0000, for 250 iterations
+        # until the run was killed by hand. A frozen policy at any stage is the
+        # same wasted night.
+        kill2 = (not warmed and it > WARMUP * 10 and low >= FROZEN_KILL)
 
         # `dlp0` compares the worker's NUMPY logp against the parent's JAX one
         # and is the top kill criterion. Under --backend gpu both sides are the
@@ -1314,10 +1319,21 @@ def main() -> None:
 
         if kill2:
             print(f"\n  KILL 2: evar under {args.warm_evar} for {low} consecutive "
-                  f"iterations at stage 0 (best seen {evar_max:+.3f}). At distance "
-                  f"{dmin}{hi} the outcome is not predictable from the state, so "
-                  "reward density was NEVER the problem and no curriculum fixes "
-                  "it. Stopping. Write it down in docs/ml-log.md.", flush=True)
+                  f"iterations at stage {stage} (best seen {evar_max:+.3f}), so the "
+                  f"policy is frozen and nothing downstream can move.", flush=True)
+            # The same symptom means two different things and only stage 0
+            # falsifies the hypothesis the curriculum was built on.
+            if stage == 0:
+                print(f"  At distance {dmin}{hi} the outcome is not predictable "
+                      "from the state, so reward density was NEVER the problem "
+                      "and no curriculum fixes it. Write it down in "
+                      "docs/ml-log.md.", flush=True)
+            else:
+                print(f"  Stage 0 worked, so the critic fits SHORT games and not "
+                      f"{turns:.0f}-turn ones. That is a critic problem, not a "
+                      "refutation of the curriculum: lower --warm-evar, raise "
+                      "--stage-cap so each stage consolidates, or use a "
+                      "distributional value head.", flush=True)
             break
 
         # --- comp-eval: the ONLY progress number. Competition boards at every
