@@ -60,7 +60,7 @@ def sprt(wins: int, draws: int, losses: int, elo0: float = 0.0, elo1: float = 12
     value = llr(wins, draws, losses, elo0, elo1)
     verdict = "continue"
     if value >= upper:
-        verdict = "accept H1 (B is better)"
+        verdict = "accept H1 (A is better)"
     elif value <= lower:
         verdict = "accept H0 (no improvement)"
     return {"llr": value, "lower": lower, "upper": upper, "verdict": verdict,
