@@ -3,7 +3,7 @@
 Running log so nothing gets tried twice. Every entry needs a measured number, not
 an impression. If an entry has no number it does not belong here.
 
-Last updated 2026-08-04.
+Last updated 2026-08-05.
 
 ## The one-line summary
 
@@ -958,6 +958,141 @@ is loud, so it was left alone.
 The seam check is the deliverable, not a checkbox. `make verify` runs it and
 `make test` runs it. If it ever prints a COVERAGE line with a zero in it, the
 equality it asserts has gone vacuous and the run that follows proves nothing.
+
+---
+
+## The critic as the bottleneck: the diagnosis, the instrument, and a PROJECTION
+
+**Nothing in this section is measured yet.** It is written before the run so the
+prediction can be read against the outcome, the way the 23x and the 2.5-4x
+throughput projections above were not.
+
+### The diagnosis
+
+With terminal-only reward and gamma=1, a move's advantage is essentially
+`V(s_next) - V(s)`. That difference is the ONLY mechanism connecting a move at
+turn 100 to a win at turn 450. Our critic reports explained variance 0.20-0.35,
+so most of that difference is noise, and credit assignment degrades toward
+"every move in a won game gets upvoted" — which cannot separate the good moves
+from the bad ones inside the same game.
+
+Two observed failures this predicts, both already in this document:
+
+1. **Castles.** A castle costs 35 army now and returns +0.5 army/turn for the
+   rest of the game, roughly a 70-turn payback. Given a build prior, PPO deleted
+   them within 37 iterations (`bld` 15 -> 0.1) and held there. A weak critic sees
+   the immediate cost and not the diffuse benefit.
+2. **Midgame collapse.** Over 336 ladder games, mean land at turn 100 is **48.8
+   for us against 45.4** for the opponent; by turn 200 it is **69.0 against
+   75.2**. We win the opening and lose the midgame, and whatever goes wrong there
+   has its consequence 50+ turns later — the attribution a weak critic cannot
+   make.
+
+### What the instrument measures, and what it deliberately does not
+
+`learn/selfplay.py` now prints `evar` in bands with a control:
+
+```
+evar +0.31 (e+0.04 m+0.22 l+0.88 sc m+0.18 l+0.80)
+```
+
+`e` is the first 10% of each episode's plies, `l` the last 10%, `m` frac
+0.20-0.45 — the midgame window the collapse lives in, which the first version of
+this instrument did not print at all.
+
+**No absolute number here is a claim, and that is the point.** V* is a
+martingale under terminal-only reward, so every band carries a ceiling set by how
+fast games resolve and how often a losing seat is sniped through fog. Simulated
+over a bounded win-probability martingale with z drawn consistently with V* — i.e.
+a PERFECT critic — the last-decile evar reads anywhere from **0.29 to 1.00**
+across plausible operating points, and 0.80 at a plausible one. An earlier draft
+of this work put a `l >= 0.85` bar on that field. **That is the stage-eval 0.60
+mistake for the third time in this project** (see also the greedy >= 0.90
+submission bar, which would have blocked a 1849-Elo bot): a threshold that may be
+unreachable by construction.
+
+`sc` is the fix and it is the only readable number. It is the same evar for the
+same subset, from an ordinary least squares on the **eight broadcast scalar
+planes the observation already carries** (`turn/1200`, `turn%2`, `(turn%50)/50`,
+`turn>=800`, `log1p` of both army and both land totals) — a predictor that cannot
+see the board at all. Both predictors face the identical ceiling, so **the
+ceiling cancels and only the gap means anything**:
+
+| reading | conclusion |
+|---|---|
+| `m`/`l` well above `sc` | the critic reads the board; a low absolute number is information the state does not contain, and no value loss recovers it |
+| `m`/`l` at or below `sc` | the critic extracts nothing the clock does not already give — the only reading that justifies touching the value loss |
+| `nan` | Var(z) = 0, an all-draw batch. Not a critic result |
+
+Cost: two `lstsq` calls on an (n, 9) design, **7 ms at n = 71k**, no games.
+
+### The fix under test
+
+An HL-Gauss distributional value head, `--value-head hlgauss`, **default off**.
+128 bins over [-1, 1], sigma 0.04, cross entropy — AverageJoe's numbers, and our
+reward is already terminal +-1 with gamma=1 so the range matches exactly.
+
+Two things about it are worth recording because they cut against the framing that
+motivated it:
+
+* **It is not distributional here.** Our returns have support exactly
+  {-1, 0, +1}, so the three label rows occupy 13/26/13 of the 128 bins with
+  **exactly zero overlap mass in float32**. It is a 3-way classifier with fixed
+  label smoothing. It buys no distributional information.
+* **The one real mechanism is narrow.** What remains is killing the `(1 - tanh^2)`
+  factor in the MSE gradient, which is a function of |V| alone: 1.00 at |V|=0,
+  0.19 at 0.90, 0.0199 at 0.99. It is severe only where |V| is large — the last
+  decile — and ~1.0 in the midgame, where the diagnosis says the disease is. **The
+  mechanism and the diagnosis do not overlap.** The castle decision in particular
+  sits at turn 100-200 with |V| ~ 0, so this change does nothing to the ~0.11
+  signal-to-noise per build decision computed under KNOWN LIMITATIONS 4.
+
+One arithmetic trap found and fixed before the run: at z = +-1 the Gaussian is
+centred on the range edge, so half its mass is truncated and renormalised away
+and the CE optimum is **kappa * V\*** with kappa = 0.9677, not V\*. GAE is NOT
+invariant to that — the terminal delta is `z - V_{T-1}` with z unscaled, so
+`adv_t(kappa V) = kappa adv_t(V) + (1-kappa) lam^(T-1-t) z`, a z-signed residue
+that std-normalisation cannot remove (measured: the terminal advantage runs 1.33x
+the scalar head's). `values_of_hl` divides kappa out, which restores
+`adv(V_hl) == adv(V_scalar)` to f32 round-off and makes evar comparable between
+the two heads — without which **the change would have been unmeasurable, which is
+worse than not making it.**
+
+### PROJECTION — labelled, and expected to be a rejection
+
+| field | projection |
+|---|---|
+| `l` | +0.05 to +0.20 |
+| `m`, `e`, and the `sc` gaps | ~0 |
+| comp-eval / Elo | **-20 to +30, centred on ZERO** |
+| castles (`bld`) | no effect |
+
+**What would falsify it:** `l` rises >= +0.10 while `m` and comp-eval stay flat
+over 300 iterations. **That is the outcome expected, and it must be written up
+here as a rejection, not a win** — otherwise this becomes the third derived
+improvement in this project reported from the metric it optimises.
+
+### The bar, stated so it can be falsified
+
+Keep the head only if it clears **+50 Elo on a 400-game SPRT** against a scalar
+run trained to the same stage from the same clone and the same seed, AND the
+midgame band `m` improves relative to `sc`. `l` is a screen, never a merge
+criterion. At 400 games SE is ~+-35 Elo, so anything under ~+70 needs a second
+batch.
+
+**And the honest A/B needs three arms, not two.** At fixed `--critic-lr 1e-3`,
+switching to CE changes the critic's effective learning rate by a factor that
+varies from 0.4x to 12.6x across the state space (tanh-MSE |dL/du| is 2.25 at
+|V|=0.5 and 0.079 at |V|=0.99, against CE's O(1)). A scalar-vs-hlgauss test at
+one `--critic-lr` is confounded with a critic-LR sweep. The control is a third
+arm — **scalar head at 5x `--critic-lr`** — and it is cheaper than the thing it
+controls for. If that arm matches hlgauss, the loss function was never the
+variable.
+
+**The price nobody had stated:** compute and memory are free (the head is 4k
+parameters, 0.013% of trunk MACs; 4.2 MB against ~231 MB for one trunk
+activation). The cost is **two GPU-nights minimum** — three matched runs to a
+comparable stage plus the gate — plus the diagnostic run before them.
 
 ## Dead ends closed by measurement
 

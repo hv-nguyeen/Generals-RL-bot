@@ -43,9 +43,12 @@ takes only the techniques that attack OUR measured failure:
           nothing to fit. What it does fix is narrower and real: the MSE target
           sits ON the tanh asymptote, so the gradient carries a (1 - tanh^2)
           factor that vanishes exactly where the critic is confidently wrong.
-          Turn it on only if the `l` field of evar says the critic fails on
-          nearly-decided positions (see READING THE OUTPUT), and merge it only
-          on an arena.runner verdict;
+          That is a LATE-GAME gradient-scale fix, where |V| is large; the
+          midgame credit assignment this project's collapse is about runs at
+          |V| ~ 0 where the factor is ~1.0 and the two losses have near
+          identical gradients. Turn it on only if the evar bands say the critic
+          fails to beat a board-blind predictor (see READING THE OUTPUT), and
+          merge it only on an arena.runner verdict;
   NOT     the magnet KL. We already have it wearing different clothes: the k3
           anchor to the behaviour clone is a permanent prior with a beta
           guardrail, not a decaying one;
@@ -171,7 +174,9 @@ reads the board and the night belongs to the receptive field instead. Either
 way the head merges on an arena.runner verdict, never on evar; and the honest
 A/B needs a THIRD arm, scalar head at 5x `--critic-lr`, because CE and
 tanh-MSE differ in effective critic learning rate by 0.4x to 12.6x across the
-state space and a two-arm test is confounded with a critic-LR sweep.
+state space and a two-arm test is confounded with a critic-LR sweep. Price it
+before starting: that is three matched training runs plus a 400-game gate, i.e.
+two GPU-nights minimum, for a mechanism this docstring argues is narrow.
 
 KILL THE RUN IF:
 
@@ -1012,7 +1017,11 @@ def main() -> None:
                          "across the state space and a two-arm test cannot tell "
                          "the loss function from a critic-LR sweep")
     ap.add_argument("--hl-bins", type=int, default=128,
-                    help="AverageJoe's, lifted whole; not load-bearing")
+                    help="AverageJoe's, lifted whole; not load-bearing, and "
+                         "the arithmetic says so: the head is 32x128 = 4k "
+                         "parameters against the trunk's ~33M MACs a sample "
+                         "(0.013%) and the (4096, 128) logits+target pair is "
+                         "4.2 MB against ~231 MB for ONE trunk activation")
     ap.add_argument("--hl-sigma", type=float, default=0.04,
                     help="sigma/w = 2.56 at 128 bins over [-1, 1]. The RATIO "
                          "governs the smoothing: Farebrother's flat band is "
@@ -1694,7 +1703,11 @@ def main() -> None:
               f"W/D/L {w}/{d}/{len(g0) - w - d}  samp {n // 1000:3d}k  "
               f"turns {turns:.0f}  dist {dist:.1f}  bld {builds / len(g0):.2f}"
               f"{util}{tag}\n"
-              f"            pg {pg:+.4f}  v {vloss:.3f}  "
+              # `v` is MSE on the scalar head and KL nats on hlgauss -- two
+              # different units, so the field is NAMED after the head rather
+              # than letting a 0.21 and a 0.21 look like the same number.
+              f"            pg {pg:+.4f}  "
+              f"{'vkl' if args.value_head == 'hlgauss' else 'v'} {vloss:.3f}  "
               f"evar {evar:+.2f} (e{evar_e:+.2f} m{evar_m:+.2f} l{evar_l:+.2f} "
               f"sc m{sc_m:+.2f} l{sc_l:+.2f})  "
               f"{'dnp' if vec_backend else 'dlp0'} "
