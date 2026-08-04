@@ -846,13 +846,30 @@ def main() -> None:
                          "the return at distance 2-6. That is the whole claim: if "
                          "it fails, reward density was never the problem and the "
                          "overnight run answers nothing. ~10 min at 60 workers")
-    ap.add_argument("--backend", choices=("cpu", "gpu"), default="cpu",
+    ap.add_argument("--backend", choices=("cpu", "gpu", "scan"), default="cpu",
                     help="rollout backend for TRAINING games only. cpu is the "
                          "process pool and stays the default until the gpu path "
                          "is measured against it; every eval runs on cpu either "
-                         "way, because they play arena opponents.")
+                         "way, because they play arena opponents. scan is gpu "
+                         "with the per-turn python loop replaced by a "
+                         "--scan-chunk-turn lax.scan: 40x fewer kernel launches "
+                         "and 32x fewer host syncs at chunk 40, same boards, "
+                         "actions and lengths, logp to 1 ulp (tests/test_all.py).")
+    # 40 divides 1200 and gives a break granularity of 40 turns against the
+    # python loop's 32, so the wasted-step overshoot is unchanged in practice.
+    # Not imported from vecroll: vecroll imports THIS module.
+    ap.add_argument("--scan-chunk", type=int, default=40,
+                    help="--backend scan: turns per lax.scan. Must divide "
+                         "--max-turns. Raising it cuts host round trips and "
+                         "raises the device buffer (chunk x 2 x games x 17.6 kB); "
+                         "lower this before lowering --games on an OOM.")
+    ap.add_argument("--start-stage", type=int, default=0,
+                    help="skip the curriculum and pin the first stage. "
+                         "MEASUREMENT SCAFFOLDING: a stage-5 rollout number "
+                         "otherwise costs an overnight run to reach. Promotion "
+                         "still works from here.")
     ap.add_argument("--pool-dir", default="runs/pools",
-                    help="--backend gpu: prebuilt boards from `tools.pools`")
+                    help="--backend gpu/scan: prebuilt boards from `tools.pools`")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--selfcheck", action="store_true")
@@ -861,6 +878,15 @@ def main() -> None:
     if args.selfcheck:
         selfcheck()
         return
+    if not 0 <= args.start_stage < len(STAGES):
+        raise SystemExit(f"--start-stage {args.start_stage} is not a stage "
+                         f"(0..{len(STAGES) - 1})")
+    # Fail here, not on the first rollout: a partial last chunk would step past
+    # the turn limit, and the turn limit IS the draw rule.
+    if args.backend == "scan" and (args.scan_chunk < 1
+                                   or args.max_turns % args.scan_chunk):
+        raise SystemExit(f"--scan-chunk {args.scan_chunk} must be a positive "
+                         f"divisor of --max-turns {args.max_turns}")
     if args.probe:
         # Everything the probe does is subtraction: no promotion (so stage 0 is
         # pinned without a second code path), no comp-eval past the iteration-0
@@ -915,6 +941,17 @@ def main() -> None:
     # XLA runs f32 convs in TF32 on an L4 by default, which costs ~1e-2 per logit
     # and would make dlp0 report a divergence the trainer does not have.
     jax.config.update("jax_default_matmul_precision", "highest")
+    # Cold start compiles the rollout kernel, the two train steps and the two
+    # oracles; on the L4 that is minutes before iteration 0 prints anything, and
+    # it is paid again on every resume and every probe. Cached next to --out so
+    # a stale cache dies with the run directory rather than outliving a change
+    # to the kernel.
+    jax.config.update("jax_compilation_cache_dir",
+                      str(Path(args.out).parent / "jaxcache"))
+    # 0.0, not the 1.0 default: this run compiles about six kernels total, so
+    # "cache everything" costs a handful of files and the default silently
+    # excludes every kernel that takes under a second.
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
     print("devices:", jax.devices())
 
     z0 = np.load(args.init)
@@ -981,10 +1018,19 @@ def main() -> None:
         return lp[jnp.arange(idx.shape[0]), idx]
 
     def to_x(a):
-        return jnp.asarray(a.astype(np.float32))
+        # Upload the f16 and widen ON THE DEVICE. Casting first materialised a
+        # second, twice-as-large host array and pushed 35.3 kB a row over PCIe
+        # instead of 17.6 -- ~2.8 GB an iteration at 256 games / stage 0
+        # (512 columns x ~156 turns x 17.6 kB, and the whole buffer goes up
+        # twice: ingest chunks, then the training epoch).
+        # f16 -> f32 is exact in numpy and in XLA, so dnp and dlp0 cannot move.
+        return jnp.asarray(a).astype(jnp.float32)
 
     def to_mask(packed):
-        return jnp.asarray(np.unpackbits(packed, axis=1)[:, :features.N_ACTIONS].astype(bool))
+        # Unpack on the device too: `vecroll.make_step` packs there, so the 497
+        # bytes a row are what crosses PCIe in both directions. Big-endian on
+        # both sides; `vecroll.selfcheck` asserts jnp/np packbits agree.
+        return jnp.unpackbits(jnp.asarray(packed), axis=1)[:, :features.N_ACTIONS] != 0
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1000,7 +1046,12 @@ def main() -> None:
     stage_mode = 2
 
     rng = np.random.default_rng(args.seed)
-    start_it, stage, over, resident = 0, 0, 0, 0
+    start_it, stage, over, resident = 0, args.start_stage, 0, 0
+    # ONE predicate for the five sites that used to test `== "gpu"`. Miss the
+    # `dnp` one and a new backend runs with the numpy/JAX weight-layout kill
+    # silently disarmed -- which is the check that exists because a conv layout
+    # bug cost this repo a 200-0 arena result.
+    vec_backend = args.backend != "cpu"
     beta, lr_scale = BETA0, 1.0
     t_p = t_v = 0
     warmed, low, rewinds = False, 0, 0
@@ -1045,6 +1096,9 @@ def main() -> None:
         rng.bit_generator.state = s["rng_state"]
         print(f"resumed from {resume_path} at iteration {start_it}, stage {stage}, "
               f"best {best_score:.3f}")
+        if args.start_stage:            # the checkpoint wins; say so out loud
+            print(f"  --start-stage {args.start_stage} IGNORED: the stage comes "
+                  f"from the checkpoint")
     elif args.resume:
         print(f"--resume: no {resume_path}, starting fresh")
 
@@ -1068,7 +1122,7 @@ def main() -> None:
     #     the two halves of the final paired gate): those run numpy heuristic
     #     opponents through `arena.agents` and cannot move onto the device, and
     #     they are the ground truth the gpu path has to be measured against.
-    vec = {"stage": None, "pool": None, "step": None}
+    vec = {"stage": None, "pool": None, "step": None, "scan": None}
 
     def play_train(it: int, stage: int):
         from learn import vecroll
@@ -1081,13 +1135,17 @@ def main() -> None:
                   f"mean dist {host['dist'].mean():.1f}", flush=True)
         if vec["step"] is None:
             vec["step"] = vecroll.make_step(bc.forward)
+            vec["scan"] = vecroll.make_scan(vec["step"], args.scan_chunk)
         # Every env starts on a DIFFERENT board on every iteration. The starter
         # kit's own pool cannot manage that: `pool_idx` starts at 0 in every
         # environment, so episode k of every env is the same board.
         npool = len(vec["pool"]["dist"])
         idx = (it * args.games + np.arange(args.games)) % npool
-        return vecroll.rollout(vec["step"], vec["pool"], idx, theta,
-                               jax.random.fold_in(jax.random.PRNGKey(args.seed), it),
+        key = jax.random.fold_in(jax.random.PRNGKey(args.seed), it)
+        if args.backend == "scan":
+            return vecroll.rollout_scan(vec["scan"], vec["pool"], idx, theta, key,
+                                        args.max_turns, args.scan_chunk)
+        return vecroll.rollout(vec["step"], vec["pool"], idx, theta, key,
                                args.max_turns)
 
     def rewind(why: str) -> bool:
@@ -1126,7 +1184,7 @@ def main() -> None:
         t0 = time.time()
         dmin, dmax, _ = STAGES[stage]
         snapshot = {k: np.asarray(v) for k, v in theta.items()}
-        results = (play_train(it, stage) if args.backend == "gpu"
+        results = (play_train(it, stage) if vec_backend
                    else play(build_jobs(it, args.games, stage), snapshot))
         resident += 1
         if not results:
@@ -1224,7 +1282,7 @@ def main() -> None:
         # stronger -- no sampling noise, and it exercises the submission's code
         # path rather than the worker's. 32 x 0.4 ms = 13 ms an iteration.
         dnp = float("nan")
-        if args.backend == "gpu" and n >= DNP_ROWS:
+        if vec_backend and n >= DNP_ROWS:
             sel = rng.choice(n, DNP_ROWS, replace=False)
             ref = np.asarray(bc.forward(theta, to_x(xs[sel])))
             dnp = float(np.abs(numpy_forward(snapshot, xs[sel]) - ref).max())
@@ -1293,7 +1351,7 @@ def main() -> None:
         # became samples. Meaningless on cpu (each worker stops at its own
         # game's end), printed only where it can be acted on.
         util = (f"  util {turns / max(r['turns'] for r in g0):.2f}"
-                if args.backend == "gpu" else "")
+                if vec_backend else "")
         # Builds per game, both seats. The action space gained a build slot per
         # cell so the policy COULD build; whether it ever does is a different
         # question and nothing else in this run answers it. A run that sits at
@@ -1311,8 +1369,8 @@ def main() -> None:
               f"turns {turns:.0f}  dist {dist:.1f}  bld {builds / len(g0):.2f}"
               f"{util}{tag}\n"
               f"            pg {pg:+.4f}  v {vloss:.3f}  evar {evar:+.2f}  "
-              f"{'dnp' if args.backend == 'gpu' else 'dlp0'} "
-              f"{dnp if args.backend == 'gpu' else dlp0:.1e}  "
+              f"{'dnp' if vec_backend else 'dlp0'} "
+              f"{dnp if vec_backend else dlp0:.1e}  "
               f"klU {kl_u:.3f}/{kl_last:.3f}  klA {kl_a:.3f}  "
               f"beta {beta:.3f}  ent {ent:.2f}  gn {gn:.2f}  mb {nb}  "
               f"{time.time() - t0:.0f}s", flush=True)

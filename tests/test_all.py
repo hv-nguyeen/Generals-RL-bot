@@ -365,6 +365,95 @@ def test_the_training_seam_matches_the_submission():
     check_encoders(boards=12, turns=320, stride=8)
 
 
+def test_the_scanned_rollout_matches_the_python_loop():
+    """`--backend scan` must play the SAME games as `--backend gpu`.
+
+    The scan moves the per-turn loop onto the device. It calls the same jitted
+    `step`, splits the same keys in the same order and passes the same absolute
+    turn index — so everything that DECIDES a game must be exact: the
+    observation, the legal mask, the sampled action, the length, the outcome.
+    `logp` is compared to `vecroll.LOGP_TOL` instead, because a scan body is a
+    different XLA compilation and the conv trunk fuses differently in it
+    (measured: logits move 3.6e-07, logp 4.8e-07 = 1 ulp). Do not "fix" a
+    failure by widening that bound.
+
+    HORIZON. 480 turns, not 160, and this is the reason: at 160 the two paths
+    are bitwise equal and the test looks stronger than it is, so a later change
+    that widened the gap would first show up in production. 480 is roughly a
+    competition-distance episode and it is where the 1-ulp gap appears.
+
+    Read the COVERAGE line. `turns` is `where(ended >= 0, ended + 1, steps)` and
+    `steps` is the only new state the scan carries: if no game ends, both paths
+    compare arrays of -1 and the test passes with the turn counter completely
+    wrong. So it asserts that BOTH branches are live — some games decided,
+    some still running at the horizon.
+
+    On failure it prints the first divergent (turn, column) and the two `logp`
+    values there. A single flipped `idx` deep into a game, with everything
+    before it identical, is the known near-tie in `categorical` and is a
+    property of the drift above; a divergence in `x` or `mask`, one from turn 0,
+    or a different length, is a bug.
+    """
+    try:
+        import jax  # noqa: F401
+    except ImportError:
+        print("  SKIPPED (no jax): --backend scan is UNVERIFIED in this run")
+        return
+    import jax.random as jr
+
+    from learn import train as bc
+    from learn import vecroll
+    from tools import pools
+
+    n, max_turns = 8, 480     # see HORIZON above
+    key = jr.PRNGKey(0)
+    theta = bc.init_params(key, {"layers": 4, "channels": 8, "residual": False})
+    step = vecroll.make_step(bc.forward)
+    idx = np.arange(n)
+
+    def diverges(a, b):
+        """(turn, field) of the first mismatch in one trajectory pair, or None."""
+        if a["turns"] != b["turns"]:
+            return (min(a["turns"], b["turns"]), "turns")
+        for f in ("x", "idx", "mask"):
+            bad = np.nonzero(np.any((a[f] != b[f]).reshape(len(a[f]), -1), axis=1))[0]
+            if len(bad):
+                return (int(bad[0]), f)
+        bad = np.nonzero(np.abs(a["logp"] - b["logp"]) > vecroll.LOGP_TOL)[0]
+        return (int(bad[0]), "logp") if len(bad) else None
+
+    # Stage 0 ONLY, and that is measured rather than assumed: a random 4x8 net
+    # decides nothing at stage 1+ inside 480 turns (stage 3, n=4: 4/4 still
+    # running at 480), so a second pool would buy a vacuous COVERAGE line at
+    # three times the cost. Stage 0's own boards already vary h (18-19) and
+    # w (19-21), which is the only thing a second stage was there for.
+    chunks = (480, 40, 16)          # 1 chunk, 12 chunks, 30 chunks
+    host = pools.build(0, size=n)
+    assert len(set(host["h"])) > 1 and len(set(host["w"])) > 1, "h/w do not vary"
+    pool = vecroll.device_pool(host)
+    ref = vecroll.rollout(step, pool, idx, theta, key, max_turns)
+    decided = sum(r["turns"] < max_turns for r in ref[::2])
+    print(f"  COVERAGE: {decided}/{n} games decided, {n - decided} still running "
+          f"at turn {max_turns}, chunks {chunks}")
+    assert 0 < decided < n, (
+        f"{decided}/{n} decided — one of the two `turns` branches is never "
+        "taken, so this comparison is vacuous on the only state the scan adds. "
+        "Raise max_turns and record the number.")
+    for chunk in chunks:
+        got = vecroll.rollout_scan(vecroll.make_scan(step, chunk), pool, idx,
+                                   theta, key, max_turns, chunk)
+        assert len(got) == len(ref), (chunk, len(got), len(ref))
+        for j, (a, b) in enumerate(zip(ref, got)):
+            for k in ("z", "turns", "dist", "seat", "opp"):
+                assert a[k] == b[k], (chunk, j, k, a[k], b[k])
+            d = diverges(a, b)
+            assert d is None, (
+                f"chunk {chunk}: column {j} (game {j // 2}, seat {j % 2}) "
+                f"diverges at turn {d[0]} in {d[1]}; "
+                f"logp {a['logp'][d[0]]!r} vs {b['logp'][d[0]]!r}, "
+                f"idx {a['idx'][d[0]]} vs {b['idx'][d[0]]}")
+
+
 def test_the_trainers_check_themselves():
     """The two PPO trainers each carry a numpy-only `--selfcheck`; run them here
     so `make test` covers the shared objective, GAE, the curriculum's advance

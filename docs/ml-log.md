@@ -602,6 +602,73 @@ Device memory is arithmetic on measured per-object sizes: ~160 MB resident pool,
 ~320 MB peak across a stage promotion, tens of MB of per-step buffers. Not close
 to 24 GB, so batch width is not memory-bound.
 
+### The 23x was wrong by 13x, and the reason is the whole story (2026-08-04)
+
+The paragraph above derived ~230k games/hour against ~10k on CPU. **Measured on
+the cluster, on an L4, `learn/selfplay.py --backend gpu`:**
+
+| games | time/iter | s/game | GPU-Util | vs CPU |
+|---|---|---|---|---|
+| 256 | 10 s | 0.039 | 0.21 | 1.7x |
+| 2048 | 128 s | 0.0625 | 0.11 | ~1.0x |
+| 256, `--backend cpu` | 17 s | 0.066 | — | 1.0x |
+
+**A derived 23x measured 1.7x, and it got WORSE as the batch grew.** Utilisation
+falls with batch size, which is the signature: the device is idle ~80% of the
+time and bigger batches buy marginally better kernels while adding proportionally
+more serial host bookkeeping.
+
+**Diagnosis: host-bound, not compute-bound.** Python sat inside the inner loop —
+per turn it gathered states, called JAX, decoded actions, stepped the env,
+checked terminations. A stage-0 game is ~156 turns and a competition game ~480,
+so an iteration was hundreds of sequential host round trips each handing the GPU
+~1 ms of work and then making it wait. Secondary: the net is 73k parameters
+(a 3x3x32x32 conv on 21x21 is a ~32x288x441 matmul), far too small to occupy an
+L4 even while a kernel IS resident — and `nvidia-smi`'s GPU-Util is "time with
+any kernel resident", not capacity, so 0.21 overstates the true FLOP fraction.
+
+**What changed: `--backend scan`.** The rollout now runs inside `jax.lax.scan`,
+`--scan-chunk` turns per device call. At chunk 40, stage 0: kernel launches
+160 -> 4, blocking host calls 645 -> 20. `--backend cpu` is still the default and
+`--backend gpu` is unchanged and still supported; the scan is a third choice.
+
+**Not bit-identical, and that is measured, not conceded.** A scan body is a
+different XLA compilation from a standalone `@jax.jit`, so the conv trunk fuses
+differently: logits move 3.6e-07 and `logp` by 1 ulp (4.8e-07 over 8 games x 480
+turns, XLA:CPU). Observations, legal masks, sampled actions, lengths and outcomes
+are exact. `logp` is the PPO ratio denominator and 5e-07 of relative error in it
+is orders below any gradient. The gate
+(`tests/test_all.py::test_the_scanned_rollout_matches_the_python_loop`) is exact
+on everything that decides a game and bounded on `logp` —
+**and its horizon is 480 turns because at 160 the two paths ARE bitwise equal**,
+i.e. the first version of that test passed for a reason that had nothing to do
+with the property it claimed.
+
+**PROJECTION, not a measurement: 2.5-4x at 256 games, i.e. 0.010-0.016 s/game.**
+Nobody has run it. It rests on two load-bearing guesses: that the ~2.1 s of
+kernel-resident time in today's 10 s iteration is unchanged by the scan, and that
+the ~1.8 s of host memcpy per iteration (`np.concatenate`, `_pack_columns`'s
+strided per-column gather, the ingest copy, the minibatch fancy-index gathers)
+is untouched by it — because it is. **The derived ~40k env-steps/s ceiling
+remains unreachable by this path at all**, because every sample still makes a
+full device -> host -> device round trip; AverageJoe, where that number came
+from, never leaves the device. Treat 23x as a lesson, not a target.
+
+**What falsifies it:** if `--backend scan` at 256 games reads worse than
+~7 s/iteration, the bottleneck was never the round trips and the remaining cost
+is the host memcpy path and the D2H copy, neither of which this touches. If
+GPU-Util still reads ~0.2 at 256 games while s/game improves, the gaps closed but
+the kernels are the next problem and the answer is a bigger net, not a faster
+loop.
+
+**Host RAM, not device RAM, is what OOMs this.** The rollout buffer is
+`steps x 2*games x 18.2 kB`: 10.8 GB at 256 games / 1200 turns, 34.7 GB at 2048
+games / 480 turns. Both paths used to hold the per-chunk list AND the joined
+array at once, doubling that to 21.7 GB on a box also hosting 60 workers, found
+as a numpy `MemoryError` minutes into an iteration. `vecroll._join` frees each
+part as it copies; peak is now the result plus one part. Device memory is not the
+constraint at any batch anyone would type — chunk 40 fits ~5000 games on the L4.
+
 ### Four correlated-map and recompilation traps, confirmed in the starter kit source
 
 Not opinions about the library — line numbers, all still true of

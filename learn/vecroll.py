@@ -1,7 +1,7 @@
 """Vectorised self-play rollouts on the GPU, behind `learn/selfplay.py`'s
 existing produce/train boundary.
 
-    python -m learn.vecroll --selfcheck     # shapes and one vmapped step, no games
+    python -m learn.vecroll --selfcheck     # shapes, one vmapped step, scan identity
 
 The CPU path measures ~2.8 games/s because every worker runs `bot/policy/net.py`
 in numpy once per seat per turn. This runs the same game N boards wide inside
@@ -61,6 +61,13 @@ from learn.selfplay import outcome                           # noqa: E402
 MASK_BYTES = -(-features.N_ACTIONS // 8)      # what np.packbits produces
 ALIVE_EVERY = 32     # a device sync in the inner loop costs more than the
                      # handful of no-op steps this leaves on the table
+# How far `rollout_scan`'s logp may sit from `rollout`'s. NOT a fudge factor:
+# a scan body is a different XLA compilation, and the measured gap is 1 ulp
+# (4.8e-07 over 8 games x 480 turns, XLA:CPU). 100x that, so it fails on a real
+# divergence and not on a fusion change. Everything that decides a game -- the
+# observation, the legal mask, the sampled action, the length -- is compared
+# EXACTLY. One definition, used by `selfcheck` and by tests/test_all.py.
+LOGP_TOL = 1e-5
 
 
 def transition(state, actions):
@@ -96,6 +103,12 @@ def make_step(forward):
 
     Seats are stacked into one batch -- rows [0:n] are seat 0, rows [n:2n] are
     seat 1 -- so both seats of every game go through ONE forward pass.
+
+    Returns the legal mask ALREADY PACKED, `(2n, MASK_BYTES)` uint8, because
+    3970 bytes a row crossing PCIe to become 497 is 8x the bytes and a
+    single-threaded `np.packbits` on the host every turn. `jnp.packbits` and
+    `np.packbits` are both big-endian by default; `selfcheck` asserts they agree
+    bit for bit rather than trusting that.
     """
     import jax
     import jax.numpy as jnp
@@ -126,7 +139,8 @@ def make_step(forward):
         # from there, so a final read would silently turn draws into whatever
         # happened afterwards.
         first = (ended < 0) & info.is_done
-        return (states, x.astype(jnp.float16), mask, a_idx, logp,
+        return (states, x.astype(jnp.float16), jnp.packbits(mask, axis=1),
+                a_idx, logp,
                 jnp.where(first, t, ended), jnp.where(first, info.winner, winner))
 
     return step
@@ -137,10 +151,14 @@ def rollout(step, pool, idx: np.ndarray, theta, key, max_turns: int) -> list[dic
     returns, in the same order (seat 0 then seat 1 of each game), so everything
     from `selfplay.py`'s ingest down is untouched.
 
-    Host memory: the step buffers are `T x 2n x 12 x 21 x 21` float16, i.e.
-    10.6 kB a sample -- ~2.6 GB for a 256-game stage-5 iteration, and the same
-    again in the returned trajectories, which is why the stacked buffer is freed
-    before they are cut out of it.
+    Host memory: the step buffers are `T x 2n x C x 21 x 21` float16, i.e.
+    17.6 kB a sample at `features.C` = 20, and T is the LONGEST game in the
+    batch, not the mean -- a 256-game stage-5 iteration that runs near the 1200
+    turn limit is `(1200, 512, 20, 21, 21)` f16 = 10.8 GB. `_join` keeps the
+    per-turn parts from being live at the same time as the joined buffer; the
+    joined buffer IS still live while `_pack_columns` cuts the trajectories out
+    of it, and that one is inherent. `--games` and `--max-turns` are the knobs;
+    this is the number that OOMs the box, several minutes into an iteration.
     """
     import jax
     import jax.numpy as jnp
@@ -156,22 +174,61 @@ def rollout(step, pool, idx: np.ndarray, theta, key, max_turns: int) -> list[dic
     steps = 0
     for t in range(max_turns):
         key, sub = jr.split(key)
-        states, x, mask, a_idx, logp, ended, winner = step(
+        states, x, packed, a_idx, logp, ended, winner = step(
             states, h, w, theta, sub, jnp.int32(t), ended, winner)
-        xs.append(np.asarray(x))
-        ms.append(np.packbits(np.asarray(mask), axis=1))
-        ids.append(np.asarray(a_idx))
-        lps.append(np.asarray(logp))
+        # `[None]` so the parts are `(1, 2n, ...)` and `_join` is the same
+        # concatenate the scan path uses. It is a view; it costs nothing.
+        xs.append(np.asarray(x)[None])
+        ms.append(np.asarray(packed)[None])
+        ids.append(np.asarray(a_idx)[None])
+        lps.append(np.asarray(logp)[None])
         steps = t + 1
         if t % ALIVE_EVERY == ALIVE_EVERY - 1 and bool((ended >= 0).all()):
             break
 
-    X = np.stack(xs); M = np.stack(ms); I = np.stack(ids); L = np.stack(lps)
-    del xs, ms, ids, lps
+    return _pack_columns(_join(xs), _join(ms), _join(ids), _join(lps),
+                         ended, winner, steps, pool, idx)
+
+
+def _join(parts: list) -> np.ndarray:
+    """`np.concatenate` that drops each part as it copies it.
+
+    A memory fix, not a speed one, and the arithmetic is the point:
+    `np.concatenate(parts)` holds the list AND the result, so the 10.8 GB
+    stage-5 buffer above peaks at 21.7 GB -- on a box that is also hosting the
+    worker pool, discovered as a numpy MemoryError minutes into an iteration.
+    Peak here is the result plus ONE part.
+
+    Mutates `parts` (entries become None). Callers pass a list they own.
+    """
+    out = np.empty((sum(len(p) for p in parts),) + parts[0].shape[1:],
+                   parts[0].dtype)
+    i = 0
+    for k, p in enumerate(parts):
+        out[i:i + len(p)] = p
+        i += len(p)
+        parts[k] = None
+    return out
+
+
+def _pack_columns(X, M, I, L, ended, winner, steps: int, pool, idx) -> list[dict]:
+    """Turn-major device buffers -> `selfplay._pack`'s per-trajectory dicts.
+
+    Shared by `rollout` and `rollout_scan` so the two paths differ ONLY in where
+    the per-turn loop lives. A difference between them is then unambiguously a
+    rollout difference and not a slicing one, which is what
+    `tests/test_all.py::test_the_scanned_rollout_matches_the_python_loop`
+    compares.
+
+    Every buffer is `(T, 2n, ...)`: turn first, then the seat-stacked column.
+    """
+    n = len(idx)
     ended = np.asarray(ended)
     winner = np.asarray(winner)
     # `turns` counts the tick the game ended ON, matching the CPU rollout: it
-    # records the observation, acts, steps, and stops.
+    # records the observation, acts, steps, and stops. `steps` is the fallback
+    # for a column that never ended, so it MUST be the absolute number of turns
+    # stepped -- see `make_scan` on why that is the whole risk of the scan.
     turns = np.where(ended >= 0, ended + 1, steps).astype(int)
     dist = pool["dist"][idx]
 
@@ -187,6 +244,112 @@ def rollout(step, pool, idx: np.ndarray, theta, key, max_turns: int) -> list[dic
                         "x": X[:T, col].copy(), "idx": I[:T, col].copy(),
                         "mask": M[:T, col].copy(), "logp": L[:T, col].copy()})
     return out
+
+
+def make_scan(step, chunk: int):
+    """`step` for `chunk` turns without returning to python.
+
+    The ONLY thing that changes from `rollout`'s loop is where the loop lives:
+    the body calls the same jitted `step`, splits the same key in the same
+    order, and passes the same ABSOLUTE turn index -- see the `t + 1` below,
+    which is the whole risk in this file.
+
+    NOT bit-identical, and that was measured rather than assumed. A scan body is
+    a different XLA compilation from a standalone `@jax.jit`, so the conv trunk
+    fuses differently and the LOGITS move by ~3.6e-07 (measured, XLA:CPU, jax
+    0.11). Observations, legal masks, sampled actions and lengths came back
+    identical over 8 games x 480 turns; `logp` differs by up to 1 ulp (4.8e-07).
+    That is harmless -- `logp` is the PPO ratio denominator, and 5e-07 of
+    relative error in it is far below any gradient -- but the drift is in the
+    input to `jax.random.categorical`, so a sampled action CAN flip at a
+    near-tie. `tests/test_all.py` holds the line: exact on everything that
+    decides a game, bounded on `logp`.
+
+    Read the output as `(chunk, 2n, ...)` stacked in TURN-MAJOR order, i.e. what
+    `rollout`'s per-turn `xs.append` produced, already stacked on the device.
+    """
+    import jax
+    import jax.random as jr
+
+    @jax.jit
+    def run(states, h, w, theta, key, t0, ended, winner):
+        def body(carry, _):
+            states, key, t, ended, winner = carry
+            key, sub = jr.split(key)
+            states, x, packed, a_idx, logp, ended, winner = step(
+                states, h, w, theta, sub, t, ended, winner)
+            # `t` is ABSOLUTE, which is why it is carried and not a scan index.
+            # `step` latches `ended = where(first, t, ended)`, so restarting the
+            # counter at 0 each chunk would silently shorten every game that
+            # ends after chunk 0 -- shapes stay consistent, z stays right, and
+            # the tail of every decided game just vanishes from the buffer.
+            return (states, key, t + 1, ended, winner), (x, packed, a_idx, logp)
+        return jax.lax.scan(body, (states, key, t0, ended, winner), None,
+                            length=chunk)
+    return run
+
+
+def rollout_scan(run, pool, idx: np.ndarray, theta, key, max_turns: int,
+                 chunk: int) -> list[dict]:
+    """`rollout` with the per-turn loop replaced by a `chunk`-turn `lax.scan`.
+
+    Two counts, because they are different numbers and the earlier version of
+    this docstring divided one by the other. At stage 0 (~160 turns, chunk 40):
+    kernel launches 160 -> 4 (40x), and BLOCKING host calls -- four
+    `np.asarray` a turn plus the liveness probe -- 645 -> 20 (32x). The bytes
+    moved are unchanged; the round trips are the diagnosis.
+
+    What this does NOT remove: the D2H copy of each chunk does not overlap
+    compute, so the device idles through 1.5 GB a stage-0 iteration, and every
+    sample still round-trips host -> `_pack_columns` -> `selfplay`'s gather ->
+    back to the device. That is ~1.8 s of host memcpy an iteration and it is
+    why the derived ~40k env-steps/s is an upper bound this path cannot reach.
+
+    NO autoreset, for the same reason `rollout` has none: one column is one
+    whole game, so there is no episode boundary for an advantage to leak
+    across. That is also why the scan is CHUNKED rather than one scan of
+    `max_turns` -- you cannot break out of a `lax.scan`, and a full-length scan
+    would step 1200 turns where this stops at ~160 at stage 0, i.e. it would
+    report a beautiful env-steps/s while being 7.5x slower per GAME.
+
+    Device memory for the chunk buffer: `chunk * 2 * games * 18.2 kB` (17.6 of
+    `x`, 497 B of packed mask, 8 B of idx/logp) -- 373 MB at chunk 40 /
+    256 games, 3.0 GB at 2048, and DOUBLE that at the peak because the previous
+    chunk's output is still bound while XLA allocates the next one. Even so the
+    L4 is not the binding resource: chunk 40 fits ~5000 games. HOST ram is,
+    see `_join`. Lower `--scan-chunk` before lowering `--games`.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    if chunk < 1 or max_turns % chunk:
+        raise ValueError(
+            f"--max-turns {max_turns} must be a positive multiple of "
+            f"--scan-chunk {chunk}: a partial last chunk would step past the "
+            "turn limit, and the turn limit IS the draw rule, so a game decided "
+            "at turn 1205 would be recorded as a win.")
+
+    n = len(idx)
+    states = jax.tree_util.tree_map(lambda a: a[jnp.asarray(idx)], pool["states"])
+    h, w = pool["h"][jnp.asarray(idx)], pool["w"][jnp.asarray(idx)]
+    ended = jnp.full(n, -1, jnp.int32)
+    winner = jnp.full(n, -1, jnp.int32)
+
+    xs, ms, ids, lps = [], [], [], []
+    steps = 0
+    for t0 in range(0, max_turns, chunk):
+        (states, key, _, ended, winner), (x, m, i_, l_) = run(
+            states, h, w, theta, key, jnp.int32(t0), ended, winner)
+        xs.append(np.asarray(x))
+        ms.append(np.asarray(m))
+        ids.append(np.asarray(i_))
+        lps.append(np.asarray(l_))
+        steps = t0 + chunk
+        if bool((ended >= 0).all()):
+            break
+
+    return _pack_columns(_join(xs), _join(ms), _join(ids), _join(lps),
+                         ended, winner, steps, pool, idx)
 
 
 def selfcheck() -> None:
@@ -212,15 +375,35 @@ def selfcheck() -> None:
     states = jax.tree_util.tree_map(lambda a: a[jnp.arange(n)], pool["states"])
     out = step(states, pool["h"], pool["w"], theta, key, jnp.int32(0),
                jnp.full(n, -1, jnp.int32), jnp.full(n, -1, jnp.int32))
-    states2, x, mask, a_idx, logp, ended, winner = out
+    states2, x, packed, a_idx, logp, ended, winner = out
     assert x.shape == (2 * n, features.C, features.PAD, features.PAD), x.shape
-    assert mask.shape == (2 * n, features.N_ACTIONS), mask.shape
+    assert packed.shape == (2 * n, MASK_BYTES), packed.shape
+    assert packed.dtype == np.uint8, packed.dtype
     assert a_idx.shape == (2 * n,) and logp.shape == (2 * n,)
     assert np.all(np.asarray(logp) <= 0.0)
     # every sampled action is legal -- the mask is applied BEFORE the sample
-    m = np.asarray(mask)
+    m = np.unpackbits(np.asarray(packed), axis=1)[:, :features.N_ACTIONS].astype(bool)
     assert m[np.arange(2 * n), np.asarray(a_idx)].all()
-    assert np.packbits(m, axis=1).shape == (2 * n, MASK_BYTES)
+    # `make_step` packs on the DEVICE and `selfplay.to_mask` unpacks on it, so
+    # the host packbits that used to sit in the loop is gone and nothing else
+    # tests its replacement. Bit order is the only thing that can differ, and an
+    # asymmetric probe is what shows it: a round-trip through np.unpackbits
+    # would agree with itself under either convention.
+    probe = (np.arange(2 * n * features.N_ACTIONS)
+             .reshape(2 * n, features.N_ACTIONS) % 3 == 0)
+    assert np.array_equal(np.asarray(jnp.packbits(jnp.asarray(probe), axis=1)),
+                          np.packbits(probe, axis=1)), "jnp/np packbits bit order"
+    # `selfplay.to_x` / `to_mask` moved the f16->f32 widen and the unpack onto
+    # the device. NO dtype changed -- f16 is a strict subset of f32, so the two
+    # orderings are bit-identical and the dnp bound (1e-4 x scale, and the seam
+    # test's measured 1.2e-07) is untouched. Asserted, not argued:
+    xh = np.asarray(x)
+    assert np.array_equal(np.asarray(jnp.asarray(xh).astype(jnp.float32)).view(np.uint32),
+                          np.asarray(jnp.asarray(xh.astype(np.float32))).view(np.uint32)), \
+        "device-side f16->f32 widen is not bitwise the host cast"
+    assert np.array_equal(
+        np.asarray(jnp.unpackbits(jnp.asarray(packed), axis=1)
+                   [:, :features.N_ACTIONS] != 0), m), "device unpack != host unpack"
     assert int(np.asarray(states2.time)[0]) == 1
     assert np.all(np.asarray(ended) == -1) and np.all(np.asarray(winner) == -1)
 
@@ -230,6 +413,13 @@ def selfcheck() -> None:
     for i in range(n):
         assert not np.array_equal(xn[i], xn[n + i]), i
         assert np.array_equal(xn[i, features.VALID], xn[n + i, features.VALID]), i
+
+    # `_join` is on BOTH rollout paths, so the loop-vs-scan test cannot see a
+    # bug in it -- it would corrupt the two sides identically. Checked here
+    # against the concatenate it replaces, on uneven parts.
+    parts = [np.arange(k * 6, dtype=np.int16).reshape(k, 3, 2) + 100 * j
+             for j, k in enumerate((1, 4, 2, 1))]
+    assert np.array_equal(_join(list(parts)), np.concatenate(parts)), "_join"
 
     # and the whole rollout contract, on a 3-turn stub
     res = rollout(step, pool, np.arange(n), theta, key, max_turns=3)
@@ -244,8 +434,31 @@ def selfcheck() -> None:
     for i in range(n):                              # paired, and zero-sum
         a, b = res[2 * i], res[2 * i + 1]
         assert a["z"] == -b["z"] and a["turns"] == b["turns"]
+
+    # The scan, on the same 3-turn stub: plumbing only. This is DELIBERATELY the
+    # weak version -- no game ends in 3 turns, so the `turns = ended + 1` branch
+    # is never taken and the absolute turn counter is untested here. The real
+    # check is tests/test_all.py::test_the_scanned_rollout_is_bit_identical,
+    # which runs long enough for games to end and asserts that it happened.
+    for ch in (3, 1):
+        got = rollout_scan(make_scan(step, ch), pool, np.arange(n), theta, key,
+                           max_turns=3, chunk=ch)
+        assert len(got) == len(res), (ch, len(got))
+        for a, b in zip(res, got):
+            for k in ("z", "turns", "dist", "seat", "opp"):
+                assert a[k] == b[k], (ch, k, a[k], b[k])
+            for k in ("x", "idx", "mask"):     # exact: these decide the game
+                assert np.array_equal(a[k], b[k]), (ch, k)
+            # logp is bounded, not exact -- see `make_scan` on why a scan body
+            # is a different compilation. Same bound as tests/test_all.py.
+            assert np.abs(a["logp"] - b["logp"]).max() <= LOGP_TOL, ch
+    try:
+        rollout_scan(None, pool, np.arange(n), theta, key, max_turns=3, chunk=2)
+        raise AssertionError("a partial last chunk was accepted")
+    except ValueError:
+        pass
     print(f"vecroll selfcheck OK ({n} envs, {features.N_ACTIONS} actions, "
-          f"{MASK_BYTES}-byte masks)")
+          f"{MASK_BYTES}-byte masks, scan chunks 3/1 match)")
 
 
 def main() -> None:
