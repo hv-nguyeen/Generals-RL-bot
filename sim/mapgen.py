@@ -24,8 +24,23 @@ from bot.board import bfs_field_from, dilate4, room_field
 SPAWN_CANDIDATES = 8
 
 
-def generate(seed: int) -> np.ndarray:
-    """A competition-legal grid: -2 mountain, 0 plain, 1 general A, 2 general B."""
+def generate(seed: int,
+             dmin: int = rules.MIN_GENERALS_DISTANCE,
+             dmax: int | None = None) -> np.ndarray:
+    """A competition-legal grid: -2 mountain, 0 plain, 1 general A, 2 general B.
+
+    `dmin`/`dmax` bracket the BFS distance between the two generals. The
+    defaults ARE the competition generator -- `generate(s)` and
+    `generate(s, 17, None)` are byte-identical, asserted in
+    `learn/selfplay.selfcheck` -- and a narrower bracket is what
+    `learn/selfplay.py`'s curriculum uses to make early games short. Terrain is
+    drawn from the RNG stream before the spawn search, so a given seed keeps the
+    same map and only moves its generals.
+
+    The bracket is a REQUEST, not a guarantee: the fallback chain below
+    (fair -> far -> reach) will seat a general outside it rather than fail when
+    a stage's ring is empty. `generals_distance` is how a caller checks.
+    """
     rng = np.random.default_rng(seed)
     h = int(rng.integers(rules.MIN_SIDE, rules.MAX_SIDE + 1))
     w = int(rng.integers(rules.MIN_SIDE, rules.MAX_SIDE + 1))
@@ -65,7 +80,9 @@ def generate(seed: int) -> np.ndarray:
     for rank_order, cand in enumerate(candidates):
         field = bfs_field_from(passable, cand)
         reach = (field < inf) & passable
-        far = reach & (field >= rules.MIN_GENERALS_DISTANCE)
+        far = reach & (field >= dmin)
+        if dmax is not None:
+            far = far & (field <= dmax)
         gap = np.abs(room - int(room[cand]))
         fair = far & (gap <= rules.SPAWN_ROOM_TOLERANCE)
 
@@ -91,6 +108,19 @@ def generate(seed: int) -> np.ndarray:
 
 def dims(grid: np.ndarray) -> tuple[int, int]:
     return int(grid.shape[0]), int(grid.shape[1])
+
+
+def generals_distance(grid: np.ndarray) -> int:
+    """BFS steps between the two generals over passable ground.
+
+    The measured distance, not the requested one. `generate` falls back to a
+    wider ring rather than failing, so this is the only thing that proves a
+    curriculum stage actually reached the generator instead of being a log line.
+    """
+    passable = grid != -2
+    a = tuple(int(v) for v in np.argwhere(grid == 1)[0])
+    b = tuple(int(v) for v in np.argwhere(grid == 2)[0])
+    return int(bfs_field_from(passable, a)[b])
 
 
 # --------------------------------------------------------------- real boards

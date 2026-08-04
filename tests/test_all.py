@@ -328,6 +328,20 @@ def test_a_checkpoint_states_its_own_architecture():
                 pass
 
 
+def test_the_trainers_check_themselves():
+    """The two PPO trainers each carry a numpy-only `--selfcheck`; run them here
+    so `make test` covers the shared objective, GAE, the curriculum's advance
+    rule and the fact that a requested generals distance actually reaches the
+    map generator. No games, no GPU, well under a second.
+
+    They print: the per-stage in-range percentages are the curriculum's own
+    proof and are worth seeing on every test run."""
+    from learn import netoracle, selfplay
+
+    netoracle.selfcheck()
+    selfplay.selfcheck()
+
+
 def main() -> None:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

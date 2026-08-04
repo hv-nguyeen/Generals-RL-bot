@@ -256,6 +256,38 @@ def gae(z: float, v: np.ndarray, gamma: float = GAMMA, lam: float = LAM):
     return adv
 
 
+def adam(p, opt, g, t, lr):
+    """One Adam step. `lr` is an ARGUMENT, not a closure: the collapse guard
+    halves it at runtime and a closed-over python float inside a jit would
+    silently keep the original.
+
+    Module scope so `learn/selfplay.py` imports it instead of making the fifth
+    copy in this repo. jax is imported in the body, not at module level, because
+    the spawned rollout workers import this module for `_rollout` and must never
+    pull in jax.
+    """
+    import jax.numpy as jnp
+
+    b1, b2, eps = 0.9, 0.999, 1e-8
+    new_p, new_o = {}, {}
+    for k in p:
+        m, v = opt[k]
+        m = b1 * m + (1 - b1) * g[k]
+        v = b2 * v + (1 - b2) * g[k] ** 2
+        new_p[k] = p[k] - lr * (m / (1 - b1 ** t)) / (jnp.sqrt(v / (1 - b2 ** t)) + eps)
+        new_o[k] = (m, v)
+    return new_p, new_o
+
+
+def clip_grads(g, limit):
+    """Global-norm gradient clip. Returns (clipped, pre-clip norm)."""
+    import jax.numpy as jnp
+
+    norm = jnp.sqrt(sum(jnp.sum(v ** 2) for v in g.values()))
+    s = jnp.minimum(1.0, limit / (norm + 1e-8))
+    return {k: v * s for k, v in g.items()}, norm
+
+
 def mixture(sigma, floor: float = SIGMA_FLOOR) -> np.ndarray:
     """sigma' = (1-floor)*sigma + floor*uniform, the TRAINING opponent distribution.
 
@@ -698,22 +730,6 @@ def main() -> None:
     phi = vt.init_params(jax.random.PRNGKey(args.seed), arch)   # critic, same size
     opt_p = {k: (jnp.zeros_like(v), jnp.zeros_like(v)) for k, v in theta.items()}
     opt_v = {k: (jnp.zeros_like(v), jnp.zeros_like(v)) for k, v in phi.items()}
-
-    def adam(p, opt, g, t, lr):
-        b1, b2, eps = 0.9, 0.999, 1e-8
-        new_p, new_o = {}, {}
-        for k in p:
-            m, v = opt[k]
-            m = b1 * m + (1 - b1) * g[k]
-            v = b2 * v + (1 - b2) * g[k] ** 2
-            new_p[k] = p[k] - lr * (m / (1 - b1 ** t)) / (jnp.sqrt(v / (1 - b2 ** t)) + eps)
-            new_o[k] = (m, v)
-        return new_p, new_o
-
-    def clip_grads(g, limit):
-        norm = jnp.sqrt(sum(jnp.sum(v ** 2) for v in g.values()))
-        s = jnp.minimum(1.0, limit / (norm + 1e-8))
-        return {k: v * s for k, v in g.items()}, norm
 
     def p_objective(p, beta, x, mask, idx, old_logp, ref_logp, adv):
         return policy_loss(bc.forward(p, x), mask, idx, old_logp, ref_logp, adv,
