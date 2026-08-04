@@ -4,6 +4,10 @@ Read `README.md` first, then `docs/superpowers/specs/2026-08-03-generals-bot-des
 for the rules analysis. `third_party/generals-bots` is the official starter kit —
 it is the ground truth for every rule; read the engine source, not the rules page.
 
+**Start with `docs/STATE.md`** — current standing, what is running, what to do
+next, and the measured non-starters. `docs/CLUSTER.md` is how to install and run
+on the VU box.
+
 **Before proposing any ML or evaluator work, read `docs/ml-log.md`.** Six ML
 attempts and nine local instruments have failed, each for a specific measured
 reason. The log exists so none of them gets tried a seventh time.

@@ -2,7 +2,8 @@
 
 `docs/ml-log.md` is the full measured history and it is long. This file is the
 short version: what is true right now, what is running, and what to do next.
-Read this first, then the log for the reasoning behind any line.
+Read this first, then the log for the reasoning behind any line, and
+`docs/CLUSTER.md` for how to install and run anything on the VU box.
 
 ## Standing
 
