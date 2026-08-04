@@ -17,15 +17,53 @@ from bot import rules
 from bot.obs import Obs
 
 PAD = 21                      # every competition board fits in 21x21
-C = 12                        # feature channels
+C = 20                        # feature channels: 12 spatial, then 8 broadcast
 DIRS_N = 4
 SPLITS = 2
-PER_CELL = DIRS_N * SPLITS    # 8 moves per source cell
+BUILD_OFFSET = DIRS_N * SPLITS      # slot 8 of a cell is "build a castle here"
+PER_CELL = DIRS_N * SPLITS + 1      # 8 moves + 1 build per cell
 N_ACTIONS = PAD * PAD * PER_CELL + 1
 PASS_INDEX = N_ACTIONS - 1
 
 (MINE, OPP, NEUTRAL, FOG, MOUNTAIN, CASTLE,
- MY_GEN, OPP_GEN, ARMY_MINE, ARMY_OPP, ARMY_NEUTRAL, VALID) = range(C)
+ MY_GEN, OPP_GEN, ARMY_MINE, ARMY_OPP, ARMY_NEUTRAL, VALID,
+ # broadcast scalars, constant over the board; CLOCK..LAND_OPP must stay the
+ # LAST channels and stay contiguous — `encode` fills them as one slice.
+ CLOCK, PARITY, GROW_PHASE, DEATHTOUCH,
+ ARMY_TOTAL_MINE, ARMY_TOTAL_OPP, LAND_MINE, LAND_OPP) = range(C)
+
+
+def scalar_features(turn, my_army, opp_army, my_land, opp_land, log1p=np.log1p):
+    """The eight broadcast scalars, in channel order, for CLOCK..LAND_OPP.
+
+    ONE definition called by both encoders — `bot.features.encode` with
+    `np.log1p` and `learn.rlenv.encode_jax` with `jnp.log1p` — because two
+    hand-written copies of an eight-element tuple in channel order is exactly
+    the drift `tools.verify_engine --encoders` exists to catch, and not writing
+    it twice is cheaper than catching it.
+
+    WHY these five numbers, all of which the wire protocol carries and the
+    encoder used to throw away:
+
+      * the clock. Deathtouch at turn 800 changes the win condition
+        discontinuously, structures grow on even ticks, every tile grows every
+        50, and the game is a DRAW at 1200. A network with no clock cannot tell
+        turn 100 from turn 790 and so cannot predict a draw, which is a
+        mechanical reason a critic stalls at competition distance where games
+        end by timeout and crosses at distance 2-6 where they end decisively.
+      * the totals. `opp_army` counts the opponent's FOGGED tiles too, so
+        `opp_army - (visible enemy army)` is the hidden army the heuristic's
+        `belief.hidden_enemy_army` runs on — by construction not computable from
+        the board the network sees.
+    """
+    return (turn / rules.TURN_LIMIT,
+            turn % 2,                                  # structures_grow
+            (turn % 50) / 50.0,                        # all_grow phase
+            (turn >= rules.DEATHTOUCH_TURN) * 1.0,
+            log1p(my_army) / 6.0,
+            log1p(opp_army) / 6.0,
+            log1p(my_land) / 6.0,
+            log1p(opp_land) / 6.0)
 
 
 def encode(obs: Obs) -> np.ndarray:
@@ -51,15 +89,32 @@ def encode(obs: Obs) -> np.ndarray:
     x[ARMY_OPP, :h, :w] = np.where(opp, la, 0.0)
     x[ARMY_NEUTRAL, :h, :w] = np.where(~mine & ~opp, la, 0.0)
     x[VALID, :h, :w] = 1.0
+
+    # Broadcast over the real board only, so the padding stays all-zero in every
+    # channel: `learn.train.augment` reads the bottom-right pad cell for dst
+    # cells outside a rotated non-square board and expects zeros there.
+    x[CLOCK:, :h, :w] = np.array(
+        scalar_features(obs.turn, obs.my_army, obs.opp_army,
+                        obs.my_land, obs.opp_land),
+        dtype=np.float32)[:, None, None]
     return x
 
 
 def action_to_index(action) -> int:
-    """Wire action -> flat class. Builds are not modelled; they map to pass."""
+    """Wire action -> flat class.
+
+    `idx = (r*21 + c)*9 + (8 if build else d*2 + split)`, pass last. A build is
+    position-only: dir and split are ignored by the engine (see
+    `generals/modifiers/build_castles.py`), so it gets one slot per cell and not
+    eight. Builds used to fold into PASS here, which trained the clone to pass
+    on exactly the positions where a strong player built a castle.
+    """
     kind, r, c, d, split = (int(v) for v in action)
-    if kind != rules.MOVE:
+    if not (0 <= r < PAD and 0 <= c < PAD):
         return PASS_INDEX
-    if not (0 <= r < PAD and 0 <= c < PAD and 0 <= d < DIRS_N):
+    if kind == rules.BUILD:
+        return ((r * PAD + c) * PER_CELL) + BUILD_OFFSET
+    if kind != rules.MOVE or not 0 <= d < DIRS_N:
         return PASS_INDEX
     return ((r * PAD + c) * PER_CELL) + d * SPLITS + (1 if split else 0)
 
@@ -69,6 +124,8 @@ def index_to_action(idx: int):
         return rules.PASS_ACTION
     cell, rest = divmod(int(idx), PER_CELL)
     r, c = divmod(cell, PAD)
+    if rest == BUILD_OFFSET:
+        return (rules.BUILD, r, c, 0, 0)
     d, split = divmod(rest, SPLITS)
     return (rules.MOVE, r, c, d, split)
 
@@ -93,4 +150,13 @@ def legal_mask(obs: Obs) -> np.ndarray:
             m[base] = True
             if a[r, c] >= 4:
                 m[base + 1] = True
+
+    # Builds. Computable from a FOGGED observation with no hidden information,
+    # and that is provable rather than lucky: visibility is dilate8(own), so
+    # every cell we own is visible to us, and the engine's price depends only on
+    # `(castles | generals) & ownership[me]` -- enemy structures never enter it.
+    mine = o == rules.OWNER_ME
+    structs = mine & ((t == rules.T_GENERAL) | (t == rules.T_CASTLE))
+    can = mine & ~structs & (a >= rules.build_cost_grid(structs))
+    m[:PAD * PAD * PER_CELL].reshape(PAD, PAD, PER_CELL)[:h, :w, BUILD_OFFSET] = can
     return m

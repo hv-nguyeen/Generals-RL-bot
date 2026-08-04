@@ -135,7 +135,7 @@ def forward(params, x):
     import jax.numpy as jnp
 
     h = trunk(params, x)
-    move = _conv(h, params["head_w"], params["head_b"])           # (B, 8, H, W)
+    move = _conv(h, params["head_w"], params["head_b"])     # (B, PER_CELL, H, W)
     flat = jnp.transpose(move, (0, 2, 3, 1)).reshape(x.shape[0], -1)
     pass_logit = h.mean(axis=(2, 3)) @ params["pass_w"] + params["pass_b"]
     return jnp.concatenate([flat, pass_logit[:, None]], axis=1)
@@ -203,6 +203,11 @@ def _dihedral_maps(h: int, w: int, g: int):
     for d in range(features.DIRS_N):
         for s in range(splits):
             actmap[oldbase + d * splits + s] = newbase + dperm[d] * splits + s
+    # A build is position-only, so it follows the cell and NOT the direction
+    # permutation. Leaving it out looks harmless -- actmap starts as the
+    # identity -- and silently relabels every augmented build as a move of the
+    # unrotated cell, which is a wrong label that trains perfectly cleanly.
+    actmap[oldbase + features.BUILD_OFFSET] = newbase + features.BUILD_OFFSET
     return srcof, actmap
 
 
@@ -242,6 +247,22 @@ def shard_list(data: Path) -> list[Path]:
     shards = sorted(data.glob("shard_*.npz"))
     if not shards:
         raise SystemExit(f"no shards in {data} — run `python -m learn.dataset` first")
+    # `learn/dataset.py` writes the action-space size it labelled with. A shard
+    # built before builds were modelled labels every expert castle build as
+    # PASS_INDEX 3528, which under the current scheme decodes to "build at cell
+    # 392" -- a wrong label that trains cleanly and cannot be noticed later.
+    meta = data / "meta.json"
+    if meta.exists():
+        m = json.loads(meta.read_text())
+        for key, want in (("n_actions", features.N_ACTIONS), ("channels", features.C)):
+            got = m.get(key)
+            if got is not None and int(got) != want:
+                raise SystemExit(
+                    f"{data} was built with {key}={got}, this build has {want}. "
+                    f"Rebuild with `python -m learn.dataset`.")
+    else:
+        print(f"WARNING no {meta}: cannot check the shards were built for "
+              f"{features.N_ACTIONS} actions and {features.C} channels", flush=True)
     return shards
 
 
@@ -585,6 +606,17 @@ def selfcheck() -> None:
                 assert r * pad + c == to_dst[r0 * pad + c0], f"source moved wrong at g={g}"
                 assert (r + DIRS[d][0]) * pad + (c + DIRS[d][1]) == to_dst[r1 * pad + c1], \
                     f"augmented action does not point at the moved destination at g={g}"
+
+            # A BUILD follows the cell and NOT the direction permutation, and it
+            # must stay a build. Omitting it from actmap is invisible -- actmap
+            # starts as the identity -- and relabels every augmented build as a
+            # MOVE of the unrotated cell: a wrong label that trains cleanly.
+            for r0, c0 in ((2, 1), (0, 0), (h - 1, w - 1)):
+                lab = np.array([features.action_to_index((rules.BUILD, r0, c0, 0, 0))])
+                _, gy = augment(enc.copy(), lab, g)
+                kind, r, c, _, _ = features.index_to_action(int(gy[0]))
+                assert kind == rules.BUILD, f"a build became kind {kind} at g={g}"
+                assert r * pad + c == to_dst[r0 * pad + c0], f"build moved wrong at g={g}"
 
     print("train selfcheck OK")
 

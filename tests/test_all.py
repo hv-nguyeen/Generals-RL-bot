@@ -258,14 +258,16 @@ def test_a_checkpoint_states_its_own_architecture():
 
     rng = np.random.default_rng(0)
 
-    def weights(layers, ch, residual):
-        p, prev = {}, features.C
+    def weights(layers, ch, residual, cin=None, per_cell=None):
+        cin = features.C if cin is None else cin
+        per_cell = features.PER_CELL if per_cell is None else per_cell
+        p, prev = {}, cin
         for n in npnet.trunk_keys(layers, residual):
             p[f"{n}_w"] = (rng.normal(size=(ch, prev, 3, 3)) * 0.2).astype("f4")
             p[f"{n}_b"] = (rng.normal(size=ch) * 0.2).astype("f4")
             prev = ch
-        p["head_w"] = (rng.normal(size=(features.PER_CELL, ch, 3, 3)) * 0.2).astype("f4")
-        p["head_b"] = np.zeros(features.PER_CELL, "f4")
+        p["head_w"] = (rng.normal(size=(per_cell, ch, 3, 3)) * 0.2).astype("f4")
+        p["head_b"] = np.zeros(per_cell, "f4")
         p["pass_w"] = np.zeros(ch, "f4")
         p["pass_b"] = np.float32(0.0)
         return p
@@ -320,12 +322,47 @@ def test_a_checkpoint_states_its_own_architecture():
         cut = {k: v for k, v in p.items() if not k.startswith("res2")}
         np.savez(td / "tailres.npz", **cut, **rec)
 
-        for name in ("renamed.npz", "gap.npz", "tail.npz", "tailres.npz"):
+        # A checkpoint from before the action space or the observation changed.
+        # Both are internally consistent, carry an honest arch_record, and load
+        # without complaint if nobody checks the two widths that are not part of
+        # "architecture": the head would die later in a broadcast against the
+        # legal mask, the stem in a BLAS shape error inside _conv3x3 -- both
+        # mid-match, from lines that name neither the file nor the reason.
+        for name, kw in (("stale_head.npz", {"per_cell": features.PER_CELL - 1}),
+                         ("stale_obs.npz", {"cin": features.C - 1})):
+            p = weights(4, 32, False, **kw)
+            np.savez(td / name, **p, **npnet.arch_record(p))
+
+        for name in ("renamed.npz", "gap.npz", "tail.npz", "tailres.npz",
+                     "stale_head.npz", "stale_obs.npz"):
             try:
                 npnet.Net(str(td / name))
                 raise AssertionError(f"{name} loaded instead of raising")
             except ValueError:
                 pass
+
+
+def test_the_training_seam_matches_the_submission():
+    """Step both engines in lockstep and compare what a JAX rollout would feed a
+    policy: the observation, the encoder, the legal mask and the flat action map.
+
+    This is the check `learn/rlenv.py` claimed in its docstring and never ran.
+    Everything downstream — behaviour cloning, PPO, the vectorised rollout —
+    computes its gradients against whatever these two agree on, so a single
+    channel out of order is a policy trained on one game and played in another,
+    with nothing about the failure pointing at the encoder.
+
+    Read the COVERAGE line it prints. The build half of the action space is
+    all-False in a random game, and two all-False masks compare equal.
+    """
+    try:
+        import jax  # noqa: F401
+    except ImportError:
+        print("  SKIPPED (no jax): the encoder equivalence is UNVERIFIED in this run")
+        return
+    from tools.verify_engine import check_encoders
+
+    check_encoders(boards=12, turns=320, stride=8)
 
 
 def test_the_trainers_check_themselves():
@@ -337,9 +374,23 @@ def test_the_trainers_check_themselves():
     They print: the per-stage in-range percentages are the curriculum's own
     proof and are worth seeing on every test run."""
     from learn import netoracle, selfplay
+    from tools import pools
 
     netoracle.selfcheck()
     selfplay.selfcheck()
+    pools.selfcheck()
+    # `train.selfcheck` needs jax and so does importing `learn.train` at all, so
+    # both live under the guard: the whole point of the two skip branches is that
+    # `make test` still runs on a machine that only has what the SUBMISSION needs.
+    try:
+        import jax  # noqa: F401
+    except ImportError:
+        print("  SKIPPED (no jax): the trainer and the vectorised rollout are "
+              "UNCHECKED in this run")
+        return
+    from learn import train, vecroll
+    train.selfcheck()
+    vecroll.selfcheck()
 
 
 def main() -> None:

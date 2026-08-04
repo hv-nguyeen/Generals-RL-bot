@@ -164,13 +164,31 @@ class Net:
         self.layers, self.arch = _load_trunk(z)
         self.head_w = z["head_w"].astype(np.float32)
         self.head_b = z["head_b"].astype(np.float32)
+        # The action space gained a build slot per cell (8 -> 9). A stale head
+        # loads without complaint here and dies later inside `np.where(mask,
+        # logits, -inf)` on a broadcast error -- mid-match, after the handshake,
+        # from a line that says nothing about checkpoints.
+        if self.head_w.shape[0] != features.PER_CELL:
+            raise ValueError(
+                f"{path}: head is {self.head_w.shape[0]}-wide, this build needs "
+                f"{features.PER_CELL}. The action space changed (castle builds "
+                f"are modelled now); retrain, do not reuse.")
+        # Same story one layer up: the encoder gained the broadcast scalar
+        # channels, so a stem from before them is a different function of a
+        # different board. It would otherwise die in a BLAS shape error deep
+        # inside _conv3x3, mid-match, naming neither the file nor the reason.
+        if self.layers[0][0].shape[1] != features.C:
+            raise ValueError(
+                f"{path}: stem takes {self.layers[0][0].shape[1]} input channels, "
+                f"this build encodes {features.C}. The observation changed (turn "
+                f"and the army/land totals are planes now); retrain, do not reuse.")
         self.pass_w = z["pass_w"].astype(np.float32)
         self.pass_b = float(z["pass_b"])
 
     def logits(self, obs: Obs) -> np.ndarray:
         x = _trunk(features.encode(obs), self.layers, self.arch["residual"])
-        move = _conv3x3(x, self.head_w, self.head_b)          # (8, H, W)
-        # (H, W, 8) flattened must match features.action_to_index ordering
+        move = _conv3x3(x, self.head_w, self.head_b)   # (PER_CELL, H, W)
+        # (H, W, PER_CELL) flattened must match features.action_to_index ordering
         flat = np.transpose(move, (1, 2, 0)).reshape(-1)
         pass_logit = float(self.pass_w @ x.mean(axis=(1, 2)) + self.pass_b)
         return np.concatenate([flat, [pass_logit]])

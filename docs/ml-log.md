@@ -328,11 +328,56 @@ harder exactly as fast as the policy improves, so 0.60 may be unreachable by
 construction. Loosen it — 0.55, or promote on comp-eval trend — but not mid-run.
 
 **What this changes strategically.** The heuristic's parameter space is exhausted
-(0.522) and its best measured build is 1737. A trained policy that is at 0.42
-against v16 after 300 iterations, still rising, is the first thing in this
-project with a path past that. Throughput is now the binding constraint, not
-method: ~10k games/hour on CPU rollouts against a derived ~230k/hour
-GPU-vectorised.
+(0.522) and its best measured build is 1737. A trained policy that reaches v16
+parity in 50 iterations is the first thing in this project with a path past that.
+Throughput is now the binding constraint, not method: ~10k games/hour on CPU
+rollouts against a derived ~230k/hour GPU-vectorised.
+
+### The peak was iteration 50, and the run then froze
+
+Reading 200→300 as a rising trend was wrong. The full series:
+
+```
+iter   0   0.152  <- kept        the clone
+iter  50   0.515  <- kept        parity with v16, in FIFTY iterations
+iter 100   0.323                 collapse
+iter 150   0.399
+iter 200   0.356
+iter 250   0.384
+iter 300   0.420                 recovering, never regained the peak
+```
+
+Then `[critic warmup 211/20]` at iteration 346: the policy had **re-frozen** and
+stayed frozen. Stage 2 games run 333 turns against stage 0's 156, `evar` fell
+below the re-freeze line, and the kill rule only arms at stage 0
+(`not warmed and stage == 0 and ...`), so at stage 2 it can freeze indefinitely.
+The run burned ~250 iterations on critic-only updates. **Arm the freeze timeout
+at every stage, not just stage 0.**
+
+### The checkpoint is real, and it is NOT a 1737-equivalent bot
+
+`sp.best.npz` confirmed on 400 fresh games: **207W 0D 193L, 0.517, +12 elo**
+against v16. Move times 1.3 ms mean, 15.1 ms worst, zero faults.
+
+But head-to-head parity is not a rating. Against a common yardstick:
+
+| opponent | net | heuristic |
+|---|---|---|
+| v16 | 0.517 (+12) | — |
+| greedy | 0.772 (+212) | **0.932 (+455)** |
+| hunter:3 | 0.925 (+436) | 0.958 (+520) |
+
+**Measured against greedy the heuristic rates 243 Elo above the net; measured
+head-to-head they are level.** Both cannot be a rating. This is the
+non-transitivity the league was built to detect: the net matches v16
+specifically while dropping 23% of its games to greedy where the heuristic drops
+7%. On a ladder you play the whole field, so 0.517 vs v16 does not translate to
+~1717.
+
+**The bar for submitting a network is therefore not "beats v16".** It is
+**greedy ≥ 0.90 AND v16 ≥ 0.55** — uniform strength across styles, checked before
+spending a submission. Head-to-head against one opponent is exactly the evidence
+that made v12 look good.
 
 ---
 
@@ -370,6 +415,188 @@ That reframes attempt 6 rather than excusing it: PPO took a clone from ~0.15 to
 0.255 against the heuristic — it roughly doubled the win rate — and then stalled
 900 iterations short of parity. Directional only; different clones, different
 opponents.
+
+---
+
+## The training foundation (2026-08-04) — what it changes and what it does not
+
+No Elo here on purpose: this entry is plumbing, and plumbing is judged by what it
+makes possible and by what it can no longer get silently wrong. **Everything
+below either has a command that prints it or is labelled an estimate.**
+
+### Three things changed
+
+**1. The action space models castle builds: 3529 -> 3970.** `441*9 + 1`, i.e.
+slot 8 of every cell is "build here". It used to be `441*8 + 1` with builds
+folded into PASS, which meant two separate failures: the behaviour clone was
+trained to PASS on exactly the positions a strong player built a castle on, and
+no RL policy could ever emit a build or learn to defend against one, because its
+self-play opponent could not build either. Under our ruleset a castle is +0.5
+army/turn forever for ONE turn of tempo — `bot/policy/castle.py` calls it the
+single biggest economic lever in the ruleset, and the heuristic uses it.
+
+**2. The observation carries the five scalars it used to throw away: 12 -> 20
+channels.** `bot/obs.Obs` always carried `turn`, `my_land`, `my_army`,
+`opp_land`, `opp_army`; `features.encode` read only the three grids. Now eight
+broadcast planes: `turn/1200`, `turn%2` (structures grow on even ticks),
+`(turn%50)/50` (all-tile growth), `turn>=800` (deathtouch), and `log1p/6` of both
+army totals and both land totals. `features.scalar_features` is the single
+definition, called by the numpy encoder with `np.log1p` and by `encode_jax` with
+`jnp.log1p`, because two hand-written copies of an eight-element tuple in channel
+order is precisely the drift the seam check exists to catch.
+
+Two concrete things the network could not previously see:
+
+* **the clock.** Deathtouch at 800 changes the win condition discontinuously and
+  1200 is a DRAW. A critic with no clock cannot tell turn 100 from turn 790 and
+  therefore cannot predict "this ends as a draw" — a mechanical candidate reason
+  `evar` stalls at 0.12 at competition distance and crosses it in 15 iterations
+  at distance 2-6, where games end decisively at ~156 turns.
+* **hidden army.** `opp_army` counts the opponent's FOGGED tiles, so
+  `opp_army - visible enemy army` is `belief.hidden_enemy_army` — the quantity
+  v17's `attack_discount_committed` fix was built on, and by construction not
+  computable from the board the network sees.
+
+**3. The rollout is vectorised** (`learn/vecroll.py`) over prebuilt map pools
+(`tools/pools.py`), behind `selfplay.py`'s existing produce/train boundary.
+`--backend gpu` switches the TRAINING rollout only; comp-eval, stage-eval and the
+paired gate stay on the CPU process pool, because they play `arena.agents`
+opponents that cannot exist in a JAX kernel and because they are the ground truth
+the new path has to be measured against. **`--backend cpu` is still the default
+and is unchanged.**
+
+### Measured
+
+| what | number | how |
+|---|---|---|
+| numpy/JAX seam | 3840 steps, 1374 frames, 9 board shapes, encoder max abs diff **1.2e-07** | `make verify` |
+| flat action map | all 3970 indices, 0 mismatches | same |
+| build coverage | 661 frames with a legal build, 192 executed, 193 cells, costs 35..109 | same |
+| scalar coverage | all 8 broadcast channels varied over the run | same |
+| competition mapgen | byte-identical to the previous commit over 2000 maps, 5 seed blocks + 5 curriculum bands | sha256 of int32 bytes + shape, this tree vs a worktree of HEAD |
+| `make test` without jax | 19/19, with two explicit SKIPPED lines | import blocker on `jax` |
+
+### Estimated, NOT measured
+
+**~40k env-steps/s -> ~65 games/s -> ~230k games/hour on the L4, against ~2.8
+games/s on CPU rollouts today.** This is arithmetic from board size and step
+cost, not a benchmark. Nobody has run it. `third_party/generals-bots/tests/
+test_performance.py` is the first thing to run on the cluster, and the number
+that matters afterwards is the `util` field in the iteration line: the batch runs
+until the LONGEST game in it finishes, so short games sit idle and the real
+figure is `util` times the peak.
+
+Device memory is arithmetic on measured per-object sizes: ~160 MB resident pool,
+~320 MB peak across a stage promotion, tens of MB of per-step buffers. Not close
+to 24 GB, so batch width is not memory-bound.
+
+### Four correlated-map and recompilation traps, confirmed in the starter kit source
+
+Not opinions about the library — line numbers, all still true of
+`third_party/generals-bots` as vendored:
+
+* `pool_idx=jnp.int32(0)` for every state (`core/game.py:139`) and it increments
+  identically (`core/env.py:339`), so **512 parallel envs replay ONE env's worth
+  of boards** after the first episode boundary.
+* `init_state` hardcodes `self.max_grid_size` for BOTH dimensions
+  (`core/env.py:275,289`), so every vectorised env is 21x21 and **the 18-21
+  variable-size competition distribution never appears in training at all.** This
+  one is invisible in a diversity count.
+* `mode="competition"` sets `min_generals_distance=17` authoritatively
+  (`core/env.py:155`) and its preset never sets `max` (`core/env.py:59-84`), so
+  `GeneralsEnv(mode="competition", max_generals_distance=6)` is min=17/max=6,
+  which empties the candidate set and drops into a `farthest` fallback
+  (`core/grid.py:356-358`) **with no error.** A curriculum built the obvious way
+  gets silently wrong maps.
+* both distance args are `static_argnames` (`core/grid.py:142-143`), so K
+  curriculum bands are K sets of compiled kernels.
+
+`tools/pools.py` + `learn/vecroll.py` avoid all four by construction rather than
+by fixing them: we index the pool ourselves so `pool_idx` is never read, the
+pool carries the true per-board `h`/`w`, `_MODE_PRESETS` is never constructed,
+and every stage is the same `(N,21,21)` array so promotion is an argument change
+and not a retrace.
+
+### KNOWN LIMITATIONS — not fixed, and none of them is cheap
+
+Recorded here rather than left unstated. The first is the one to attack next.
+
+**1. The receptive field is a hard ceiling, and it is arithmetic.** `bot/policy/
+net.py` is a plain 3x3 stack — no dilation, no pooling, no downsampling — and
+only the PASS logit gets a global mean. An L-layer 3x3 stack has receptive-field
+radius exactly L: the default 4 layers see a 9x9 window on a 21x21 board, and the
+deepest net ever trained here (8x64) sees 17x17. Corner to corner needs 20.
+
+Consequences that are not opinions: the build surcharge has radius 6
+(`rules.SURCHARGE_RADIUS`), so a 4-layer net cannot compute a castle's price — it
+is saved only by the legal mask already encoding affordability, and it still
+cannot prefer a flat-35 site over a 47 one. Every global field the heuristic runs
+on (`dist_home`, `dist_enemy_gen`, `dist_unowned`, the threat scan, the
+cumulative defense arithmetic) is a whole-board BFS. **The policy can see a fight
+but not where its general is if the fight is 10 tiles away.**
+
+"Capacity is not the ceiling" above does NOT contradict this and does not cover
+it. That table is BC val top-1, which the same section says is label-noise
+limited at 0.489-0.499 — an instrument saturated by label noise cannot
+distinguish a net with enough capacity from a net that cannot see the board. The
+cheap next step is mean-pool-and-broadcast per trunk block so the move head gets
+the global context the pass head already gets; it changes checkpoint topology, so
+it is a measured experiment and not a foundation change.
+
+**2. There is no history and no memory.** One frame, no recurrence. `bot/belief.py`
+maintains `mem_owner`/`mem_army`/`mem_turn` (what a tile looked like when last
+seen and how stale that is), `ever_seen`, `ever_enemy`, `enemy_castles`,
+`candidates`. None of it is in the observation and none is recoverable from a
+single frame. Two specifics:
+
+* **enemy castles through fog are literally invisible.** The wire protocol reports
+  a fogged mountain and a fogged castle with the same code 5, and the encoder maps
+  `T_STRUCTURE_IN_FOG` into both FOG and MOUNTAIN. The belief separates them only
+  because it snapshotted the terrain on turn 1 (competition strips neutral
+  castles, so every turn-1 type-5 is a mountain). A single-frame policy cannot do
+  this at all, and the heuristic scores capturing them (`w.cap_castle`).
+* **the enemy-general prior.** `belief.candidates` inverts the generator's own
+  seating rule (BFS distance >= 17, room within tolerance) and pins the general to
+  a few dozen cells before first contact. Not in the observation and not local.
+
+**3. Stage 0 does not merely fail to teach the castle economy — it teaches its
+negation.** At generals distance 2-6 every siting rule in `castle.py` is
+unsatisfiable by construction: `castle_safe_dist` wants the rear, and at distance
+2-6 there is no rear. Builds are AFFORDABLE there (a general reaches 35 army at
+turn 68 and stage-0 games measure 156 turns), so a self-play policy will
+correctly learn that spending 35 army leaves a snipeable 0-army tile next to the
+opponent — the exact inverse of the stage-5 truth. The KL anchor and
+`MIN_RESIDENCY` then carry that prior forward. Stages 1-3 are also too tight for a
+rear. **Watch the new `bld` field** (builds per game, both seats) in the iteration
+line: it is the only thing that reports whether the 3529 -> 3970 change bought
+anything, and a run that sits at `bld 0.00` at stage 4-5 has an action it never
+takes.
+
+**4. The build credit path is thin, and that is quantitative.** Reward is
+terminal-only (attempts 2 and 3 killed shaping). A castle pays ~+200 army over the
+remaining ~400 turns of a stage-5 game, maybe a 3-5pp win-probability shift, ~0.1
+in z units against a critic residual std of ~0.89 at evar 0.12. That is ~0.11
+signal-to-noise per build decision: ~80 build samples for a 1-sigma read and
+~2000 for a confident one. Affordable at 256 games/iteration only if builds
+actually occur — see `bld` again.
+
+**5. Multi-turn plans are not expressible as one action, and never were for
+anyone.** `castle.plan` returns a `site=` with no action when it wants to walk
+army to a build site over 20-40 turns before paying 35; the thrust and the
+corridor-hold are likewise sequences. These are policies over the action space,
+not missing actions.
+
+**6. Value shards are not meta-checked.** `learn/train.shard_list` refuses a
+policy dataset whose `meta.json` disagrees on `n_actions` or `channels` — those
+are wrong LABELS, which train perfectly cleanly. `learn/valuetrain.py` globs its
+shards directly, but a stale-width value shard dies on a conv shape error, which
+is loud, so it was left alone.
+
+### What still has to be true for any of this to matter
+
+The seam check is the deliverable, not a checkbox. `make verify` runs it and
+`make test` runs it. If it ever prints a COVERAGE line with a zero in it, the
+equality it asserts has gone vacuous and the run that follows proves nothing.
 
 ## Dead ends closed by measurement
 

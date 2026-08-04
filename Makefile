@@ -24,7 +24,8 @@ test:  ## rule and belief tests
 	$(PY) -m tests.test_all
 
 verify:  ## differential test against the official JAX engine
-	$(PY) -m tools.verify_engine --games 40 --max-turns 200
+	$(PY) -m tools.verify_engine --games 40 --max-turns 200 --encoders
+	$(PY) -m tests.test_all
 
 bench:  ## quick sanity match, no files written
 	$(PY) -m arena.runner --a ours --b greedy --games 40 --workers $(WORKERS) --max-turns 900

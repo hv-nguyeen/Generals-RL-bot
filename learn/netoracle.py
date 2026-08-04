@@ -515,7 +515,7 @@ def selfcheck() -> None:
     rng = np.random.default_rng(2)
     m = rng.random(features.N_ACTIONS) < 0.1
     packed = np.packbits(np.stack([m, ~m]), axis=1)
-    assert packed.shape == (2, 442), packed.shape
+    assert packed.shape == (2, -(-features.N_ACTIONS // 8)), packed.shape
     back = np.unpackbits(packed, axis=1)[:, :features.N_ACTIONS].astype(bool)
     assert np.array_equal(back[0], m) and np.array_equal(back[1], ~m)
 

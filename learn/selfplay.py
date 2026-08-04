@@ -212,7 +212,7 @@ import numpy as np
 
 from arena import agents
 from bot import features, rules
-from bot.policy.net import Net, arch_record
+from bot.policy.net import Net, arch_of, arch_record
 from learn.league import stderr
 from learn.netoracle import (ADV_CLIP, ANCHOR_HI, ANCHOR_LO, BETA0, BETA_MAX,
                              BETA_MIN, CHUNK, KL_STOP, MAX_REWINDS, WARMUP,
@@ -242,12 +242,15 @@ SP_TRAIN_SEED0 = 1_000_000
 SP_STAGE_SEED0 = 1_400_000     # promotion gate, current stage's distance
 SP_COMP_SEED0 = 1_500_000      # progress, ALWAYS competition distance
 SP_GATE_SEED0 = 1_600_000      # final paired gate, seen by nothing else
+SP_POOL_SEED0 = 2_000_000      # `tools/pools.py`, the prebuilt training boards
 
 PROMOTE_EVAR = 0.10   # promoting into sparser reward with a critic that already
                       # explains nothing is failure 6 with a countdown
 PROMOTE_OVER = 2      # consecutive evals over threshold. stderr(200) = 0.05, so
                       # one eval reads +-0.10 around the gate and promotion is
                       # permanent; two halves the confirmed decision's SE to 0.035
+DNP_ROWS = 32         # stored rows through the submission's numpy forward each
+                      # iteration under --backend gpu; see the `dnp` block
 MIN_RESIDENCY = 30    # without it the clone walks five stages in five evals and
                       # the run is a distance-17 run with extra logging
 REFREEZE_AFTER = 5    # consecutive low-evar iterations that re-freeze the policy
@@ -278,6 +281,37 @@ def outcome(winner: int, seat: int) -> float:
     as slow noise and not as a bug. `selfcheck` pins the whole table.
     """
     return 0.0 if winner < 0 else (1.0 if winner == seat else -1.0)
+
+
+def numpy_forward(params, x: np.ndarray) -> np.ndarray:
+    """(B, C, 21, 21) -> (B, N_ACTIONS) through bot/policy/net.py's OWN code.
+
+    This is the submission's forward pass, driven from a parameter dict instead
+    of a .npz, and it exists for one reason: `dnp`. Under --backend gpu the
+    behaviour policy and the training policy are the same JAX function, so the
+    numpy/JAX equivalence that `dlp0` used to check every iteration stops being
+    checked by anything. A numpy conv with the wrong weight layout produced
+    plausible logits, passed every smoke test and lost 200-0; the check is not
+    optional. `selfcheck` pins this against `Net.logits` itself.
+    """
+    from bot.policy import net as npnet
+
+    arch = arch_of(params)
+    layers = [(np.asarray(params[f"{k}_w"], np.float32),
+               np.asarray(params[f"{k}_b"], np.float32))
+              for k in npnet.trunk_keys(arch["layers"], arch["residual"])]
+    hw = np.asarray(params["head_w"], np.float32)
+    hb = np.asarray(params["head_b"], np.float32)
+    pw = np.asarray(params["pass_w"], np.float32)
+    pb = float(params["pass_b"])
+    out = []
+    for row in np.asarray(x, dtype=np.float32):
+        h = npnet._trunk(row, layers, arch["residual"])
+        move = npnet._conv3x3(h, hw, hb)
+        pass_logit = float(pw @ h.mean(axis=(1, 2)) + pb)
+        out.append(np.concatenate(
+            [np.transpose(move, (1, 2, 0)).reshape(-1), [pass_logit]]))
+    return np.stack(out)
 
 
 def _pack(buf: list, winner: int, turns: int, dist: int) -> list[dict] | None:
@@ -607,8 +641,16 @@ def selfcheck() -> None:
 
     # --- seed blocks do not collide at the documented budget
     tr, sg, cp = seed_span(1200, 256, 10, 200, 50, 400)
-    assert SP_TRAIN_SEED0 < SP_STAGE_SEED0 < SP_COMP_SEED0 < SP_GATE_SEED0
+    assert SP_TRAIN_SEED0 < SP_STAGE_SEED0 < SP_COMP_SEED0 < SP_GATE_SEED0 < SP_POOL_SEED0
     assert tr < SP_STAGE_SEED0 and sg < SP_COMP_SEED0 and cp < SP_GATE_SEED0, (tr, sg, cp)
+    # Pool boards are TRAINING boards under the vectorised backend, so they get
+    # their own block: reusing SP_TRAIN_SEED0 would put the gate's and the
+    # comp-eval's boards inside the training distribution the moment the pool
+    # grew. `tools.pools` owns the top of the range; the gate block ends well
+    # below it at 1.6M + a few thousand.
+    from tools.pools import pool_seed_span
+    assert SP_GATE_SEED0 < SP_POOL_SEED0
+    assert pool_seed_span() > SP_POOL_SEED0
     # jobs land inside their own block
     jt = build_jobs(1199, 256, 0)
     assert len(jt) == 256 and len({j[0] for j in jt}) == 256
@@ -672,9 +714,18 @@ def selfcheck() -> None:
         obs = Obs(H=18, W=18, turn=1, my_land=1, my_army=9, opp_land=1, opp_army=1,
                   type_grid=ty, owner_grid=ow, army_grid=ar)
         i, lm, logp = _act(net, obs, None)
-        # from (0,0) with 9 army: down and right, whole or split, plus pass
+        # from (0,0) with 9 army: down and right, whole or split, plus pass.
+        # No build: a general is not a legal build site and 9 < 35 anyway.
         assert lm[features.PASS_INDEX] and lm.sum() == 5, lm.sum()
         assert lm[i] and logp <= 0.0
+
+        # --- `numpy_forward` IS Net.logits, driven from a dict. It is what the
+        #     `dnp` alarm measures the trainer against once --backend gpu makes
+        #     dlp0 structurally zero, so a drift between the two would disable
+        #     the only remaining numpy/JAX equivalence check, silently.
+        got = numpy_forward(p, features.encode(obs)[None])
+        assert got.shape == (1, features.N_ACTIONS), got.shape
+        assert np.abs(got[0] - net.logits(obs)).max() == 0.0
 
         # --- the worker's seat plumbing, on a 3-turn stub rather than a game.
         #     Nothing can capture a general in 3 turns (generals hold 1 army and
@@ -693,6 +744,25 @@ def selfcheck() -> None:
             assert r["x"].shape == (3, features.C, features.PAD, features.PAD)
             assert r["logp"].shape == (3,) and np.all(r["logp"] <= 0.0)
             assert 2 <= r["dist"] <= 6
+        # --- the CPU rollout can now BUILD, which is the point of phase 1 and
+        #     needs no GPU: `_rollout` routes index_to_action(idx) straight into
+        #     engine.step, and a build index has to survive that trip. Under the
+        #     old 3529 space no index decoded to a build at all.
+        st = engine.from_grid(mapgen.generate(SP_TRAIN_SEED0, 2, 6))
+        r, c = st.gpos[0]
+        rc = (r, c + 1 if c + 1 < st.armies.shape[1] else c - 1)
+        st.own[0][rc] = True
+        st.neutral[rc] = False
+        st.armies[rc] = 99                             # 47 = 35 + 12 at distance 1
+        m = features.legal_mask(engine.observe(st, 0))
+        cells = m[:features.PAD * features.PAD * features.PER_CELL].reshape(
+            features.PAD, features.PAD, features.PER_CELL)
+        assert cells[rc[0], rc[1], features.BUILD_OFFSET], "a 99-army tile cannot build?"
+        idx = features.action_to_index((rules.BUILD, rc[0], rc[1], 0, 0))
+        assert m[idx] and features.index_to_action(idx) == (rules.BUILD, *rc, 0, 0)
+        engine.step(st, features.index_to_action(idx), rules.PASS_ACTION)
+        assert st.castles[rc] and int(st.armies[rc]) == 99 - 47, int(st.armies[rc])
+
         # the two seats see DIFFERENT boards (their own fog), which is the whole
         # reason each carries its own encode rather than sharing one
         assert not np.array_equal(got[0]["x"], got[1]["x"])
@@ -776,6 +846,13 @@ def main() -> None:
                          "the return at distance 2-6. That is the whole claim: if "
                          "it fails, reward density was never the problem and the "
                          "overnight run answers nothing. ~10 min at 60 workers")
+    ap.add_argument("--backend", choices=("cpu", "gpu"), default="cpu",
+                    help="rollout backend for TRAINING games only. cpu is the "
+                         "process pool and stays the default until the gpu path "
+                         "is measured against it; every eval runs on cpu either "
+                         "way, because they play arena opponents.")
+    ap.add_argument("--pool-dir", default="runs/pools",
+                    help="--backend gpu: prebuilt boards from `tools.pools`")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--selfcheck", action="store_true")
@@ -986,6 +1063,33 @@ def main() -> None:
                 res.extend(r)
         return res
 
+    # --- the vectorised training rollout, behind the SAME boundary as `play`.
+    #     `play` keeps all four of its other callers (comp-eval, stage-eval and
+    #     the two halves of the final paired gate): those run numpy heuristic
+    #     opponents through `arena.agents` and cannot move onto the device, and
+    #     they are the ground truth the gpu path has to be measured against.
+    vec = {"stage": None, "pool": None, "step": None}
+
+    def play_train(it: int, stage: int):
+        from learn import vecroll
+        from tools import pools
+
+        if vec["stage"] != stage:
+            host = pools.load(args.pool_dir, stage)
+            vec.update(stage=stage, pool=vecroll.device_pool(host))
+            print(f"  pool: stage {stage}, {len(host['dist'])} boards, "
+                  f"mean dist {host['dist'].mean():.1f}", flush=True)
+        if vec["step"] is None:
+            vec["step"] = vecroll.make_step(bc.forward)
+        # Every env starts on a DIFFERENT board on every iteration. The starter
+        # kit's own pool cannot manage that: `pool_idx` starts at 0 in every
+        # environment, so episode k of every env is the same board.
+        npool = len(vec["pool"]["dist"])
+        idx = (it * args.games + np.arange(args.games)) % npool
+        return vecroll.rollout(vec["step"], vec["pool"], idx, theta,
+                               jax.random.fold_in(jax.random.PRNGKey(args.seed), it),
+                               args.max_turns)
+
     def rewind(why: str) -> bool:
         """Revert to the best checkpoint, halve lr, double beta. True = stop.
 
@@ -1022,7 +1126,8 @@ def main() -> None:
         t0 = time.time()
         dmin, dmax, _ = STAGES[stage]
         snapshot = {k: np.asarray(v) for k, v in theta.items()}
-        results = play(build_jobs(it, args.games, stage), snapshot)
+        results = (play_train(it, stage) if args.backend == "gpu"
+                   else play(build_jobs(it, args.games, stage), snapshot))
         resident += 1
         if not results:
             print(f"iter {it:5d}  no usable games", flush=True)
@@ -1105,6 +1210,28 @@ def main() -> None:
         kill2 = (not warmed and stage == 0 and it > WARMUP * 10
                  and low >= FROZEN_KILL)
 
+        # `dlp0` compares the worker's NUMPY logp against the parent's JAX one
+        # and is the top kill criterion. Under --backend gpu both sides are the
+        # same JAX forward, so it becomes structurally 0.0 while still printing
+        # -- the check would be gone with nothing announcing it. `dnp` replaces
+        # it: 32 stored rows through bot/policy/net.py's own numpy forward
+        # against the trainer's, on the SAME f16 x the gradient sees. Strictly
+        # stronger -- no sampling noise, and it exercises the submission's code
+        # path rather than the worker's. 32 x 0.4 ms = 13 ms an iteration.
+        dnp = float("nan")
+        if args.backend == "gpu" and n >= DNP_ROWS:
+            sel = rng.choice(n, DNP_ROWS, replace=False)
+            ref = np.asarray(bc.forward(theta, to_x(xs[sel])))
+            dnp = float(np.abs(numpy_forward(snapshot, xs[sel]) - ref).max())
+            scale = max(float(np.abs(ref).max()), 1.0)
+            if dnp > 1e-4 * scale:
+                print(f"  KILL dnp {dnp:.2e} over {1e-4 * scale:.2e}: the numpy "
+                      "forward in the submission and the JAX forward in the "
+                      "trainer disagree. Every gradient so far was computed "
+                      "against a policy that did not generate the data.",
+                      flush=True)
+                break
+
         dlp0 = float("nan")
         kl_u = kl_last = kl_a = ent = pg = gn = vloss = 0.0
         kl_sum, nb, stop = 0.0, 0, False
@@ -1156,15 +1283,32 @@ def main() -> None:
         turns = sum(r["turns"] for r in g0) / len(g0)
         dist = sum(r["dist"] for r in g0) / len(g0)
         hi = "+" if dmax is None else f"-{dmax}"
+        # Batch utilisation: the vectorised backend runs every column until the
+        # LONGEST game finishes, so this is the fraction of stepped ticks that
+        # became samples. Meaningless on cpu (each worker stops at its own
+        # game's end), printed only where it can be acted on.
+        util = (f"  util {turns / max(r['turns'] for r in g0):.2f}"
+                if args.backend == "gpu" else "")
+        # Builds per game, both seats. The action space gained a build slot per
+        # cell so the policy COULD build; whether it ever does is a different
+        # question and nothing else in this run answers it. A run that sits at
+        # bld 0.0 forever has an action it never took -- either builds are wrong
+        # here or the curriculum band cannot afford them (stage 0 reaches 35 army
+        # around turn 68 but has no rear to build in), and either way the 3529 ->
+        # 3970 change bought nothing at that stage.
+        builds = int((idxs % features.PER_CELL == features.BUILD_OFFSET).sum())
         # The freeze counter is in the tag, not just the fact of it: a frozen
         # policy is a legitimate state for a few iterations and a dead run after
         # FROZEN_KILL, and the line has to say which one you are looking at.
         tag = f"  [critic warmup {low}/{FROZEN_KILL}]" if not do_policy else ""
         print(f"iter {it:5d}  stage {stage} ({dmin}{hi})  games {len(g0)}  "
               f"W/D/L {w}/{d}/{len(g0) - w - d}  samp {n // 1000:3d}k  "
-              f"turns {turns:.0f}  dist {dist:.1f}{tag}\n"
+              f"turns {turns:.0f}  dist {dist:.1f}  bld {builds / len(g0):.2f}"
+              f"{util}{tag}\n"
               f"            pg {pg:+.4f}  v {vloss:.3f}  evar {evar:+.2f}  "
-              f"dlp0 {dlp0:.1e}  klU {kl_u:.3f}/{kl_last:.3f}  klA {kl_a:.3f}  "
+              f"{'dnp' if args.backend == 'gpu' else 'dlp0'} "
+              f"{dnp if args.backend == 'gpu' else dlp0:.1e}  "
+              f"klU {kl_u:.3f}/{kl_last:.3f}  klA {kl_a:.3f}  "
               f"beta {beta:.3f}  ent {ent:.2f}  gn {gn:.2f}  mb {nb}  "
               f"{time.time() - t0:.0f}s", flush=True)
 
