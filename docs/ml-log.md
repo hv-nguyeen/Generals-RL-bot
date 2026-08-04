@@ -22,6 +22,49 @@ v18 heuristic             1587   n=90    ->  +262, 3.8 sigma
 Local numbers at that checkpoint: **0.705 against v16** at competition distance
 (+151 Elo) and 0.843 against greedy.
 
+### And a SINGLE STRONG opponent lies too — castles, 2026-08-05
+
+`bot/policy/net.py`'s head is one 3x3 conv emitting `PER_CELL` channels, so the
+build slot's bias is a single scalar shared by every cell. Adding **+9.094** to
+`head_b[8]` took the best net from ~0 castles a game to **~15**, with no
+retraining. Measured against v16 on 400 identical boards it looked like a large
+free win:
+
+```
+sp3.best              293W-107L   0.733   (+175 elo)
+sp3.best + build bias 323W- 77L   0.807   (+249 elo)
+```
+
+**It was a matchup artifact.** Three other measurements disagreed and the ladder
+confirmed them — the rank DROPPED and the build bias was removed.
+
+| test | verdict |
+|---|---|
+| **ladder** | **rank dropped** |
+| builder vs non-builder, head-to-head, identical weights bar one scalar | −36 elo |
+| PPO self-play at stage 3 | deleted them: `bld` 15 → 0.1 in 37 iterations |
+| vs v16 | +74 elo ← the outlier |
+
+**The rule this document gave after the greedy failure was too weak.** It said
+compare head-to-head against the STRONGEST available opponent. v16 *was* the
+strongest fixed opponent and it still misled — it builds ~0.9 castles a game
+itself, so over-building beats its particular style without being generally
+good. The correct rule: **no single fixed opponent measures general strength,
+however strong it is.** Only a diverse field does, and locally that means an
+archive, not one bot.
+
+Two further notes worth keeping:
+
+* **Self-play is structurally blind to symmetric strategies.** If both sides
+  build, neither gains, so the gradient sees the immediate 35-army cost and no
+  benefit. Same shape as attempt 2, where land shaping had expectation exactly
+  zero in a mirror. PPO's rejection of castles is therefore weak evidence on its
+  own — it was right here, but it would reject a genuinely good symmetric
+  strategy too.
+* **Only the extremes were tested.** 0 castles and 15. The heuristic builds
+  ~0.9 and gains +111 Elo from it (`castle_enabled=False`: 262W-138L, 400
+  games), so an optimum plausibly sits between and remains unmeasured.
+
 ### The greedy yardstick was the tenth instrument to lie
 
 Before submitting, the two local measures disagreed by 315 Elo:
