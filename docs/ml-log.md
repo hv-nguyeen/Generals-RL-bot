@@ -7,9 +7,17 @@ Last updated 2026-08-04.
 
 ## The one-line summary
 
-Six ML attempts, none has produced a bot worth submitting. Every Elo gain in this
-project has come from reading replays and fixing a mechanism. Weight-level and
-learned changes are 0-for-9; mechanism fixes are 5-for-5.
+Six ML attempts failed. **The seventh is working.** A generals-distance
+curriculum took competition-distance win rate against v16 from 0.152 to 0.420 in
+300 iterations, where the same PPO without a curriculum managed 0.175 to 0.255
+in 1500 and stopped. Reward density was the thing all six shared.
+
+The heuristic has its own ceiling and we are now measuring it. v13 read 1737 over
+102 ladder games; v18 — five unconditional mechanism fixes later — read **1587
+over 90**, a 3.0σ regression. The "5-for-5 mechanism fixes" claim in earlier
+versions of this file was measured on mechanism metrics (general-drain rate,
+army brought home), NOT on Elo, and the aggregate is 150 Elo down. Only the
+first two or three were ever confirmed by rating.
 
 **Two things were settled on 2026-08-04, and they point in opposite directions:**
 
@@ -289,13 +297,42 @@ invariant to any opponent's weakness at any distance. Confirmed in the probe.
 
 **Scale, stated honestly:** 1200 iterations x 256 games is ~307k games and ~180M
 transitions against AverageJoe's ~52M games and 26 billion. **135x short**, with
-a 70k-parameter CNN against a 22M-parameter transformer. Expect `comp-eval` to
-move off 0.05; do not expect it to reach the 0.50 that would match v16.
+a 70k-parameter CNN against a 22M-parameter transformer.
 
-What the run actually decides: **does learning at short distances transfer?**
-`comp-eval` climbing as stages advance means the method works and only scale is
-missing. Flat at 0.05 through stage 5 means the curriculum taught something
-local that does not generalise.
+### IT TRANSFERS. First working run, from `clone-8x32`
+
+`comp-eval` plays 400 games against `ours:configs/v16.json` at competition
+distance 17+ — boards the policy has never trained on.
+
+| iteration | stage | comp-eval vs v16 |
+|---|---|---|
+| 0 | 0 (2-6) | 0.152 (the clone) |
+| 200 | 1 (4-9) | 0.356 ±0.035 |
+| 250 | 1 | 0.384 |
+| 300 | 1 | **0.420** |
+| 330 | → 2 (7-13) | still climbing |
+
+**+0.27 in 300 iterations.** Against attempt 6 — same PPO, same reward, no
+curriculum — which went 0.175 → 0.255 in 1500 iterations and then sat flat for
+900 more. Three times the gain in a fifth of the iterations, and this one has not
+stopped.
+
+I predicted "expect it to move off 0.05, do not expect 0.50". That was wrong by a
+wide margin and the prediction is left above deliberately.
+
+**The promotion gate is too strict.** `stage-eval` sat at 0.48-0.58 and never hit
+0.60 twice, so stage 2 was entered by `--stage-cap` (forced), not earned. The
+policy improves modestly over its own stage-entry snapshot each time and the
+compounding shows up in `comp-eval` instead. A self-referential target gets
+harder exactly as fast as the policy improves, so 0.60 may be unreachable by
+construction. Loosen it — 0.55, or promote on comp-eval trend — but not mid-run.
+
+**What this changes strategically.** The heuristic's parameter space is exhausted
+(0.522) and its best measured build is 1737. A trained policy that is at 0.42
+against v16 after 300 iterations, still rising, is the first thing in this
+project with a path past that. Throughput is now the binding constraint, not
+method: ~10k games/hour on CPU rollouts against a derived ~230k/hour
+GPU-vectorised.
 
 ---
 
