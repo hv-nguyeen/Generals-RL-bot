@@ -11,6 +11,14 @@ Six ML attempts, none has produced a bot worth submitting. Every Elo gain in thi
 project has come from reading replays and fixing a mechanism. Weight-level and
 learned changes are 0-for-9; mechanism fixes are 5-for-5.
 
+**Two things were settled on 2026-08-04, and they point in opposite directions:**
+
+* **Network capacity is NOT the ceiling.** 70k to 270k parameters, four sizes,
+  all 0.489-0.499 validation top-1. Stop scaling the net.
+* **Reward density IS the problem, and a curriculum fixes it.** At generals
+  distance 2-6 the critic reached explained variance 0.12 in **15 iterations**;
+  at the competition's distance 17+ it never cleared 0.12 in **1400**.
+
 ---
 
 ## Attempts
@@ -209,6 +217,17 @@ magnitude-scaled tolerance.
 **Elo noise.** SE ≈ 694.9 × 0.5 / √n → ±58 at 36 games, ±41 at 72, ±26 at 180.
 Most build comparisons made in this project were never resolvable.
 
+**The arena's SPRT verdict named the wrong side until 2026-08-04.** `llr` is
+computed from A's results, so H1 means "A beats B", but the string said
+"B is better". Every accepted-H1 verdict this tool printed named the loser.
+Nothing was decided on it — the Elo sign is on the line above and that is what
+got read — but check the sign, not the words, in any older output.
+
+**`ours` with no config argument is not the current build.** It is `Config()`,
+whose dataclass defaults still carry `lock_enabled=True` — the setting measured
+at −265 Elo. Benchmarks against bare `ours` are against one of the weakest
+configurations we have shipped, not against v16/v18.
+
 ---
 
 ## Inference budget is not the constraint
@@ -228,6 +247,92 @@ rollout throughput** (workers run numpy inference every turn; 7.5× slower forwa
 will overfit a multi-million-parameter net).
 
 ---
+
+### 7. Curriculum self-play — `learn/selfplay.py` (2026-08-04, running)
+
+The first attempt aimed at the cause the other six share: at the competition's
+minimum generals distance of 17 an episode is ~500 turns for ONE bit of reward.
+
+Taken from AverageJoe (same author as our starter kit; 81.5% and #1 on the
+generals.io ladder) after reading it — no code copied, it has no licence. What
+transferred: the distance curriculum, `adv_top_frac`, `num_epochs 1`, the
+terminal-only reward. What did not: its neutral-city magnet branch (we have no
+neutral castles), its 17-42 top stage (BFS distance 42 cannot occur on an 18-21
+grid at 0.24-0.26 mountain density), and every architecture-coupled
+hyperparameter.
+
+**Probe result, 15 iterations at stage 0 (distance 2-6):**
+
+```
+iter   0  turns 156  dist 3.9  evar +0.00   [critic warmup 1/20]
+iter  10  turns 153  dist 3.7  evar +0.05   [critic warmup 11/20]
+iter  15  turns 162  dist 3.8  evar +0.12   <- policy unfroze
+comp-eval  0  0.050 +-0.035 (400 games, dist 17+)
+stage-eval 0  0.500 +-0.050 (200 games, vs stage-entry self)
+```
+
+The hypothesis holds. `evar` crossed 0.10 in **15 iterations** where attempt 6
+never crossed it in 1400. Reward density was the binding constraint, not the
+critic architecture and not the network size.
+
+**One design assumption was wrong:** stage-0 games run **156 turns, not the ~80**
+the design assumed. Still 3x denser than the ~480 at competition distance, but
+the throughput projection was 2x optimistic and iteration times followed.
+
+**The promotion gate took three attempts.** Advancing on win rate against v16 is
+worthless below stage 4: `bot/belief.py` builds the enemy-general prior as
+`passable & (dist >= 17)`, so at distance 4 the true general is not in v16's
+candidate set at all and 0.60 measures its miscalibration rather than our
+learning. Each stage now evaluates against the policy's OWN stage-entry weights,
+both seats played. An unchanged policy reads exactly **0.500** — a fixed point,
+invariant to any opponent's weakness at any distance. Confirmed in the probe.
+
+**Scale, stated honestly:** 1200 iterations x 256 games is ~307k games and ~180M
+transitions against AverageJoe's ~52M games and 26 billion. **135x short**, with
+a 70k-parameter CNN against a 22M-parameter transformer. Expect `comp-eval` to
+move off 0.05; do not expect it to reach the 0.50 that would match v16.
+
+What the run actually decides: **does learning at short distances transfer?**
+`comp-eval` climbing as stages advance means the method works and only scale is
+missing. Flat at 0.05 through stage 5 means the curriculum taught something
+local that does not generalise.
+
+---
+
+## Network capacity is not the ceiling
+
+`tools/scaling.py`, one variable at a time, 1.94M examples from 2787 replays,
+3 held-out shards (49,152 positions, ~120 games) instead of the 8192 contiguous
+rows (~7 games) the old split used.
+
+| arch | params | best val top-1 | best val nll |
+|---|---|---|---|
+| 8x32 | 70,569 | 0.499 +-0.039 | **2.1021** |
+| 4x64 | 122,441 | 0.489 +-0.041 | 2.2204 |
+| 8x64 | 270,153 | 0.494 +-0.044 | 2.1802 |
+
+**Four times the parameters, no gain on either metric.** Depth alone and width
+alone both flat. The limit is label noise: several moves in a position are
+equally reasonable, different demonstrators pick differently, and no model
+resolves that.
+
+Two cautions recorded so the table is not over-read. `8x32` was still improving
+at epoch 19 of 20, so its row is a floor rather than a converged measurement —
+`--patience 3` never fired because nothing plateaued. And the SE is an
+across-shard estimate from only 3 shards, so it is itself noisy.
+
+**The old 0.614 figure is not comparable.** It came from the 7-game validation
+set and was inflated by correlation between positions in the same game.
+
+A behaviour clone is also much weaker than the heuristic: `ours` (bare defaults,
+which still carry `lock_enabled=True`, the setting that cost 265 Elo) beat
+`clone-4x64` **172-28, score 0.860, +315 Elo**. So even against one of our
+weakest configurations the clone scores 0.140.
+
+That reframes attempt 6 rather than excusing it: PPO took a clone from ~0.15 to
+0.255 against the heuristic — it roughly doubled the win rate — and then stalled
+900 iterations short of parity. Directional only; different clones, different
+opponents.
 
 ## Dead ends closed by measurement
 
