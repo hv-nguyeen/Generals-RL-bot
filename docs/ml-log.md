@@ -21,8 +21,11 @@ first two or three were ever confirmed by rating.
 
 **Two things were settled on 2026-08-04, and they point in opposite directions:**
 
-* **Network capacity is NOT the ceiling.** 70k to 270k parameters, four sizes,
-  all 0.489-0.499 validation top-1. Stop scaling the net.
+* **Network capacity is NOT the ceiling** — *this claim is now in doubt, see
+  "The receptive field" below.* 70k to 270k parameters, four sizes, all
+  0.489-0.499 validation top-1. The study varied width and depth, but BC top-1
+  saturates on LABEL NOISE at ~0.50, so it cannot distinguish "big enough" from
+  "cannot see the board".
 * **Reward density IS the problem, and a curriculum fixes it.** At generals
   distance 2-6 the critic reached explained variance 0.12 in **15 iterations**;
   at the competition's distance 17+ it never cleared 0.12 in **1400**.
@@ -381,7 +384,55 @@ that made v12 look good.
 
 ---
 
-## Network capacity is not the ceiling
+## The receptive field — the most likely reason this pivot fails
+
+`bot/policy/net.py` is an L-layer stack of 3x3 convolutions with **no dilation
+and no pooling**, so its receptive-field radius is exactly L.
+
+| arch | radius | window |
+|---|---|---|
+| 4x32 (shipped) | 4 | 9x9 |
+| 8x32 (deepest ever trained) | 8 | 17x17 |
+| **a 21x21 board, corner to corner** | **20** | — |
+
+Now list what the heuristic actually decides on: `dist_home`, `dist_enemy_gen`,
+`dist_enemy_terr`, `dist_unowned`, the distance-ordered cumulative defence sums,
+the threat scan, `hidden_enemy_army`, the turn number. **Every one is a
+whole-board BFS or a global scalar. None is computable inside a 9x9 window**, and
+widening the net at fixed depth adds no reach at all — `4x64` has 122k parameters
+and still sees 9x9.
+
+So the scaling study above may have measured the wrong thing. Both readings fit
+the data and only one was recorded:
+
+* the model is big enough and the labels are noisy — what the table says;
+* the model **cannot see the board**, and top-1 saturates on label noise long
+  before that becomes visible.
+
+This is also the most plausible explanation of the non-transitivity: a policy
+with radius 8 plays locally-good moves and gets outmanoeuvred on a board it
+cannot perceive as a whole.
+
+### The experiment that settles it in one hour
+
+**Distil the heuristic, not the ladder.** v16 is deterministic given its config,
+so labelling its own games gives **exactly zero label noise** — which removes the
+confound entirely.
+
+1. Play ~300 v16-vs-v16 games at competition distance, dump (observation, v16's
+   action) for both seats. ~290k examples, minutes on the arena.
+2. Hold out whole games, using the shard split.
+3. Train 15 minutes each at `--layers 4 --channels 32` (radius 4) and
+   `--layers 12 --channels 128` (radius 12, ~1.9M params — the inference table
+   says 20x128 costs 6.3 ms/move, 4% of budget, so depth is affordable).
+
+| result | conclusion |
+|---|---|
+| L4 stalls ~0.5-0.7, L12 clears ~0.90 | **receptive field is the ceiling.** Go deeper, or add a mean-pool-and-broadcast global path per block, which is far cheaper than depth. Re-cost throughput for a 1-2M-param net. |
+| both stall below ~0.7 | **the observation is the ceiling.** No policy over these 12 channels can imitate the heuristic; it needs the belief-derived channels bot/belief.py maintains. |
+| both clear ~0.90 | architecture and observation are both fine; the ceiling is training, and the pivot proceeds as planned. |
+
+## Network capacity is not the ceiling — as measured by BC top-1
 
 `tools/scaling.py`, one variable at a time, 1.94M examples from 2787 replays,
 3 held-out shards (49,152 positions, ~120 games) instead of the 8192 contiguous
