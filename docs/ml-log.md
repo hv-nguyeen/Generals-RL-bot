@@ -65,6 +65,28 @@ Two further notes worth keeping:
   ~0.9 and gains +111 Elo from it (`castle_enabled=False`: 262W-138L, 400
   games), so an optimum plausibly sits between and remains unmeasured.
 
+**WHY v16 MISLED, precisely.** A castle repays over ~70 turns, so its value is a
+function of how long the game lasts — and that is a property of the OPPONENT.
+v16 farms and plays slowly, so games against it run 480+ turns and 15 castles
+have time to compound. Ladder opponents at 1800+ press hard and games end early;
+army spent on a castle at turn 150 never returns, and you are 35 down in the
+fight that decides the game.
+
+So the finding is not "castles are bad". It is **castles are a bet on the game
+lasting**, and against strong opponents that bet loses. This also explains why
+the heuristic's 0.9 per game beats both 0 and 15: `castle_gather_min_army: 400`
+means it never walks army to a site, it only builds when a stack is ALREADY
+standing on one. That is an opportunistic bet with almost no downside, not a
+planned investment.
+
+The implication for the network is that a constant bias is the wrong shape for
+this decision entirely. `head_b[8]` shifts every cell on every turn identically;
+what the decision needs is context — how long is this game likely to last, am I
+under pressure, is this site safe. That information exists (`rules.build_cost_grid`
+is computable per cell, threat is derivable) and none of it is in the 20
+observation channels. See the ceiling discussion above: information the net
+cannot compute has been worth more in this project than capacity or schedule.
+
 ### The greedy yardstick was the tenth instrument to lie
 
 Before submitting, the two local measures disagreed by 315 Elo:
