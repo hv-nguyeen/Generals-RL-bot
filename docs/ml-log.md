@@ -5,6 +5,9 @@ an impression. If an entry has no number it does not belong here.
 
 Last updated 2026-08-05.
 
+**For the current state and what to do next, read `docs/STATE.md`.** This file is
+the full measured history and the reasoning; that one is the short version.
+
 ## The one-line summary
 
 **The neural bot reached 1849 Elo, rank 21/86 — the best result in the project,
@@ -1134,3 +1137,66 @@ Mechanism fixes found by reading replays. Five, all held:
 The loop: harvest replays → `analysis/deathwatch.py` and `analysis/churn.py` →
 name the mechanism → fix it → check the mechanism moved. Mechanism numbers are
 readable at 12 games. Elo is not.
+
+
+---
+
+## The net reinvented the general-drain bug (2026-08-05)
+
+`deathwatch` over 50 ladder losses of the NEURAL bot:
+
+```
+16/50 losses: army left the general in the last 15 ticks with an enemy stack
+              within 3 steps. One trace: general 85 -> 2 with a 64-stack adjacent.
+mean garrison the tick before death: 27.7, dying to stacks of 30-90
+mean reinforcement brought in:       16.4  -- it reacts, and arrives short
+```
+
+The heuristic needed three separate commits to stop doing exactly this
+(`324daa0` the thrust, `fa1a5ca` the move scorer, `3b8871f` the strike stack).
+The network arrived at the same mistake independently.
+
+**It cannot unlearn it from self-play.** At the curriculum's short distances
+emptying the general is correct tempo, so the habit is learned in the regime
+where it is right; and in a mirror match both copies do it, so neither gains and
+the gradient sees nothing wrong. The same symmetric blindness that deleted the
+castles.
+
+So the fix belongs outside training. `bot/policy/guard.py` wraps the shipped net
+with the heuristic's hard-override tier, which `ClonePolicy` never had:
+
+1. **win-in-one** — rules-exact, no judgement
+2. **deathtouch** — from turn 800 any touch on a general wins, so this is checked first
+3. **garrison veto** — refuse a move that empties the general when a visible
+   enemy stack within `general_block_radius` is at least `general_block_ratio` of
+   the garrison. **The NARROW version**: v16's radius 3, ratio 0.5. The wide
+   version — an unconditional lock at radius 6 — measured **-265 Elo** and must
+   not come back. Same idea, different settings, opposite sign.
+
+The veto hands the net **its own second-choice move**, not a hand-written
+alternative, so the policy still decides everywhere the guard has no opinion.
+
+**Status: written, selfchecked, UNTESTED against a baseline.** Needs wrapped-vs-raw
+on identical boards before it ships.
+
+## The audit: the trainer was clean, the instruments were not (2026-08-05)
+
+An adversarial line-by-line pass over `learn/selfplay.py` and `learn/vecroll.py`
+— the two files producing current results — found **no correctness bug**. Seat and
+reward bookkeeping, GAE at episode boundaries, the KL anchor's rollout-time
+logprobs, masking before `log_softmax`, the scan identity at 480 turns, and the
+absence of any surviving shaping all hold. An exhaustive check of the dihedral
+permutation over all 8 group elements x every cell x every direction x builds
+found 0 mismatches, against an in-repo selfcheck that samples 3 cells.
+
+Every live risk was in a side tool, and four were fixed:
+
+| tool | what it did |
+|---|---|
+| `tools/mixbuilds.py` | spliced build frames into ALL shards including the 3 `train.py` holds out, so validation could not detect the splice failing — exactly how the previous castle attempt hid its own failure. At reps=16 the same frame was on both sides. |
+| `tools/pools.py` | claimed its boards were the ones `--backend cpu` plays. Disjoint seed blocks; any CPU/GPU quality A/B was cross-distribution. |
+| `learn/train.py` | printed `arena.runner --a ours` as the suggested benchmark. Bare `ours` is the -265 Elo config, so every clone would have been flattered by its own tool. |
+| `tools/buildprior.py` | docstring said the policy drives both seats; it plays seat 0 against `--opponent`, so the +9.094 was calibrated against v16's style specifically. |
+
+**The pattern holds: this project's bugs are in its instruments, not its
+learning.** A lying docstring is a bug, and three of these four were.
