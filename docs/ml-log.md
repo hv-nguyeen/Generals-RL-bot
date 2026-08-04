@@ -82,6 +82,18 @@ before the softmax, evaluation on held-out boards.
 
 Gate needed +0.177 on 400 fresh games. Rejected.
 
+**Settled on 400 fresh games (2026-08-04):**
+
+```
+clone:runs/nn/br16.best.npz  vs  ours:configs/v16.json
+  102W 0D 298L  score 0.255   elo -186.2 [-227.8, -149.1]
+  sprt llr -9.22 -> accept H0 (no improvement)
+```
+
+So the best checkpoint is worth **0.255**, not the 0.320 the `<- kept` line
+showed — winner's curse, exactly as the plateau mean predicted. Attempt 6 is a
+failure with a number on it.
+
 **Why it collapsed:** critic warmup was a fixed **3 iterations**, and `evar`
 (explained variance) sat at +0.00…+0.04 through the whole early phase. The policy
 was being updated from advantages that were pure critic noise. The likely
@@ -216,6 +228,32 @@ rollout throughput** (workers run numpy inference every turn; 7.5× slower forwa
 will overfit a multi-million-parameter net).
 
 ---
+
+## Dead ends closed by measurement
+
+**Territory churn is not a scoring bug.** A field analysis put our tiles changing
+hands ~78 times in wins and ~288 in losses and concluded we take ground we cannot
+hold. `analysis/churn.py` over 200 games says otherwise — in BOTH wins and losses
+the tiles that flipped were born with MORE army than the tiles that held:
+
+| | flips/100t | young% | fronts | birth army flipped | held | ratio |
+|---|---|---|---|---|---|---|
+| win (34) | 29.2 | 31 | 8.4 | 7.0 | 3.0 | 2.33 |
+| loss (165) | 48.6 | 14 | 6.7 | 3.0 | 2.0 | 1.50 |
+
+Caveat worth stating: birth army is partly a proxy for *contestedness*, not for
+garrison adequacy — we spend more army taking frontier tiles, and frontier tiles
+are the ones that flip. So the metric cannot fully separate the hypotheses. But
+the direction is unambiguous and it is the opposite of the claim, and `young%` is
+LOWER in losses (14% vs 31%), i.e. the tiles we lose are ones we held longer.
+That is a front being fought over and lost, not tiles rented for a turn.
+
+**"Avoid multiple weak fronts" is dead too.** We hold MORE separate contested
+borders in wins (8.4) than in losses (6.7).
+
+What survives is churn per turn — 48.6 vs 29.2 — which is a symptom of losing a
+sustained fight. That is the army-economy problem, and it agrees with deathwatch:
+we die to stacks two to three times our garrison.
 
 ## What has actually worked
 
