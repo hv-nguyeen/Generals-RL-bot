@@ -30,8 +30,11 @@ FIVE PREVIOUS ATTEMPTS FAILED. EACH ONE HAS A MECHANISM HERE
 4. Terminal-reward REINFORCE with no baseline pushed down 90% of its own moves
    every step and collapsed to a 0% win rate in twelve iterations. There is a
    separate GAE critic (the `learn/valuetrain.py` topology, tanh head) fitted to
-   the MONTE-CARLO return, three iterations of CRITIC-ONLY warmup before the
-   first policy step, and the advantage is SCALED but not re-centred. Centring
+   the MONTE-CARLO return, CRITIC-ONLY warmup until the critic actually explains
+   something (`--warm-evar`, not a fixed iteration count -- a 1500-iteration run
+   released the policy after 3 iterations with evar still at +0.02 and eval fell
+   0.175 -> 0.000 by iteration 160), and the advantage is SCALED but not
+   re-centred. Centring
    was the bug, not the cure: with gamma=1, terminal-only reward and lam=0.95
    every state more than ~60 plies from the end has a raw advantage of ~0, so
    subtracting the buffer mean hands two thirds of the batch one identical
@@ -109,6 +112,12 @@ KILL THE RUN IF:
                         No best response in this class either. That is a real
                         result; stop and write it down.
 
+A COLLAPSE is caught rather than watched: an eval 2 se below the `eval 0`
+baseline rewinds to the best checkpoint, halves the learning rate and doubles
+the anchor. Three of those and the run stops -- the schedule is wrong, not
+unlucky. The previous run had no such guard and spent 310 iterations at a zero
+win rate, which also spent the warm start it depended on.
+
 THE COMMAND
 -----------
     OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \\
@@ -155,7 +164,8 @@ SIGMA_FLOOR = 0.15   # training only; eval and the gate use raw sigma
 KL_STOP = 0.02       # the clip flattens the gradient, it does not bound the step
 BETA0, BETA_MIN, BETA_MAX = 0.05, 0.01, 1.0
 ANCHOR_HI, ANCHOR_LO = 1.0, 0.1
-WARMUP = 3           # critic-only iterations; a random critic is failure 4
+WARMUP = 3           # minimum critic-only iterations; --warm-evar is the real gate
+MAX_REWINDS = 3      # collapses tolerated before the schedule is declared wrong
 CHUNK = 8192         # ingest forward chunk, no-grad, outside value_and_grad
 
 def policy_keys(arch: dict) -> set:
@@ -565,6 +575,9 @@ def main() -> None:
     ap.add_argument("--minibatch", type=int, default=4096)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--critic-lr", type=float, default=1e-3)
+    ap.add_argument("--warm-evar", type=float, default=0.10,
+                    help="hold the policy frozen until the critic explains this "
+                         "much of the return; 0 restores the old fixed warmup")
     ap.add_argument("--eval-every", type=int, default=10)
     ap.add_argument("--eval-games", type=int, default=200)
     ap.add_argument("--gate-games", type=int, default=400)
@@ -707,10 +720,12 @@ def main() -> None:
                            beta, xp=jnp)
 
     @jax.jit
-    def p_step(p, opt, t, beta, batch):
+    def p_step(p, opt, t, beta, lr, batch):
         (loss, aux), g = jax.value_and_grad(p_objective, has_aux=True)(p, beta, *batch)
         g, norm = clip_grads(g, 0.5)
-        p, opt = adam(p, opt, g, t, args.lr)
+        # lr is traced, not closed over: the collapse guard halves it at runtime
+        # and a closed-over python float would silently keep the original.
+        p, opt = adam(p, opt, g, t, lr)
         return p, opt, loss, aux, norm
 
     @jax.jit
@@ -764,6 +779,10 @@ def main() -> None:
     t_p = t_v = 0
     best_score, best_iter = -1.0, -1
     best_theta = dict(theta_init)
+    warmed = False          # set once the critic explains enough to trust
+    base_score = None       # eval 0: the initialisation's own score
+    rewinds = 0
+    lr_scale = 1.0
     started = time.time()
 
     for it in range(args.iters):
@@ -821,7 +840,16 @@ def main() -> None:
         vr = float(ret.var())
         evar = float(1.0 - ((ret - vals).var() / vr)) if vr > 1e-9 else float("nan")
 
-        do_policy = it >= WARMUP
+        # Warm up on the CRITIC'S SCORE, not on a fixed iteration count. The
+        # 1500-iteration run released the policy after 3 iterations with evar
+        # still at +0.00..+0.04, so its first hundred updates were driven by
+        # advantages that were pure critic noise; eval fell 0.175 -> 0.000 by
+        # iteration 160 and spent 310 iterations at a zero win rate. Worse, that
+        # collapse spends the behaviour-clone warm start, so what recovers
+        # afterwards is PPO-from-scratch, which is the attempt that plateaued at
+        # 0.15. Wait until the critic explains something.
+        warmed = warmed or (it >= WARMUP and evar >= args.warm_evar)
+        do_policy = warmed
         dlp0 = float("nan")
         kl_u = kl_last = kl_a = ent = pg = gn = vloss = 0.0
         kl_sum, nb, stop = 0.0, 0, False
@@ -837,7 +865,8 @@ def main() -> None:
                              jnp.asarray(old_logp[sel]), jnp.asarray(ref_logp[sel]),
                              jnp.asarray(adv[sel]))
                     t_p += 1
-                    theta, opt_p, _, aux, norm = p_step(theta, opt_p, t_p, beta, batch)
+                    theta, opt_p, _, aux, norm = p_step(theta, opt_p, t_p, beta,
+                                                        args.lr * lr_scale, batch)
                     d_, ku, ka, en, pgv = (float(x) for x in aux)
                     if epoch == 0 and s == 0:
                         dlp0 = d_
@@ -901,6 +930,30 @@ def main() -> None:
             print(f"eval {it:4d}  {score:.3f} +-{stderr(dg):.3f} ({dg} distinct)  "
                   f"[{'  '.join(f'{s} {v:.2f}' for s, v in per.items())}]{mark}",
                   flush=True)
+
+            # Collapse guard. eval 0 is the initialisation's own score and the
+            # only baseline that matters: falling well below it means the warm
+            # start is being destroyed, and nothing after that point is training
+            # from a clone any more. The 1500-iteration run fell to 0.000 and ran
+            # 310 iterations there with nothing watching. Rewind and halve the
+            # step rather than continue downhill; give up if it keeps happening,
+            # because a third rewind means the setting is wrong, not unlucky.
+            if base_score is None:
+                base_score = score
+            elif score < base_score - 2.0 * stderr(dg):
+                rewinds += 1
+                print(f"  COLLAPSE {score:.3f} is 2 se below the eval-0 baseline "
+                      f"{base_score:.3f}; rewinding to iter {best_iter} and "
+                      f"halving lr (rewind {rewinds}/{MAX_REWINDS})", flush=True)
+                if rewinds > MAX_REWINDS:
+                    print("  giving up: the schedule is wrong, not unlucky. "
+                          "Lower --lr or raise --warm-evar.", flush=True)
+                    break
+                theta = {k: jnp.asarray(v) for k, v in best_theta.items()}
+                opt_p = {k: (jnp.zeros_like(v), jnp.zeros_like(v))
+                         for k, v in theta.items()}
+                lr_scale *= 0.5
+                beta = min(beta * 2.0, BETA_MAX)
 
     # --- gate: paired against the initialisation. An absolute threshold would be
     # arbitrary; "did PPO improve on its own starting point against this mixture"
