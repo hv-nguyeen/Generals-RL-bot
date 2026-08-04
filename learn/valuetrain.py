@@ -1,7 +1,9 @@
 """Fit the win-probability model on the GPU, export for numpy inference.
 
 Same trunk as the policy so `bot/policy/net.py` can run it on one CPU core; only
-the head differs. Parameter names match what ValueNet loads.
+the head differs. The trunk builder is `learn.train`'s, so `--layers`,
+`--channels` and `--residual` mean the same thing here, and ValueNet discovers
+whichever was used straight out of the npz.
 
     python -m learn.valuetrain --data /local/data/vng205/val --out /local/data/vng205/value.npz
 """
@@ -15,37 +17,24 @@ from pathlib import Path
 
 import numpy as np
 
-from bot import features
-from bot.policy.net import CHANNELS, LAYERS
+from learn import train as bc
 
 
-def init_params(key):
+def init_params(key, arch: dict | None = None):
+    """Same trunk builder as the policy, a scalar head instead of the move head."""
     import jax
-    import jax.numpy as jnp
-    p, keys, prev = {}, jax.random.split(key, LAYERS + 1), features.C
-    for i in range(LAYERS):
-        p[f"conv{i}_w"] = jax.random.normal(
-            keys[i], (CHANNELS, prev, 3, 3)) * np.sqrt(2.0 / (9 * prev))
-        p[f"conv{i}_b"] = jnp.zeros((CHANNELS,))
-        prev = CHANNELS
-    p["v_w"] = jax.random.normal(keys[LAYERS], (CHANNELS,)) * 0.01
-    p["v_b"] = jnp.zeros(())
+
+    p = bc.init_params(key, arch)
+    for k in ("head_w", "head_b", "pass_w", "pass_b"):
+        del p[k]
+    p["v_w"] = jax.random.normal(jax.random.fold_in(key, 7),
+                                 (p["conv0_w"].shape[0],)) * 0.01
+    p["v_b"] = jax.numpy.zeros(())
     return p
 
 
 def forward(p, x):
-    import jax
-    import jax.numpy as jnp
-
-    def conv(inp, w, b):
-        return jax.lax.conv_general_dilated(
-            inp, w, (1, 1), "SAME",
-            dimension_numbers=("NCHW", "OIHW", "NCHW")) + b[None, :, None, None]
-
-    h = x
-    for i in range(LAYERS):
-        h = jax.nn.relu(conv(h, p[f"conv{i}_w"], p[f"conv{i}_b"]))
-    return h.mean(axis=(2, 3)) @ p["v_w"] + p["v_b"]
+    return bc.trunk(p, x).mean(axis=(2, 3)) @ p["v_w"] + p["v_b"]
 
 
 def main() -> None:
@@ -56,8 +45,12 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=6)
     ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--lr", type=float, default=2e-3)
+    ap.add_argument("--layers", type=int, default=None)
+    ap.add_argument("--channels", type=int, default=None)
+    ap.add_argument("--residual", action="store_true", default=None)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+    arch = bc.resolve_arch(None, args.layers, args.channels, args.residual)
 
     import jax
     import jax.numpy as jnp
@@ -72,7 +65,7 @@ def main() -> None:
     print(f"{len(shards)} shards, {len(train)} for training")
 
     rng = np.random.default_rng(args.seed)
-    params = init_params(jax.random.PRNGKey(args.seed))
+    params = init_params(jax.random.PRNGKey(args.seed), arch)
     m = {k: jnp.zeros_like(v) for k, v in params.items()}
     v = {k: jnp.zeros_like(x) for k, x in params.items()}
 
@@ -115,11 +108,12 @@ def main() -> None:
         mark = ""
         if a > best:
             best, mark = a, "  <- kept"
-            np.savez_compressed(args.out, **{k: np.asarray(x) for k, x in params.items()})
+            bc.save(params, args.out)
         print(f"epoch {epoch}  loss {run / max(nb, 1):.4f}  val acc {a:.3f}  "
               f"{time.time() - started:.0f}s{mark}", flush=True)
 
-    Path(args.out).with_suffix(".json").write_text(json.dumps({"val_acc": best}, indent=2))
+    Path(args.out).with_suffix(".json").write_text(
+        json.dumps({"val_acc": best, **arch}, indent=2))
     print(f"\nwrote {args.out} (best val accuracy {best:.3f})")
     print("Calibrate before trusting it:")
     print(f"  python -m tools.calibrate --model {args.out}")

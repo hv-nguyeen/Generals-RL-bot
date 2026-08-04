@@ -4,6 +4,11 @@ Two hard requirements from the sandbox, both handled here rather than in the
 policy: reply inside 150 ms, and never die. An exception in the policy becomes a
 pass (one fault out of an allowance of fifty) instead of a crashed process,
 which is an instant forfeit.
+
+Which policy plays is decided once, at handshake, by `make_agent`: the cloned
+network if `bot/weights.npz` was packaged and `use_net` is on, the heuristic
+Controller otherwise. Every outcome prints one line to stderr, including the
+fallback — the ladder cannot tell you which one it played.
 """
 
 from __future__ import annotations
@@ -27,10 +32,41 @@ def load_config() -> Config:
     return Config.load(path) if path else Config()
 
 
+# Not a Config field: `Config.flatten` floats every non-bool, so a path in there
+# would break the tuner. The switch is the bool; the location is fixed.
+WEIGHTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights.npz")
+
+
+def make_agent(cfg: Config, player_id: int, h: int, w: int):
+    """The cloned net if one was packaged, the heuristic otherwise.
+
+    Construction happens outside main()'s per-move try/except, so a corrupt or
+    half-copied npz would otherwise kill the process before the first frame —
+    an instant forfeit, in exchange for a file that is optional by design. It
+    falls back instead, and says so on stderr: a submission that quietly plays
+    the wrong policy is the failure that is hard to notice from the ladder.
+    """
+    if cfg.use_net and os.path.exists(WEIGHTS):
+        try:
+            from bot.policy.net import ClonePolicy
+            agent = ClonePolicy(player_id, h, w, WEIGHTS)
+            print(f"policy: net {agent.net.arch} from {WEIGHTS}", file=sys.stderr)
+            return agent
+        except Exception:                             # noqa: BLE001
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            print(f"policy: FALLING BACK to the heuristic, {WEIGHTS} did not load",
+                  file=sys.stderr)
+    else:
+        print(f"policy: heuristic (use_net={cfg.use_net}, "
+              f"weights present={os.path.exists(WEIGHTS)})", file=sys.stderr)
+    return Controller(player_id, h, w, cfg)
+
+
 def main() -> None:
     cfg = load_config()
     player_id, h, w = protocol.read_handshake(sys.stdin)
-    ctrl = Controller(player_id, h, w, cfg)
+    ctrl = make_agent(cfg, player_id, h, w)
 
     budget = cfg.time_budget_ms / 1000.0
     first = True

@@ -134,7 +134,8 @@ import numpy as np
 
 from arena import agents
 from bot import features, rules
-from bot.policy.net import CHANNELS, LAYERS, Net
+from bot.policy.net import (DEFAULT_CHANNELS, DEFAULT_LAYERS, Net, arch_record,
+                            trunk_keys)
 from learn.league import allocate, dense, fictitious_play, stderr
 from sim import engine, mapgen
 
@@ -157,9 +158,14 @@ ANCHOR_HI, ANCHOR_LO = 1.0, 0.1
 WARMUP = 3           # critic-only iterations; a random critic is failure 4
 CHUNK = 8192         # ingest forward chunk, no-grad, outside value_and_grad
 
-POLICY_KEYS = ({f"conv{i}_w" for i in range(LAYERS)}
-               | {f"conv{i}_b" for i in range(LAYERS)}
-               | {"head_w", "head_b", "pass_w", "pass_b"})
+def policy_keys(arch: dict) -> set:
+    """Exactly the weights `bot/policy/net.Net` loads, for this architecture.
+
+    Derived, not enumerated: the old hardcoded set silently projected a deeper
+    checkpoint down onto four layers and trained the truncation.
+    """
+    return ({f"{n}_{s}" for n in trunk_keys(arch["layers"], arch["residual"])
+             for s in "wb"} | {"head_w", "head_b", "pass_w", "pass_b"})
 
 
 # --------------------------------------------------------------------------
@@ -400,7 +406,8 @@ def publish(p: dict, live: Path) -> None:
     iteration you would never diagnose.
     """
     tmp = live.with_suffix(".tmp.npz")
-    np.savez(tmp, **{k: np.asarray(v) for k, v in p.items()})
+    arrays = {k: np.asarray(v) for k, v in p.items()}
+    np.savez(tmp, **arrays, **arch_record(arrays))
     os.replace(tmp, live)
 
 
@@ -501,20 +508,28 @@ def selfcheck() -> None:
     # d = 0: the anchor exerts no pull on the first update, only on drift.
     assert float(-(np.exp(0.0) - 1.0)) == 0.0
 
-    # --- a checkpoint round-trips into the loader the submission uses
-    p = {f"conv{i}_w": rng.normal(size=(32, 12 if i == 0 else 32, 3, 3)).astype(np.float32) * 0.1
-         for i in range(LAYERS)}
-    p.update({f"conv{i}_b": np.zeros(32, np.float32) for i in range(LAYERS)})
-    p["head_w"] = rng.normal(size=(features.PER_CELL, 32, 3, 3)).astype(np.float32) * 0.1
+    # --- a checkpoint round-trips into the loader the submission uses. Not the
+    #     4x32 default: a residual trunk is what would break the key plumbing.
+    arch = {"layers": 5, "channels": DEFAULT_CHANNELS, "residual": True}
+    names = trunk_keys(arch["layers"], arch["residual"])
+    ch, p, prev = arch["channels"], {}, features.C
+    for n in names:
+        p[f"{n}_w"] = rng.normal(size=(ch, prev, 3, 3)).astype(np.float32) * 0.1
+        p[f"{n}_b"] = np.zeros(ch, np.float32)
+        prev = ch
+    p["head_w"] = rng.normal(size=(features.PER_CELL, ch, 3, 3)).astype(np.float32) * 0.1
     p["head_b"] = np.zeros(features.PER_CELL, np.float32)
-    p["pass_w"] = np.zeros(32, np.float32)
+    p["pass_w"] = np.zeros(ch, np.float32)
     p["pass_b"] = np.float32(0.0)
-    assert set(p) == POLICY_KEYS, set(p) ^ POLICY_KEYS
+    assert set(p) == policy_keys(arch), set(p) ^ policy_keys(arch)
+    assert len(policy_keys({"layers": DEFAULT_LAYERS, "channels": ch,
+                            "residual": False})) == 2 * DEFAULT_LAYERS + 4
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "ck.npz"
         publish(p, path)
-        assert set(np.load(path).files) == POLICY_KEYS
+        assert set(np.load(path).files) == policy_keys(arch) | set(arch_record(p))
         net = Net(str(path))                     # the exact loader ClonePolicy uses
+        assert net.arch == arch, net.arch
     h = w = 18
     ty = np.full((h, w), rules.T_PLAIN, dtype=np.int8)
     ty[0, 0] = rules.T_GENERAL
@@ -561,6 +576,11 @@ def main() -> None:
                          "The default leaves a point-mass sigma sending 85%% of "
                          "games to one bot; raise it when the startup line says "
                          "fewer than two effective opponents")
+    ap.add_argument("--layers", type=int, default=None)
+    ap.add_argument("--channels", type=int, default=None)
+    ap.add_argument("--residual", action=argparse.BooleanOptionalAction, default=None,
+                    help="only to assert what --init already is; --no-residual "
+                         "asserts a plain trunk, which --layers cannot")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--selfcheck", action="store_true")
     args = ap.parse_args()
@@ -640,21 +660,29 @@ def main() -> None:
               "--sigma-floor or grow the archive before believing the gate.")
 
     z0 = np.load(args.init)
-    missing = POLICY_KEYS - set(z0.files)
+    # The architecture is the checkpoint's, whatever it is; a flag is only ever
+    # an assertion about it. arch_of refuses a truncated or mislabelled trunk.
+    arch = bc.resolve_arch(args.init, args.layers, args.channels, args.residual)
+    keys = policy_keys(arch)
+    missing = keys - set(z0.files)
     if missing:
         raise SystemExit(f"{args.init} is not a policy checkpoint, missing {sorted(missing)}")
-    # Names are not enough: an npz trained at a different CHANNELS/LAYERS/features.C
-    # passes the name check and then dies inside bc.forward at the first policy
+    # Names and depth are not enough: an npz trained against a different
+    # features.C passes both and then dies inside bc.forward at the first policy
     # step, three iterations and 60 dead workers later.
-    want = {"conv0_w": (CHANNELS, features.C, 3, 3),
-            "head_w": (features.PER_CELL, CHANNELS, 3, 3)}
+    ch = arch["channels"]
+    want = {"conv0_w": (ch, features.C, 3, 3),
+            "head_w": (features.PER_CELL, ch, 3, 3)}
     bad = [(k, z0[k].shape, s) for k, s in want.items() if z0[k].shape != s]
     if bad:
         raise SystemExit(f"{args.init} has the wrong topology for this build: {bad}")
-    theta = {k: jnp.asarray(z0[k]) for k in POLICY_KEYS}
+    print(f"policy: {arch['layers']}x{ch}"
+          + (" residual" if arch["residual"] else "")
+          + f", {sum(int(z0[k].size) for k in keys)} parameters")
+    theta = {k: jnp.asarray(z0[k]) for k in keys}
     theta_ref = dict(theta)          # frozen; never rebound, never in a grad graph
     theta_init = {k: np.asarray(v) for k, v in theta.items()}
-    phi = vt.init_params(jax.random.PRNGKey(args.seed))
+    phi = vt.init_params(jax.random.PRNGKey(args.seed), arch)   # critic, same size
     opt_p = {k: (jnp.zeros_like(v), jnp.zeros_like(v)) for k, v in theta.items()}
     opt_v = {k: (jnp.zeros_like(v), jnp.zeros_like(v)) for k, v in phi.items()}
 
@@ -891,9 +919,11 @@ def main() -> None:
     dg = distinct_games(gate, args.maps)
     margin = 2 * stderr(dg)
     accepted = bool(score - init_score > margin)
-    np.savez_compressed(out, **best_theta)
-    np.savez_compressed(out.with_suffix(".last.npz"),
-                        **{k: np.asarray(v) for k, v in theta.items()})
+    # publish, not a bare savez: `out` is what enters the league archive and
+    # becomes the next generation's --init, so it is the LAST file that should
+    # ship without the architecture record.
+    publish(best_theta, out)
+    publish(theta, out.with_suffix(".last.npz"))
     out.with_suffix(".json").write_text(json.dumps(
         {"accepted": accepted, "score": round(score, 4),
          "init_score": round(init_score, 4), "margin": round(margin, 4),

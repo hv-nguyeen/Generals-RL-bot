@@ -236,6 +236,12 @@ class Config:
     # ---- engine-side safety ------------------------------------------------
     time_budget_ms: float = 110.0      # leave headroom under the 150 ms limit
 
+    # Play the cloned net when `bot/weights.npz` was packaged alongside this
+    # config. A bool, because `flatten` skips bools and floats everything else:
+    # switches are chosen, not searched. Set it false to A/B the heuristic
+    # against the net without repacking.
+    use_net: bool = True
+
     # ------------------------------------------------------------------------
     def save(self, path: str | Path) -> None:
         Path(path).write_text(json.dumps(asdict(self), indent=2) + "\n")

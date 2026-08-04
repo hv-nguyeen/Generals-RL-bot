@@ -7,8 +7,9 @@ move is not the winning move.
 
 Three things are deliberately fixed rather than tuned:
 
-* the network is the same 4x32 stack `bot/policy/net.py` runs on one CPU core in
-  under a millisecond. Training something the sandbox cannot run is wasted GPU.
+* the network is whatever `--init` already is. The architecture is inherited from
+  the warm start, never assumed and never quietly changed here; a flag that
+  disagrees with the checkpoint stops the run.
 * observations go through `learn/rlenv.encode_jax`, verified identical to the
   encoder in the submission.
 * the value head is training-only and is not exported, so the shipped weights
@@ -30,17 +31,19 @@ import numpy as np
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "third_party" / "generals-bots"))
 
-from bot import features                                      # noqa: E402
-from bot.policy.net import CHANNELS, LAYERS                   # noqa: E402
+from bot.policy.net import arch_of                            # noqa: E402
 from learn import rlenv                                       # noqa: E402
-from learn.train import forward, init_params                  # noqa: E402
+from learn.train import (_conv, init_params, resolve_arch,    # noqa: E402
+                         save, trunk)
 
 
 def add_value_head(params, key):
     import jax
     import jax.numpy as jnp
     params = dict(params)
-    params["val_w"] = jax.random.normal(key, (CHANNELS,)) * 0.01
+    # width from the trunk that is actually here, not from a constant: a warm
+    # start of a different size would otherwise get a head that cannot contract
+    params["val_w"] = jax.random.normal(key, params["pass_w"].shape) * 0.01
     params["val_b"] = jnp.zeros(())
     return params
 
@@ -48,19 +51,10 @@ def add_value_head(params, key):
 def policy_value(params, x):
     """Logits plus a state value. The trunk is shared; only the value head is
     extra, and it is dropped on export."""
-    import jax
     import jax.numpy as jnp
 
-    def conv(inp, w, b):
-        y = jax.lax.conv_general_dilated(
-            inp, w, window_strides=(1, 1), padding="SAME",
-            dimension_numbers=("NCHW", "OIHW", "NCHW"))
-        return y + b[None, :, None, None]
-
-    h = x
-    for i in range(LAYERS):
-        h = jax.nn.relu(conv(h, params[f"conv{i}_w"], params[f"conv{i}_b"]))
-    move = conv(h, params["head_w"], params["head_b"])
+    h = trunk(params, x)
+    move = _conv(h, params["head_w"], params["head_b"])
     flat = jnp.transpose(move, (0, 2, 3, 1)).reshape(x.shape[0], -1)
     pooled = h.mean(axis=(2, 3))
     pass_logit = pooled @ params["pass_w"] + params["pass_b"]
@@ -98,8 +92,14 @@ def main() -> None:
     ap.add_argument("--refresh", type=int, default=0,
                     help="copy the learner into the frozen opponent every N "
                          "iterations; 0 keeps it fixed")
+    ap.add_argument("--layers", type=int, default=None)
+    ap.add_argument("--channels", type=int, default=None)
+    ap.add_argument("--residual", action=argparse.BooleanOptionalAction, default=None,
+                    help="only to assert what --init already is; --no-residual "
+                         "asserts a plain trunk, which --layers cannot")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+    arch = resolve_arch(args.init, args.layers, args.channels, args.residual)
 
     import jax
     import jax.numpy as jnp
@@ -116,14 +116,21 @@ def main() -> None:
     pool, _ = env.reset(k_pool)
 
     key, k_init = jr.split(key)
-    params = init_params(k_init)
+    params = init_params(k_init, arch)
     if args.init:
         z = np.load(args.init)
-        loaded = {k: jnp.asarray(z[k]) for k in z.files}
+        # only the keys this network actually has: the npz also carries the
+        # architecture marker, and an unknown array in `params` would be handed
+        # to Adam and exported as if it were a weight
+        loaded = {k: jnp.asarray(z[k]) for k in z.files if k in params}
+        record = arch_of(z)          # its keys are exactly the arch_record entries
+        extra = [k for k in z.files if k not in params and k not in record]
         missing = [k for k in params if k not in loaded]
         params = {**params, **loaded}
-        print(f"warm started from {args.init}"
-              + (f" (missing {missing}, kept random)" if missing else ""))
+        print(f"warm started from {args.init} ({arch['layers']}x{arch['channels']}"
+              + (" residual" if arch["residual"] else "") + ")"
+              + (f" (missing {missing}, kept random)" if missing else "")
+              + (f" (ignored {extra})" if extra else ""))
     key, k_val = jr.split(key)
     params = add_value_head(params, k_val)
     anchor_full = {k: (v.copy() if hasattr(v, "copy") else v) for k, v in params.items()}
@@ -270,8 +277,7 @@ def main() -> None:
 
 def export(params, path: str) -> None:
     """Save only what the numpy policy loads — the value head stays behind."""
-    keep = {k: np.asarray(v) for k, v in params.items() if not k.startswith("val_")}
-    np.savez_compressed(path, **keep)
+    save({k: v for k, v in params.items() if not k.startswith("val_")}, path)
 
 
 if __name__ == "__main__":

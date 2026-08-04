@@ -38,6 +38,11 @@ def build(name: str, config: str | None) -> tuple[Path, Path]:
         shutil.copy2(src, stage / "bot" / src.name)
     for src in sorted((REPO / "bot" / "policy").glob("*.py")):
         shutil.copy2(src, stage / "bot" / "policy" / src.name)
+    # bot/weights.npz if it exists: bot/main.py plays the net when the file is
+    # there, so leaving it out of the zip silently ships the heuristic instead.
+    # Measured, a 10x128 checkpoint is 5 MB zipped against a 50 MB limit.
+    for src in sorted((REPO / "bot").glob("*.npz")):
+        shutil.copy2(src, stage / "bot" / src.name)
 
     if config:
         shutil.copy2(config, stage / "bot" / "config.json")

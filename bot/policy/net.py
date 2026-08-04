@@ -5,9 +5,21 @@ stay numpy-only, so the forward pass is implemented here rather than pulled in
 from a framework. Training happens elsewhere (JAX, on a GPU) and exports the
 same parameter names into a .npz.
 
-Sized to fit: 4 layers of 32 channels on a 21x21 board is about 14 million
-multiply-accumulates, a few milliseconds through BLAS even pinned to one thread.
-Anything much larger stops being safe inside the budget.
+The architecture is not assumed, it is DISCOVERED. A checkpoint describes itself
+twice over: the trunk key names give the wiring (`conv{i}` for a plain stack,
+`conv0` plus `res{i}a`/`res{i}b` pairs for a pre-activation residual stack) and
+the weight shapes give every width. Both must agree with the `layers` /
+`channels` / `residual` record written alongside them, otherwise loading fails.
+A tail-truncated trunk is invisible to the key scan and visible only to the
+recorded depth, which is why the depth is recorded. That redundancy is
+deliberate — the failure this module has already suffered once is a network that
+loads cleanly and computes nonsense, and a silently truncated trunk is exactly
+that failure: drop `conv4`/`conv5` from a 6-layer file and the head still
+matmuls, the logits still have the right shape, and the bot still plays.
+
+Measured single-core, 21x21, 12 input channels: 4x32 = 0.4 ms/move, 8x64 = 1.2,
+10x128 = 3.0. The 150 ms move budget is not what limits depth here — PPO rollout
+throughput is.
 """
 
 from __future__ import annotations
@@ -17,8 +29,84 @@ import numpy as np
 from bot import features, rules
 from bot.obs import Obs
 
-CHANNELS = 32
-LAYERS = 4
+# Only the starting point for a fresh `learn/train.py` run. Nothing at inference
+# time reads these: a loaded checkpoint always wins.
+DEFAULT_CHANNELS = 32
+DEFAULT_LAYERS = 4
+
+
+def trunk_keys(layers: int, residual: bool) -> list[str]:
+    """Trunk parameter prefixes, in evaluation order.
+
+    Plain: `conv0..conv{L-1}`, each conv+relu. Residual: `conv0` is the stem and
+    the remaining layers pair into pre-activation blocks, so the count must be
+    odd — a leftover half-block would have to be wired as something other than a
+    block, and a trunk with two wirings is a trunk nobody can load blind.
+    """
+    if layers < 1:
+        raise ValueError(f"layers must be >= 1, got {layers}")
+    if not residual:
+        return [f"conv{i}" for i in range(layers)]
+    if layers < 3 or layers % 2 == 0:
+        raise ValueError(
+            f"--residual needs an odd layer count >= 3 (1 stem + 2 per block), got {layers}")
+    return ["conv0"] + [f"res{i}{ab}" for i in range((layers - 1) // 2) for ab in "ab"]
+
+
+def _run_length(files: set[str], pat: str) -> int:
+    n = 0
+    while pat.format(n) in files:
+        n += 1
+    return n
+
+
+def arch_of(z) -> dict:
+    """`{'layers', 'channels', 'residual'}` from an npz or a parameter dict.
+
+    Everything suspicious raises. A gap in the numbering (`conv0,conv1,conv3`)
+    would otherwise be read as a 2-layer net and the rest ignored, which is the
+    truncation bug this module exists to make impossible.
+    """
+    files = set(getattr(z, "files", z))
+    convs = _run_length(files, "conv{}_w")
+    blocks = _run_length(files, "res{}a_w")
+    residual = blocks > 0
+    if not convs:
+        raise ValueError("no conv0_w: this is not a policy or value checkpoint")
+    stray = (sum(k.startswith("conv") and k.endswith("_w") for k in files) - convs
+             + sum(k.startswith("res") and k.endswith("_w") for k in files) - 2 * blocks)
+    if stray:
+        raise ValueError("trunk keys are not contiguous: "
+                         f"{sorted(k for k in files if k.endswith('_w'))}")
+    if residual and convs != 1:
+        raise ValueError(f"a residual trunk has exactly one stem conv, found {convs}")
+    # .shape, not np.asarray(...).shape: the trainers call this on dicts of jax
+    # tracers inside jit, where converting to numpy is an error
+    arch = {"layers": 1 + 2 * blocks if residual else convs,
+            "channels": int(z["conv0_w"].shape[0]),
+            "residual": residual}
+    # The key names cannot express a trunk truncated at the TAIL: drop conv4 and
+    # conv5 from a 6-layer file and the scan simply stops at conv3, reports a
+    # 4-layer net, and everything downstream still has valid shapes. The only
+    # defence is the saver writing down what it meant, so any marker present
+    # must agree — a disagreement is never a thing to guess about.
+    for k, v in arch.items():
+        if k in files and int(z[k]) != int(v):
+            raise ValueError(f"checkpoint says {k}={int(z[k])} but the trunk keys "
+                             f"say {k}={int(v)}; refusing to guess")
+    return arch
+
+
+def arch_record(params: dict) -> dict:
+    """Extra npz entries a saver must write so the file states its own wiring.
+
+    All three, not just `residual`: the key names recover the wiring and the
+    widths but not the depth the writer intended, so depth is the one the file
+    has to carry.
+    """
+    a = arch_of(params)
+    return {"residual": np.int8(a["residual"]), "layers": np.int16(a["layers"]),
+            "channels": np.int16(a["channels"])}
 
 
 def _conv3x3(x: np.ndarray, w: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -45,23 +133,42 @@ def _conv3x3(x: np.ndarray, w: np.ndarray, b: np.ndarray) -> np.ndarray:
     return (out + b[:, None]).reshape(cout, h, w_)
 
 
+def _trunk(x: np.ndarray, layers: list, residual: bool) -> np.ndarray:
+    """Shared body of both heads. Returns a relu'd (Cout, H, W) feature map."""
+    if not residual:
+        for w, b in layers:
+            x = _conv3x3(x, w, b)
+            np.maximum(x, 0.0, out=x)
+        return x
+    (w0, b0), rest = layers[0], layers[1:]
+    h = _conv3x3(x, w0, b0)
+    # Pre-activation: relu lives inside the block so the skip path stays linear
+    # all the way through, which is the whole reason deep stacks train.
+    for (wa, ba), (wb, bb) in zip(rest[0::2], rest[1::2]):
+        h = h + _conv3x3(np.maximum(_conv3x3(np.maximum(h, 0.0), wa, ba), 0.0), wb, bb)
+    return np.maximum(h, 0.0)
+
+
+def _load_trunk(z) -> tuple[list, dict]:
+    arch = arch_of(z)
+    layers = [(z[f"{n}_w"].astype(np.float32), z[f"{n}_b"].astype(np.float32))
+              for n in trunk_keys(arch["layers"], arch["residual"])]
+    return layers, arch
+
+
 class Net:
     """Loads exported weights and scores a board."""
 
     def __init__(self, path: str):
         z = np.load(path)
-        self.w = [z[f"conv{i}_w"].astype(np.float32) for i in range(LAYERS)]
-        self.b = [z[f"conv{i}_b"].astype(np.float32) for i in range(LAYERS)]
+        self.layers, self.arch = _load_trunk(z)
         self.head_w = z["head_w"].astype(np.float32)
         self.head_b = z["head_b"].astype(np.float32)
         self.pass_w = z["pass_w"].astype(np.float32)
         self.pass_b = float(z["pass_b"])
 
     def logits(self, obs: Obs) -> np.ndarray:
-        x = features.encode(obs)
-        for w, b in zip(self.w, self.b):
-            x = _conv3x3(x, w, b)
-            np.maximum(x, 0.0, out=x)
+        x = _trunk(features.encode(obs), self.layers, self.arch["residual"])
         move = _conv3x3(x, self.head_w, self.head_b)          # (8, H, W)
         # (H, W, 8) flattened must match features.action_to_index ordering
         flat = np.transpose(move, (1, 2, 0)).reshape(-1)
@@ -99,15 +206,11 @@ class ValueNet:
 
     def __init__(self, path: str):
         z = np.load(path)
-        self.w = [z[f"conv{i}_w"].astype(np.float32) for i in range(LAYERS)]
-        self.b = [z[f"conv{i}_b"].astype(np.float32) for i in range(LAYERS)]
+        self.layers, self.arch = _load_trunk(z)
         self.head_w = z["v_w"].astype(np.float32)
         self.head_b = float(z["v_b"])
 
     def win_prob(self, obs: Obs) -> float:
-        x = features.encode(obs)
-        for w, b in zip(self.w, self.b):
-            x = _conv3x3(x, w, b)
-            np.maximum(x, 0.0, out=x)
+        x = _trunk(features.encode(obs), self.layers, self.arch["residual"])
         logit = float(self.head_w @ x.mean(axis=(1, 2)) + self.head_b)
         return 1.0 / (1.0 + np.exp(-logit))

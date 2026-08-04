@@ -244,6 +244,90 @@ def test_numpy_conv_matches_the_training_conv():
         assert np.abs(got - ref).max() < 1e-4 * scale, f"conv mismatch at {cin}->{cout}"
 
 
+def test_a_checkpoint_states_its_own_architecture():
+    """Load a 6-layer file into a loader that assumes 4 and the extra layers are
+    silently dropped: the head still matmuls, the logits still have the right
+    shape, and the bot plays confident nonsense. So the loader assumes nothing,
+    and anything it cannot read unambiguously is an error."""
+    import tempfile
+    from pathlib import Path
+
+    from bot import features
+    from bot.obs import Obs
+    from bot.policy import net as npnet
+
+    rng = np.random.default_rng(0)
+
+    def weights(layers, ch, residual):
+        p, prev = {}, features.C
+        for n in npnet.trunk_keys(layers, residual):
+            p[f"{n}_w"] = (rng.normal(size=(ch, prev, 3, 3)) * 0.2).astype("f4")
+            p[f"{n}_b"] = (rng.normal(size=ch) * 0.2).astype("f4")
+            prev = ch
+        p["head_w"] = (rng.normal(size=(features.PER_CELL, ch, 3, 3)) * 0.2).astype("f4")
+        p["head_b"] = np.zeros(features.PER_CELL, "f4")
+        p["pass_w"] = np.zeros(ch, "f4")
+        p["pass_b"] = np.float32(0.0)
+        return p
+
+    ty = np.full((18, 18), rules.T_PLAIN, dtype=np.int8)
+    ty[0, 0] = rules.T_GENERAL
+    ow = np.zeros((18, 18), dtype=np.int8)
+    ow[0, 0] = rules.OWNER_ME
+    ar = np.zeros((18, 18), dtype=np.int32)
+    ar[0, 0] = 9
+    obs = Obs(H=18, W=18, turn=1, my_land=1, my_army=9, opp_land=1, opp_army=1,
+              type_grid=ty, owner_grid=ow, army_grid=ar)
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        for layers, ch, residual in ((4, 32, False), (6, 16, False), (5, 8, True)):
+            p = weights(layers, ch, residual)
+            np.savez(td / "w.npz", **p, **npnet.arch_record(p))
+            net = npnet.Net(str(td / "w.npz"))
+            assert net.arch == {"layers": layers, "channels": ch, "residual": residual}
+            assert net.logits(obs).shape == (features.N_ACTIONS,)
+
+        # a residual file whose keys were renamed into a plain stack has entirely
+        # valid shapes; only the marker says it would compute the wrong thing
+        p = weights(5, 8, True)
+        renamed = {"conv0_w": p["conv0_w"], "conv0_b": p["conv0_b"], "residual": np.int8(1)}
+        for i, n in enumerate(["res0a", "res0b", "res1a", "res1b"], start=1):
+            renamed[f"conv{i}_w"], renamed[f"conv{i}_b"] = p[f"{n}_w"], p[f"{n}_b"]
+        renamed.update({k: p[k] for k in ("head_w", "head_b", "pass_w", "pass_b")})
+        np.savez(td / "renamed.npz", **renamed)
+
+        # and a gap in the numbering is a truncated file, not a shallow network
+        p = weights(4, 32, False)
+        gap = {k: v for k, v in p.items() if k not in ("conv2_w", "conv2_b")}
+        gap["conv4_w"], gap["conv4_b"] = p["conv2_w"], p["conv2_b"]
+        np.savez(td / "gap.npz", **gap)
+
+        # Truncated at the TAIL, which no key name can betray: the scan just
+        # stops at conv3 and reports a 4-layer net that loads and plays. Only
+        # the recorded depth catches it, which is why the depth is recorded.
+        p = weights(6, 16, False)
+        rec = npnet.arch_record(p)
+        cut = {k: v for k, v in p.items()
+               if k not in ("conv4_w", "conv4_b", "conv5_w", "conv5_b")}
+        np.savez(td / "tail.npz", **cut, **rec)
+        # the same file WITHOUT the record is the failure this test exists for:
+        # it must read back as something other than the 6 layers it was
+        assert npnet.arch_of(cut)["layers"] == 4, "the key scan should not see a tail cut"
+        # residual too: a block pair removed is still an odd, loadable count
+        p = weights(7, 16, True)
+        rec = npnet.arch_record(p)
+        cut = {k: v for k, v in p.items() if not k.startswith("res2")}
+        np.savez(td / "tailres.npz", **cut, **rec)
+
+        for name in ("renamed.npz", "gap.npz", "tail.npz", "tailres.npz"):
+            try:
+                npnet.Net(str(td / name))
+                raise AssertionError(f"{name} loaded instead of raising")
+            except ValueError:
+                pass
+
+
 def main() -> None:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
