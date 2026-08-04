@@ -39,6 +39,7 @@ imitate the heuristic will not exceed it by self-play either.
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -145,6 +146,14 @@ def main() -> None:
             if n % 50 == 0:
                 print(f"  {n}/{args.games} games, {total + buffered} labels", flush=True)
     flush()
+
+    # Stamp the encoding these shards were built under. Without it a dataset
+    # built before the action space widened trains cleanly against the new one,
+    # with every label off by the reindexing -- learn/train.py checks this file
+    # and only warns when it is absent.
+    (out / "meta.json").write_text(json.dumps(
+        {"n_actions": features.N_ACTIONS, "channels": features.C,
+         "teacher": args.spec, "games": args.games, "labels": total}, indent=2) + "\n")
 
     print(f"\n{total} labels from {args.games} games of {args.spec} -> {out}")
     print(f"  {shard} shards; label noise is ZERO by construction (the teacher "
