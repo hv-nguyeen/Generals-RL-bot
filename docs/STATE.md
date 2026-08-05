@@ -127,31 +127,36 @@ noise and it is +59.5 in the arena; the instrument was too blunt to see it.
 
 ## Next, in order
 
-**1. Measure the guard against an opponent that punishes.** The mirror A/B is
-done and says nothing:
+**1. The guard is neutral, measured three ways. Stop crediting it.**
 
 ```
-guard:sp8.best vs clone:sp8.best   2000 games   0.507   +4.7  [-10.3, +19.7]   faults 0
+guard vs clone (mirror)   0.507   +4.7  [-10.3, +19.7]
+guard vs hunter           0.979   1956W 3D 41L
+clone vs hunter           0.979   1957W 3D 40L
 ```
 
-Neutral to within +-15 Elo, so the guard is NOT what sank nn6 on the ladder.
-But this is the weakest possible test of it. The guard vetoes one thing — the
-net emptying its own general with an enemy stack within 3 steps — and `clone:`
-on identical weights has to *convert* that blunder for the veto to score.
-`bot/policy/net.py:216` already says the local gauntlet cannot: none of our
-opponents punish the mistakes the field punishes. A mirror is the worst case,
-because both seats make the same blunder and neither exploits it.
+One game in 2000 between wrapped and raw. It is not what sank nn6, and it is
+not an improvement either. Keep it — win-in-one and deathtouch are rules-exact
+and cost 0.1 ms — but it is not an Elo source and no further tuning of the veto
+radius is worth a run until something can measure it.
 
-`hunter` is the only opponent we have that goes for the general. Run both and
-take the gap; that number is the guard's value, and the 0.507 above is not.
+`arena/runner.py` now prints A's mode histogram, so **the next run of the above
+answers whether the veto ever fires at all.** Near-zero `guard-veto` means the
+trigger is too tight; a large count with 0.507 means the veto is real and
+worthless. Those want opposite fixes and nothing before today could tell them
+apart.
 
-```
-$PY -m arena.runner --a guard:runs/nn/sp8.best.npz --b hunter --games 2000 --workers 32
-$PY -m arena.runner --a clone:runs/nn/sp8.best.npz --b hunter --games 2000 --workers 32
-```
+**HUNTER IS SATURATED AT 0.979 — do not put it in a gauntlet.** It loses to
+everything we have, so it scores every checkpoint the same and spends games to
+say nothing. This is the trap the multi-opponent comp-eval was built to expose,
+and it caught its first opponent before the first run.
 
-First check it ever fires. If the veto count is ~0 over 2000 games, 0.507 is
-explained trivially and the veto radius/ratio is too tight to matter.
+The bitter part: the opponents that discriminate are `v16` (0.733) and our own
+checkpoints (sp8 vs sp3 = 0.585). **Diversity is capped by strength.** A
+stylistically different opponent that cannot survive contact measures nothing,
+so the useful gauntlet is v16 plus the lineage, which is exactly the correlated
+instrument the first rule warns about. There is no local escape from this; the
+ladder is the only opponent set that is both strong and different.
 
 **2. Decide what the ladder is measuring.** nn6 (sp5 + guard) is underperforming
 against an arena that predicted +32.2 over sp3. Get `n` first. If it is real,
