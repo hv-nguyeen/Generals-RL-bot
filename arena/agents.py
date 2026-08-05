@@ -11,6 +11,9 @@ A spec is a string so runs are reproducible from a command line:
     idle                     always passes
     clone:weights.npz        a behaviour-cloned policy (learn/train.py)
     guard:weights.npz        the same policy under bot/policy/guard.py's overrides
+    snipe:weights.npz        that policy, but a stack over 30 marches at the enemy
+                             general — the decapitating opponent our lineage lacks
+    snipe:weights.npz@40     same, with the stack threshold set explicitly
     stdio:dist/x/run.sh      a packaged submission, over the real wire protocol
 
 `guard:` against `clone:` on the same weights is the only way to measure the
@@ -213,6 +216,95 @@ class Hunter:
         return (0, i // w, i % w, int(dirn[i]), 1 if do_feed else 0)
 
 
+class Sniper:
+    """A strong net for economy, with `hunter`'s decapitation bolted on.
+
+    THE INSTRUMENT WE DID NOT HAVE. Ladder forensics on the ten shortest losses:
+    at the tick our general is emptied, hidden enemy army exceeds our garrison in
+    10 of 10 (by 1.2x to 7.7x) while the VISIBLE threat within 3 tiles is ~0 in 9
+    of 10. The killer arrives 7-36 turns later. We lose to army we cannot see.
+
+    Nothing in our lineage plays that way. Every clone descends from the same
+    behaviour-cloned policy, none of them stockpile and snipe, so any change that
+    fixes decapitation reads ~0.500 in the arena and ~0 in comp-eval. The fix was
+    unmeasurable, not absent -- which is also why `bot/policy/guard.py` scored
+    neutral over 2000 games.
+
+    `hunter` does the right thing and is saturated at 0.979 because it is bad at
+    everything else, so it discriminates nothing. This is the missing combination:
+    the net plays the game, and once a stack passes `STACK_MIN` that stack marches
+    at the enemy general and nothing distracts it.
+
+    Deliberately NOT a submission and it lives here rather than in `bot/`: it is
+    an opponent, and `bot/` must stay self-contained.
+    """
+
+    STACK_MIN = 30
+
+    def __init__(self, player_id: int, h: int, w: int, weights: str,
+                 stack_min: int | None = None):
+        from bot.policy.net import ClonePolicy
+        self.inner = ClonePolicy(player_id, h, w, weights)
+        self.H, self.W = h, w
+        self.stack_min = self.STACK_MIN if stack_min is None else stack_min
+        self.last_debug: dict = {}
+
+    def act(self, obs: Obs, deadline=None):
+        ty, ow, a = obs.type_grid, obs.owner_grid, obs.army_grid
+        mine = ow == rules.OWNER_ME
+        generals = ty == rules.T_GENERAL
+        castles = ty == rules.T_CASTLE
+        passable = ~((ty == rules.T_MOUNTAIN) | (ty == rules.T_STRUCTURE_IN_FOG)
+                     | (castles & ~mine))
+
+        # The strike stack is the biggest army NOT sitting on our own general:
+        # emptying our own general to attack is the mistake we are trying to
+        # punish, not commit.
+        strike = mine & ~generals & (a >= self.stack_min)
+        if strike.any():
+            gen = mine & generals
+            from_gen = bfs_field(passable, gen) if gen.any() else None
+            egen = (ow == rules.OWNER_OPP) & generals
+            if egen.any():
+                goal = egen
+            elif from_gen is not None:
+                # Their general is in fog. Walk at the far side of the map: that
+                # is where it is, and it keeps the stack out of our own territory
+                # where it would be visible early.
+                #
+                # `reach` comes from the OBSERVATION, not from self.H/self.W:
+                # boards are 18-21 rectangles, `bfs_field` marks unreachable as
+                # obs.H * obs.W, and bounding by the padded 21*21 let unreachable
+                # tiles through — the goal became a cell with no path, no
+                # neighbour ever improved, and the march silently never happened.
+                reach = obs.H * obs.W
+                far = (ty == rules.T_FOG) & passable & (from_gen < reach)
+                if not far.any():
+                    far = passable & ~mine & (from_gen < reach)
+                goal = far & (from_gen == np.max(np.where(far, from_gen, -1))) if far.any() else None
+            else:
+                goal = None
+
+            if goal is not None and goal.any():
+                to_goal = bfs_field(passable, goal)
+                r, c = np.unravel_index(int(np.argmax(np.where(strike, a, -1))), a.shape)
+                r, c = int(r), int(c)
+                best, bestd = None, int(to_goal[r, c])
+                for d, (dr, dc) in enumerate(DIRECTIONS):
+                    nr, nc = r + dr, c + dc
+                    if not (0 <= nr < obs.H and 0 <= nc < obs.W) or not passable[nr, nc]:
+                        continue
+                    if int(to_goal[nr, nc]) < bestd:
+                        bestd, best = int(to_goal[nr, nc]), (0, r, c, d, 0)
+                if best is not None:
+                    self.last_debug = {"mode": "snipe", "turn": obs.turn}
+                    return best
+
+        act = self.inner.act(obs, deadline)
+        self.last_debug = {"mode": "net", "turn": obs.turn}
+        return act
+
+
 class RandomAgent:
     def __init__(self, player_id: int, h: int, w: int, seed: int = 0):
         self.rng = _random.Random(seed * 7919 + player_id)
@@ -254,6 +346,10 @@ def make(spec: str, player_id: int, h: int, w: int, seed: int = 0):
     if name == "clone":
         from bot.policy.net import ClonePolicy
         return ClonePolicy(player_id, h, w, arg)
+    if name == "snipe":
+        # `snipe:weights.npz` or `snipe:weights.npz@40` to set the stack size.
+        path, _, k = arg.partition("@")
+        return Sniper(player_id, h, w, path, int(k) if k else None)
     if name == "guard":
         from bot.policy.guard import GuardedPolicy
         from bot.policy.net import ClonePolicy
