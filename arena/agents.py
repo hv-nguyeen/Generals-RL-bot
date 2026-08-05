@@ -11,9 +11,11 @@ A spec is a string so runs are reproducible from a command line:
     idle                     always passes
     clone:weights.npz        a behaviour-cloned policy (learn/train.py)
     guard:weights.npz        the same policy under bot/policy/guard.py's overrides
-    snipe:weights.npz        that policy, but a stack over 30 marches at the enemy
-                             general — the decapitating opponent our lineage lacks
-    snipe:weights.npz@40     same, with the stack threshold set explicitly
+    snipe:weights.npz        that policy, but a big stack marches at the enemy
+                             general — the decapitating opponent our lineage
+                             lacks. The commit threshold is RANDOM per game so a
+                             trainee cannot learn its clock, only the rule
+    snipe:weights.npz@120    threshold pinned, for a reproducible measurement
     stdio:dist/x/run.sh      a packaged submission, over the real wire protocol
 
 `guard:` against `clone:` on the same weights is the only way to measure the
@@ -254,15 +256,32 @@ class Sniper:
     # indistinguishable -- the value of this opponent is its STYLE, not its Elo.
     STACK_MIN = 120
 
+    # Sampled per game when the threshold is not pinned. A FIXED threshold is a
+    # clock, and a policy trained against a clock learns the clock: "he commits
+    # around turn 250, garrison then". That is the overfitting objection to any
+    # scripted opponent and it is fatal for training. Randomised, the only stable
+    # thing to learn is the RULE -- keep army home in proportion to enemy army
+    # you cannot see -- which is what transfers to the ladder.
+    STACK_RANGE = (60, 200)
+
     def __init__(self, player_id: int, h: int, w: int, weights: str,
-                 stack_min: int | None = None):
+                 stack_min: int | None = None, seed: int = 0):
+        from bot.belief import Belief
         from bot.policy.net import ClonePolicy
         self.inner = ClonePolicy(player_id, h, w, weights)
         self.H, self.W = h, w
-        self.stack_min = self.STACK_MIN if stack_min is None else stack_min
+        if stack_min is not None:
+            self.stack_min = stack_min
+        else:
+            lo, hi = self.STACK_RANGE
+            self.stack_min = int(_random.Random(seed * 6151 + player_id).uniform(lo, hi))
+        # The enemy general is fogged almost always. Marching at the farthest fog
+        # is a wander; `Belief` keeps an actual prior, and no net policy uses it.
+        self.belief = Belief(player_id, h, w)
         self.last_debug: dict = {}
 
     def act(self, obs: Obs, deadline=None):
+        self.belief.update(obs)
         ty, ow, a = obs.type_grid, obs.owner_grid, obs.army_grid
         mine = ow == rules.OWNER_ME
         generals = ty == rules.T_GENERAL
@@ -278,8 +297,14 @@ class Sniper:
             gen = mine & generals
             from_gen = bfs_field(passable, gen) if gen.any() else None
             egen = (ow == rules.OWNER_OPP) & generals
+            guess = self.belief.general_guess
             if egen.any():
                 goal = egen
+            elif guess is not None and passable[guess]:
+                # The prior, not the farthest fog. This is the difference between
+                # a strike and a tourist.
+                goal = np.zeros_like(mine)
+                goal[guess] = True
             elif from_gen is not None:
                 # Their general is in fog. Walk at the far side of the map: that
                 # is where it is, and it keeps the stack out of our own territory
@@ -360,9 +385,10 @@ def make(spec: str, player_id: int, h: int, w: int, seed: int = 0):
         from bot.policy.net import ClonePolicy
         return ClonePolicy(player_id, h, w, arg)
     if name == "snipe":
-        # `snipe:weights.npz` or `snipe:weights.npz@40` to set the stack size.
+        # `snipe:weights.npz` randomises the commit threshold per game; append
+        # `@120` to pin it, which is what a reproducible measurement wants.
         path, _, k = arg.partition("@")
-        return Sniper(player_id, h, w, path, int(k) if k else None)
+        return Sniper(player_id, h, w, path, int(k) if k else None, seed)
     if name == "guard":
         from bot.policy.guard import GuardedPolicy
         from bot.policy.net import ClonePolicy
