@@ -1,8 +1,18 @@
 # generals.bot competition bot
 
 A bot for the [generals.bot](https://www.generals.bot) 1v1 competition, plus the
-arena and analysis tooling to make it better. Heuristic today; the policy sits
-behind a single `act(obs) -> action` seam so an RL policy can drop in later.
+arena and analysis tooling to make it better.
+
+**The submission is a neural policy**, not the heuristic — 8 layers, 32 channels,
+~74k parameters, trained by curriculum self-play PPO. The heuristic is still in
+`bot/policy/controller.py` and still runs as a fallback and as a benchmark
+opponent (`ours:configs/v16.json`), but it has been retired as a submission: it
+peaked around 1737 Elo and the net is ~130 above it.
+
+**Read [`docs/STATE.md`](docs/STATE.md) first.** It is the current standing, what
+is running, what to do next, and the measured non-starters; this README is the
+map of the tooling. [`docs/CLUSTER.md`](docs/CLUSTER.md) is how to run anything on
+the VU box. [`docs/ml-log.md`](docs/ml-log.md) is the full measured history.
 
 Design and rules analysis: [`docs/superpowers/specs/2026-08-03-generals-bot-design.md`](docs/superpowers/specs/2026-08-03-generals-bot-design.md).
 
@@ -64,45 +74,33 @@ lost match into a change.
 
 ## Running on the university server
 
-Nothing in the repo is machine-specific. `.venv/`, `runs/` and `dist/` are
-gitignored, so copy the tracked tree and rebuild the venv there.
+**[`docs/CLUSTER.md`](docs/CLUSTER.md) is the procedure** — jump host, node
+mapping, the environment exports and why each exists, the missing tools and their
+replacements, and a failure-symptom table. What follows is only what the rest of
+this README would otherwise imply and get wrong.
 
-```bash
-# from the laptop (~13 MB, most of it the vendored starter kit)
-rsync -az --exclude .venv --exclude runs --exclude dist --exclude __pycache__ \
-    ~/VU/NewGame/ user@server:~/generals-bot/
+`make setup` installs **numpy only**, because `bot/` is numpy-only by design. The
+training stack (jax + CUDA, ~5.5 GB) is not in it; CLUSTER.md has the pinned
+install and the node-to-node fallback for a box with no outbound network.
 
-# on the server
-cd ~/generals-bot
-make setup          # uses uv if present, otherwise python3 -m venv
-make test           # 15 tests, ~10 s — proves the rules model survived the trip
-make bench          # 40 games vs greedy, ~10 s
-```
+Two facts that cost hours to rediscover:
 
-`make verify` additionally needs jax (`.venv/bin/python -m pip install 'jax[cpu]'`).
-It is optional: it diffs the simulator against the official engine, so run it
-after touching `sim/engine.py`, not on every box.
+* **JupyterHub is not the compute node.** Same paths, same prompt, different
+  machine and a different `$HOME`, and some Hub containers expose a single CPU —
+  `nproc` before choosing `--workers`.
+* **`/local/data` is per-node and nothing syncs it.** `$HOME` is shared. A
+  head-to-head needs both checkpoints on one node.
 
 `WORKERS` defaults to cores−2 and every tool takes `--workers`. The arena scales
-close to linearly — 300 games take ~30 s on 10 cores, so a 64-core box does a
-2,000-game gauntlet in about a minute.
-
-```bash
-# detached, resumable, survives a disconnect
-make tune-big OUT=runs/tune-a GROUPS=opening,castle
-tail -f runs/tune-a.log
-
-# it checkpoints every iteration; after a kill just run the same command again
-```
-
-Then bring the result back and confirm it on the laptop, or confirm it there:
-
-```bash
-python -m arena.runner --a ours:runs/tune-a/best.json --b ours --games 800 --workers 60
-```
+close to linearly: 2000 games in ~85 s on 32 real cores.
 
 Reports and replays are plain HTML with everything inlined, so
 `scp -r runs/<run>/ .` and open them locally — no server or X forwarding needed.
+
+Note `make tune-big` (CEM over the heuristic's knobs) is a **measured
+non-starter** — PSRO best-response to the archive scored 0.522 ± 0.013 and the
+~100-knob space is exhausted. It is kept because it produced `configs/v16.json`,
+which is still the strongest non-neural opponent in the gauntlet.
 
 ## What the bot knows that a ported generals.io bot does not
 
@@ -131,23 +129,44 @@ Read out of the engine source, not the rules page:
 
 ```
 bot/            the submission. numpy only, self-contained
-  policy/       controller (modes + scored moves), analysis, castle siting
-  belief.py     terrain, fog memory, enemy-castle detection, general prior
+  policy/net.py   THE BOT: conv net, argmax over masked logits
+  policy/guard.py win-in-one and deathtouch overrides on top of the net
+  policy/        controller (the heuristic fallback), analysis, castle siting
+  features.py   board -> 24 channels; the ONE encoder, shared with training
+  belief.py     terrain, fog memory, enemy-castle detection, general prior.
+                Used by the heuristic; the net does NOT see these maps
   config.py     every tunable in one dataclass; flattens to a vector for tuning
 sim/            exact numpy mirror of the competition transition + map generator
+learn/          the training stack (jax). selfplay is the one that produced the
+                shipped policy; train/ is behaviour cloning, exploit/ an exploiter
 arena/          parallel headless matches, agent registry, Elo + SPRT, stdio agent
 analysis/       replays, per-game stats, loss classifier, HTML viewer and report
-tools/          sweep, tune (CEM), verify_engine, package, profile_turn
+tools/          grow (migrate a checkpoint), vprobe (ask the critic), package,
+                verify_engine, sweep, tune (CEM), profile_turn
 third_party/    the official starter kit, for the differential test
 ```
 
+`bot/` may not import `sim/`, `arena/` or `learn/` — it is what gets uploaded.
+
 ### How the bot decides
 
-Two tiers. **Hard overrides** first: a move that wins outright, the deathtouch
-guard, and the castle build — none of these are trade-offs. Then **scored move
-generation**: every legal move gets a 15-feature vector dotted with the weight
-block of the current mode. Multi-turn coherence comes from precomputed distance
-fields, so a greedy pick per turn still executes a coherent multi-turn march.
+**The submitted bot** is `bot/policy/net.py` — argmax over masked logits from a
+conv net, wrapped in `bot/policy/guard.py` for win-in-one and deathtouch. That is
+the whole decision procedure. `bot/main.py` ships the net when `bot/weights.npz`
+is present and falls back to the heuristic otherwise, printing to stderr; the
+packaging step deletes that file afterwards so the next build cannot silently
+ship a stale net.
+
+Note the guard's third override, the garrison veto, fires on about 0.2% of turns
+and measures neutral — see docs/STATE.md. Five hand-written overrides have now
+been measured against this policy and none has helped.
+
+**The heuristic below is the fallback and the benchmark opponent**, not the
+submission. Two tiers. Hard overrides first: a move that wins outright, the
+deathtouch guard, and the castle build. Then scored move generation: every legal
+move gets a 15-feature vector dotted with the weight block of the current mode.
+Multi-turn coherence comes from precomputed distance fields, so a greedy pick per
+turn still executes a coherent multi-turn march.
 
 Mode selection is the strategy layer:
 
@@ -185,11 +204,18 @@ them as `bot/config.json`, which `bot/main.py` picks up automatically.
 
 ## Current standing
 
-Against `greedy` (a competent flood-fill expander — a fair proxy for the median
-entrant, and much stronger than the starter kit's `expander`, which deadlocks on
-corner spawns): **271W 17D 12L over 300 games, score 0.932**. Mean move time
-1.0 ms against a 150 ms budget, zero faults.
+**See [`docs/STATE.md`](docs/STATE.md)** — it is updated per result and this
+section would only go stale. As of 2026-08-05: a neural policy on the ladder
+around rank 23 of 90, roughly +137 Elo of arena-measured improvement over the
+checkpoint that read 1849 there.
 
-The known weakness is the land race: at turn 200 we hold ~76 tiles to greedy's
-~112 and win on castle economy instead. Closing that is the highest-value work
-left, and `tools/sweep.py` over the `expand` weight block is where to start.
+Two things worth knowing before running anything:
+
+**Local numbers disagree with the ladder, repeatedly.** Eleven local instruments
+have, always in the same direction. No single fixed opponent measures general
+strength however strong it is — benchmark against several, and treat a 400-game
+result as a shortlist rather than a verdict. 2000 games costs ~85 seconds.
+
+**The submission's weights are not in this repo.** They live on the cluster under
+`runs/nn/`, and `bot/weights.npz` is deleted after packaging on purpose. A clean
+checkout therefore runs the heuristic — that is the intended state, not a bug.

@@ -42,13 +42,30 @@ def summary(wins: int, draws: int, losses: int) -> dict:
 def llr(wins: int, draws: int, losses: int, elo0: float, elo1: float) -> float:
     """Log-likelihood ratio for H1(elo1) against H0(elo0), 3-outcome model."""
     n = wins + draws + losses
-    if n == 0 or wins == 0 or losses == 0:
+    if n == 0:
         return 0.0
     w, d = wins / n, draws / n
     score = w + d / 2.0
     var = w + d / 4.0 - score * score
-    if var <= 0:
-        return 0.0
+    if wins == 0 or losses == 0 or var <= 0:
+        # The normal approximation needs BOTH outcomes present: it divides by the
+        # sample variance, which goes to zero in a shutout and makes the ratio
+        # explode. 39W-1D-0L read llr 54 that way -- "overwhelming", from a
+        # variance of 0.006.
+        #
+        # Returning 0.0 instead, as this did until 2026-08-05, is the opposite
+        # error: a 40-0 sweep produced no SPRT evidence at all.
+        #
+        # Count exactly instead. Each decisive game is one log-odds increment
+        # between the hypotheses, and the honest answer for 40-0 against
+        # H1 = 12 Elo is llr ~1.3 -- because 12 Elo predicts a 51.7% win rate,
+        # under which a sweep is nearly as surprising as it is under 50%. A
+        # shutout says the opponent is much weaker; it says little about whether
+        # the edge is 12 Elo or 500.
+        s0, s1 = elo_to_score(elo0), elo_to_score(elo1)
+        s0 = min(max(s0, 1e-9), 1.0 - 1e-9)
+        s1 = min(max(s1, 1e-9), 1.0 - 1e-9)
+        return wins * math.log(s1 / s0) + losses * math.log((1.0 - s1) / (1.0 - s0))
     s0, s1 = elo_to_score(elo0), elo_to_score(elo1)
     return n * (s1 - s0) * (2.0 * score - s0 - s1) / (2.0 * var)
 
