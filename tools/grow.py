@@ -95,15 +95,34 @@ def grow(z, layers: int, channels: int, seed: int = 0) -> dict:
         out[f"conv{j}_w"] = w
         out[f"conv{j}_b"] = np.zeros((channels,), np.float32)
 
-    hw, hb = z["head_w"], z["head_b"]
-    nhw = np.zeros((hw.shape[0], channels, 3, 3), np.float32)
-    nhw[:, :hw.shape[1]] = hw                      # new channels contribute 0
-    out["head_w"], out["head_b"] = nhw, np.asarray(hb, np.float32)
+    # A CRITIC has the same trunk and a scalar head -- `v_w`/`v_b`, no `head_w`,
+    # no `pass_w`. Reading those unconditionally meant `--init-critic` could not
+    # cross an encoder change at all: the policy migrated, the critic raised
+    # KeyError, and the run fell back to a blank critic at exactly the stage
+    # where three runs died of one. Every head is optional and padded the same
+    # way, with the new channels at zero so they contribute nothing.
+    files = set(getattr(z, "files", z))
+    if "head_w" in files:
+        hw, hb = z["head_w"], z["head_b"]
+        nhw = np.zeros((hw.shape[0], channels, 3, 3), np.float32)
+        nhw[:, :hw.shape[1]] = hw
+        out["head_w"], out["head_b"] = nhw, np.asarray(hb, np.float32)
 
-    pw = np.asarray(z["pass_w"], np.float32)
-    npw = np.zeros((channels,), np.float32)
-    npw[:pw.shape[0]] = pw
-    out["pass_w"], out["pass_b"] = npw, np.asarray(z["pass_b"], np.float32)
+    if "pass_w" in files:
+        pw = np.asarray(z["pass_w"], np.float32)
+        npw = np.zeros((channels,), np.float32)
+        npw[:pw.shape[0]] = pw
+        out["pass_w"], out["pass_b"] = npw, np.asarray(z["pass_b"], np.float32)
+
+    if "v_w" in files:
+        vw = np.asarray(z["v_w"], np.float32)
+        nvw = np.zeros((channels,) + vw.shape[1:], np.float32)
+        nvw[:vw.shape[0]] = vw
+        out["v_w"], out["v_b"] = nvw, np.asarray(z["v_b"], np.float32)
+
+    if not ({"head_w", "v_w"} & files):
+        raise SystemExit(f"{'/'.join(sorted(files)[:6])}...: no head_w and no "
+                         f"v_w -- this is neither a policy nor a critic")
 
     # Carry anything else verbatim EXCEPT the arch record, which describes the
     # net we just stopped being. `arch_of` cross-checks that metadata against the
@@ -111,8 +130,9 @@ def grow(z, layers: int, channels: int, seed: int = 0) -> dict:
     # the right behaviour, and is how this bug surfaced instead of shipping a
     # checkpoint that claimed to be 8x32 while being 12x64.
     stale = set(arch_record(out))
-    for k in z.files:
-        if k not in out and k not in stale and not k.startswith(("conv", "head", "pass")):
+    for k in files:
+        if (k not in out and k not in stale
+                and not k.startswith(("conv", "head", "pass", "v_"))):
             out[k] = z[k]
     out.update(arch_record(out))
     return out
@@ -156,6 +176,12 @@ def main() -> None:
     ap.add_argument("--channels", type=int)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--verify-games", type=int, default=12)
+    ap.add_argument("--prefix", default=None, metavar="phi",
+                    help="migrate the arrays under this prefix instead of the "
+                         "whole file, and write them back under it. The critic "
+                         "lives in a run's .resume.npz as phi__*, so "
+                         "`--prefix phi` is what makes --init-critic survive an "
+                         "encoder change")
     ap.add_argument("--selfcheck", action="store_true")
     args = ap.parse_args()
 
@@ -165,12 +191,22 @@ def main() -> None:
     if not (args.net and args.out and args.layers and args.channels):
         raise SystemExit("need --net --out --layers --channels (or --selfcheck)")
 
-    z = np.load(args.net)
+    src = np.load(args.net)
+    z = {k[len(args.prefix) + 2:]: src[k] for k in src.files
+         if k.startswith(args.prefix + "__")} if args.prefix else src
+    if args.prefix and not z:
+        raise SystemExit(f"{args.net} has no {args.prefix}__* arrays")
     before = arch_of(z)
     grown = grow(z, args.layers, args.channels, args.seed)
     tmp = Path(args.out)
-    np.savez(tmp, **grown)
-    after = arch_of(np.load(tmp))
+    if args.prefix:
+        # Written back under the prefix so `--init-critic` can read it, and
+        # ALONE -- a resume file also carries theta/optimiser moments at the old
+        # width, and half-migrating those would resume a run into shape errors.
+        np.savez(tmp, **{f"{args.prefix}__{k}": v for k, v in grown.items()})
+    else:
+        np.savez(tmp, **grown)
+    after = arch_of(grown)
 
     n_before = sum(v.size for k, v in z.items() if k.endswith(("_w", "_b")))
     n_after = sum(v.size for k, v in grown.items() if k.endswith(("_w", "_b")))
@@ -178,8 +214,11 @@ def main() -> None:
           f"{after['layers']}x{after['channels']} ({n_after} params, "
           f"{n_after / max(n_before, 1):.1f}x)")
 
-    stem_in = int(np.load(args.net)[f"{trunk_keys(before['layers'], False)[0]}_w"].shape[1])
-    if stem_in < features.C:
+    stem_in = int(np.shape(z[f"{trunk_keys(before['layers'], False)[0]}_w"])[1])
+    if args.prefix:
+        print(f"migrated {len(grown)} arrays under {args.prefix}__ "
+              f"(stem input {stem_in} -> {features.C}); pass this to --init-critic")
+    elif stem_in < features.C:
         # The parent cannot be LOADED under the current encoder -- `Net.__init__`
         # rejects a stem of the wrong width, on purpose -- so the play-based
         # check cannot run. The guarantee is structural instead: the new input
