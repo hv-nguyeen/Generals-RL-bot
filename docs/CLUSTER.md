@@ -26,9 +26,34 @@ processes on one L4 OOM at ~22 GB, and the second one dies with
 visible from all of them. `/local/data/vng205` is NOT — each node has its own,
 and the two clusters have identical paths with different contents.
 
+## JupyterHub is not the compute node
+
+The Hub terminal runs in a container with its OWN `/home/vng205`, and it is not
+necessarily on the node your job is on. Same prompt, same paths, different
+machine. Always start there with:
+
+```bash
+uname -n
+```
+
+```bash
+ls /local/data/vng205/generals-bot/runs/nn/
+```
+
+If the log you are looking for is absent, you are on the wrong node — SSH in
+instead. Logs and `runs/` only exist where the job was launched.
+
+Two more consequences. A job started over SSH is not the Hub shell's child, so
+`kill %1` and `jobs` cannot see it; use the `/proc` scan below. And a Hub session
+that has touched JAX holds GPU memory that `nvidia-smi` reports with **"No
+running processes found"**, because it cannot see across containers — so do not
+train from the Hub, and stop the server when a node looks mysteriously full.
+
 ## Install a tarball
 
-Upload to home (JupyterHub, or scp with the jump host), then:
+Upload to home (JupyterHub, or scp with the jump host). If you used the Hub,
+`ls ~` from the SSH shell FIRST and confirm the file is actually there — the two
+homes are not guaranteed to be the same one. Then:
 
 ```bash
 ls -lh ~/generals-bot-YYYYMMDD-HHMM.tar.gz
