@@ -1,42 +1,132 @@
-# Where the project is — 2026-08-05
+# Where the project is — 2026-08-06
 
 `docs/ml-log.md` is the full measured history and it is long. This file is the
 short version: what is true right now, what is running, and what to do next.
 Read this first, then the log for the reasoning behind any line, and
 `docs/CLUSTER.md` for how to install and run anything on the VU box.
 
-## Standing
+## START HERE
 
-**1808 Elo, rank 24/89.** A neural policy, not the heuristic.
+Two runs are live and they are a **matched pair with one variable**:
 
-```
-neural, best reading       1849   rank 21/86   n=36
-neural, current            1808   rank 24/89   n=30
-v13 heuristic, best        1737   n=102
-v18 heuristic              1587   n=90
+```bash
+grep "^comp-eval" runs/nn/sp17.log | tail -n 3          # 24 channels
+grep "^comp-eval" /local/data/vng205/c20/generals-bot/runs/nn/sp18.log | tail -n 3   # 20, control
 ```
 
-The heuristic is retired as a submission. It survives as an opponent, a
-calibration point, and the source of `configs/v16.json`.
+Compare the `sp9-i600` column in each. At iteration 100 it read **0.56 for sp17
+and 0.46 for sp18**, from an identical 0.50 start. ~1.7 se, so the arena decides:
+migrate sp18's best to 24 channels with `tools.grow` and run 2000 games.
 
-**1865 Elo, rank 23/90, 18W-17L-1D over 36 games** (2026-08-05). The best
-reading the project has had. The *early* reading of that same run looked bad and
-was noise — the ±58-at-n=36 rule caught exactly the mistake it exists to catch,
-so do not react to a ladder number before `n` is real.
+Then, in order: the critic pretraining below, and the ladder.
 
-**WHICH BUILD THESE 36 GAMES BELONG TO IS NOT RECORDED, and the profile does not
-say.** nn6 (`sp5.best` + guard), nn7 (`sp8.best` + guard) and nn8
-(`sp8-bp015` + guard, the castle prior) were all built the same day. Match ids
-run 109463-109498 in time order, so a build that went up mid-session splits the
-record and the pooled 1865 belongs to no single bot. **Write down the id of the
-first match after every upload** — without it a ladder number cannot be
-attributed, and attribution is the entire reason for shipping one variable at a
-time.
+## Standing — the first RELIABLE ladder number
 
-### Per-opponent, and one of them is a wall
+**1840 Elo, rank 27 of 94. 107W 128L 5D over 240 games, 45%.** (2026-08-06)
+
+At n=240 the standard error is ±22. **Every earlier ladder number in this project
+was n<=36, i.e. ±58, and should be treated as noise** — including the 1849 that
+sp3 read and the 1865 from the morning of the 5th. We therefore do NOT know
+whether the +137 Elo of arena-measured gains (sp3 -> sp8 -> i500 -> i600) reached
+the ladder at all. Not disproven; never tested, because there was no trustworthy
+number on either side.
+
+Consequence for planning: **a ladder A/B needs ~200 games per build**, most of a
+day. The ladder cannot be the iteration loop. It is the only instrument that has
+never been wrong, so it is the court of final appeal, not the working bench.
+
+The field is bimodal — roughly 19 opponents beat us at under 35%, 20 we beat at
+over 65%, and little in between. Nine have shut us out 6-0 (Mattz, bca,
+tvojtatko, ResBot, candide, Nicholas, Kubic, bitterlessonpilled, nanomena), while
+both baselines go 6-0 our way. That is what rank 27 of 94 looks like from inside:
+a tier above and a tier below.
+
+### Corrected on 2026-08-06: "loses early, wins late" was a small-sample artifact
+
+On 43 games it read median win 436 turns against median loss 245, and a lot of
+reasoning was built on it. On 337 games:
 
 ```
-thor                   0W 6L 0D     0%     <-
+median win 384   median loss 348
+
+turns     wins  losses
+<200        12      27     <- 2.25:1 against us, and 12% of games
+200-400     78      82
+400-600     41      40
+600-800     18      12
+800+        12      15
+```
+
+Only the sub-200 band is lopsided. Everywhere else it is a coin flip.
+
+## THE CRITIC IS WORSE THAN A LINEAR MODEL, and the fix is now connected
+
+From sp17's own log, the trained critic against the `sc` control (least squares
+on the 12 broadcast scalars, no board at all):
+
+```
+             critic                      sc control
+midgame      -0.09 -0.05 -0.09 -0.00     +0.02 +0.05 +0.01 +0.06
+last decile  +0.15 +0.22 +0.20 +0.36     +0.28 +0.29 +0.25 +0.39
+```
+
+`selfplay.py` states the reading itself: *"evar_l - sc_l <= 0 says the critic
+extracts nothing the clock does not already give."* It is negative in both bands,
+on every reading.
+
+This matters more than any policy change, because **the critic is how a terminal
+reward becomes per-move credit.** The advantage PPO applies to a move is the
+critic's estimate of what that move did to the win probability. A critic at this
+quality grades every strategic question — castles, garrison, reserves — close to
+randomly. There is no separate "reward function" to design; there is a critic
+that does this job or does not.
+
+### The pipeline that fixes it was 90% built and disconnected
+
+`learn/valuedata.py` turns replays into (position -> did this player win), and its
+docstring names our exact problem: *"an evaluation function grounded in games
+where REAL opponents did the punishing. Our local opponents never punish
+over-commitment."* No action inference, so none of the label noise that capped
+behaviour cloning. `/local/data/vng205/val` was built at some point and went
+unused — because until `--init-critic` landed on 2026-08-05 there was nowhere for
+the output to go. `--init-critic` now accepts both a run's `.resume.npz` and a
+standalone `valuetrain` model.
+
+Tomorrow, on the encoder in force:
+
+```bash
+$PY -m learn.valuedata /local/data/vng205/field --out /local/data/vng205/val24 --workers 32
+$PY -m learn.valuetrain --data /local/data/vng205/val24 --out /local/data/vng205/value24.npz --layers 8 --channels 32
+# then --init-critic /local/data/vng205/value24.npz on a normal selfplay run
+```
+
+Read the same `evar` vs `sc` line. A critic trained where real opponents punish
+should beat the scalar control; if it does, every downstream advantage improves.
+
+Sizing: ~380k samples from the existing `field/` at stride 4, both seats, against
+a ~71k-parameter critic. `--stride 2` doubles it for free. Dihedral augmentation
+is EASIER for a critic than for a policy — the label is invariant under flips and
+rotations, so no action remapping — but `valuetrain` has no `--augment` yet, and
+the honest first step is to train once and compare train against held-out loss.
+The real risk is distribution shift, not size: these are other bots' positions.
+It is a warm start and PPO continues on-policy, so it only has to beat random.
+
+**Downloading (2026-08-06, on the laptop):** `~/Downloads/field24/` — full game
+histories for the ten opponents that beat us, via
+`python -m analysis.official fetch --player NAME --delay 1.0`. ~40 KB per game
+gzipped, ~1900 games, ~75 MB. `/api/leaderboard?matches=1&player=NAME` serves any
+player's match list, so the strongest players' complete games are available.
+The fetcher now retries a 403 with 30/60/120s backoff and then gives up. **Never
+hammer it** — that is how the cluster lost access once.
+
+### Per-opponent at n=36 — SUPERSEDED by the n=240 numbers above
+
+Kept because the thor forensics below were run on it. The 0-6 has since become
+1-11 over a much wider field, and eight other opponents now shut us out too, so
+"thor is uniquely a wall" did not survive the larger sample.
+
+```
+thor                   0W 6L 0D     0%
 blakeboss              2W 3L 1D    33%
 Oleksandr Tymkovych    3W 3L 0D    50%
 john9801               4W 2L 0D    67%
@@ -52,7 +142,7 @@ Also note the loss to the **Hunter baseline**, which the arena scores 0.979 over
 2000 games. One loss in six is only ~12% unlikely, so not yet evidence — but the
 arena says that should happen once in 50 games, not once in 6.
 
-### Game lengths, measured on the ladder rather than assumed
+### Game lengths at n=36 — SUPERSEDED, see the n=337 table above
 
 36 games: median **320** turns, and **4 of 36 (11%) cross turn 800**.
 

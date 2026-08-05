@@ -8,6 +8,18 @@ it is the ground truth for every rule; read the engine source, not the rules pag
 next, and the measured non-starters. `docs/CLUSTER.md` is how to install and run
 on the VU box.
 
+Three things that cost the most time when forgotten:
+
+* **A number at n<=36 is noise.** Ladder SE is ±58 there and ±22 at n=240. Four
+  separate conclusions were drawn and later reversed off small ladder samples,
+  including "loses early, wins late", which was a 43-game artifact.
+* **Measure a candidate before building it.** Six signals were checked against
+  ladder replays on 2026-08-05 and four were rejected in two minutes each; the
+  survivors separate wins from losses by >2x, the rejects by 1.0-1.5x. The same
+  discipline killed a guard trigger that looked certain and fired on 98% of turns.
+* **Hand-written overrides lose to this policy.** Five measured, all neutral or
+  negative, the worst at -322 Elo. It has outgrown being told what to do.
+
 **Before proposing any ML or evaluator work, read `docs/ml-log.md`.** Six ML
 attempts and nine local instruments have failed, each for a specific measured
 reason. The log exists so none of them gets tried a seventh time.
