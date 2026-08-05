@@ -19,17 +19,63 @@ v18 heuristic              1587   n=90
 The heuristic is retired as a submission. It survives as an opponent, a
 calibration point, and the source of `configs/v16.json`.
 
-**On the ladder now: `generals-bot-nn6`** — `sp5.best.npz` packaged with
-`configs/v13.json`, guard active. Early reading is bad. Record `n` before
-treating that as a result: SE is +-58 at n=36, and this file's own rule is that
-Elo needs 100+ games.
+**1865 Elo, rank 23/90, 18W-17L-1D over 36 games** (2026-08-05). The best
+reading the project has had. The *early* reading of that same run looked bad and
+was noise — the ±58-at-n=36 rule caught exactly the mistake it exists to catch,
+so do not react to a ladder number before `n` is real.
 
-If it holds past n=100 it is a genuine contradiction, not a mis-ship. The arena
-put sp5 **+32.2 Elo over sp3** on 2000 games, and sp3 is the checkpoint that
-read 1849/1808. A ladder result below sp3 cannot be explained by "we shipped the
-weaker overnight run" — sp5 losing to sp8 by 25.2 says nothing about sp5 vs the
-thing currently ranked. That would make comp-eval-plus-arena instrument twelve,
-and the first one to fail *after* passing an internal consistency check.
+**WHICH BUILD THESE 36 GAMES BELONG TO IS NOT RECORDED, and the profile does not
+say.** nn6 (`sp5.best` + guard), nn7 (`sp8.best` + guard) and nn8
+(`sp8-bp015` + guard, the castle prior) were all built the same day. Match ids
+run 109463-109498 in time order, so a build that went up mid-session splits the
+record and the pooled 1865 belongs to no single bot. **Write down the id of the
+first match after every upload** — without it a ladder number cannot be
+attributed, and attribution is the entire reason for shipping one variable at a
+time.
+
+### Per-opponent, and one of them is a wall
+
+```
+thor                   0W 6L 0D     0%     <-
+blakeboss              2W 3L 1D    33%
+Oleksandr Tymkovych    3W 3L 0D    50%
+john9801               4W 2L 0D    67%
+vojtechpour            4W 2L 0D    67%
+Hunter (baseline)      5W 1L 0D    83%
+```
+
+0-for-6 against `thor` is p = 1.6% under even odds. One opponent has something we
+have no answer to, while everything else sits at 33-83%. That is the single
+largest identified loss of Elo and it is an exploitable weakness, not variance.
+
+Also note the loss to the **Hunter baseline**, which the arena scores 0.979 over
+2000 games. One loss in six is only ~12% unlikely, so not yet evidence — but the
+arena says that should happen once in 50 games, not once in 6.
+
+### Game lengths, measured on the ladder rather than assumed
+
+36 games: median **320** turns, and **4 of 36 (11%) cross turn 800**.
+
+```
+1200, 948, 914, 808, 773, 681, 580, 557, 515, 498, 476, 451, ...
+```
+
+Deathtouch (`rules.DEATHTOUCH_TURN = 800`) is therefore live in about one game in
+nine. Training reaches it — `--max-turns` defaults to `TURN_LIMIT` 1200 — but the
+stage-5 mean is ~480, so it is the tail there too.
+
+### The 1200-turn draw is a specific, named failure
+
+Game `#109482` vs blakeboss is the `1D`: it hit the turn limit. From turn 800 any
+move onto a general wins outright regardless of army, so the bot had **400 turns
+in which the whole game reduces to "walk onto their general"** and did not
+convert.
+
+`guard.winning_move` handles deathtouch only when the enemy general is already
+visible and adjacent. **There is no general-hunting behaviour anywhere in the net
+or the guard.** Under deathtouch that is the only thing that matters. A known
+regime, 11% of games, where the correct policy is nearly trivial to state and we
+have none of it — a sharper target than castles.
 
 ## Checkpoints that matter
 
