@@ -39,6 +39,14 @@ class GameSpec:
     time_limit: float = rules.MOVE_BUDGET_S
     record: bool = False
     maps: str | None = None      # pool of real boards; None = generate
+    # Generals-distance band. None is the competition generator exactly, so an
+    # unset run is byte-identical to every result measured before this existed.
+    # Set it to sweep a behaviour against distance: `bld` sat at 0.01 for all of
+    # stage 3 (11-17) and hit 0.5 within four iterations of stage 4 (17-24), so
+    # the policy has a castle breakpoint somewhere in between and nothing could
+    # measure where.
+    dmin: int | None = None
+    dmax: int | None = None
 
 
 def _valid_action(a) -> bool:
@@ -49,7 +57,9 @@ def _valid_action(a) -> bool:
 
 
 def play(g: GameSpec) -> dict:
-    grid = mapgen.pool_grid(g.maps, g.seed) if g.maps else mapgen.generate(g.seed)
+    grid = (mapgen.pool_grid(g.maps, g.seed) if g.maps
+            else mapgen.generate(g.seed) if g.dmin is None
+            else mapgen.generate(g.seed, g.dmin, g.dmax))
     h, w = grid.shape
     st = engine.from_grid(grid)
     players = [
@@ -146,7 +156,8 @@ def _worker(payload: dict) -> dict:
 
 
 def _jobs(spec_a: str, spec_b: str, games: int, seed0: int, max_turns: int,
-          time_limit: float, record: bool, maps: str | None) -> list[dict]:
+          time_limit: float, record: bool, maps: str | None,
+          dmin: int | None = None, dmax: int | None = None) -> list[dict]:
     """Colours swapped on alternate games of each seed pair. Order is load-bearing:
     `_tag` reads the seat off the index, so nothing may reorder these."""
     jobs = []
@@ -155,15 +166,18 @@ def _jobs(spec_a: str, spec_b: str, games: int, seed0: int, max_turns: int,
         swapped = i % 2 == 1
         s0, s1 = (spec_b, spec_a) if swapped else (spec_a, spec_b)
         jobs.append(dict(spec0=s0, spec1=s1, seed=seed, max_turns=max_turns,
-                         time_limit=time_limit, record=record, maps=maps))
+                         time_limit=time_limit, record=record, maps=maps,
+                         dmin=dmin, dmax=dmax))
     return jobs
 
 
 def run_match(spec_a: str, spec_b: str, games: int, seed0: int = 0, workers: int = 8,
               max_turns: int = rules.TURN_LIMIT, time_limit: float = rules.MOVE_BUDGET_S,
-              record: bool = False, progress=None, maps: str | None = None) -> list[dict]:
+              record: bool = False, progress=None, maps: str | None = None,
+              dmin: int | None = None, dmax: int | None = None) -> list[dict]:
     """Play `games` games, colours swapped on alternate games of each seed pair."""
-    jobs = _jobs(spec_a, spec_b, games, seed0, max_turns, time_limit, record, maps)
+    jobs = _jobs(spec_a, spec_b, games, seed0, max_turns, time_limit, record, maps,
+                 dmin, dmax)
 
     results = []
     if workers <= 1:
@@ -246,6 +260,14 @@ def main() -> None:
     ap.add_argument("--replays", action="store_true", help="store full replays (a few kB each)")
     ap.add_argument("--maps", default=None,
                     help="play on a real-board pool from `analysis.official maps`")
+    ap.add_argument("--dmin", type=int, default=None,
+                    help="generals-distance band, e.g. --dmin 13 --dmax 15. Unset "
+                         "is the competition generator exactly, so every result "
+                         "measured before this flag existed is reproducible. Set "
+                         "it to find where a behaviour turns on: `bld` is 0.01 "
+                         "across stage 3 (11-17) and 0.5 four iterations into "
+                         "stage 4 (17-24), and nothing could locate the knee")
+    ap.add_argument("--dmax", type=int, default=None)
     ap.add_argument("--elo1", type=float, default=12.0, help="SPRT alternative hypothesis")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
@@ -258,7 +280,7 @@ def main() -> None:
 
     results = run_match(args.a, args.b, args.games, args.seed0, args.workers,
                         args.max_turns, args.time_limit_ms / 1000.0,
-                        args.replays, progress, args.maps)
+                        args.replays, progress, args.maps, args.dmin, args.dmax)
     if not args.quiet:
         print()
 
@@ -287,6 +309,16 @@ def main() -> None:
         print("  A modes " + " ".join(
             f"{k} {v} ({100 * v / tot:.2f}%)"
             for k, v in sorted(hist.items(), key=lambda kv: -kv[1])))
+    # Castles per game per side, and when the first one goes down. With --dmin/
+    # --dmax this is the castle breakpoint measured directly: sweep the band and
+    # read where the rate turns on, instead of inferring it from two stages of a
+    # training log.
+    ca = float(np.mean([r["castles"][r["a_seat"]] for r in results]))
+    cb = float(np.mean([r["castles"][1 - r["a_seat"]] for r in results]))
+    firsts = [r["first_castle"][r["a_seat"]] for r in results]
+    firsts = [t for t in firsts if t]
+    when = f", A first builds turn {np.mean(firsts):.0f} in {len(firsts)}/{len(results)} games" if firsts else ""
+    print(f"  castles/game  A {ca:.2f}  B {cb:.2f}{when}")
     print(f"  wall {time.time() - t0:.1f}s")
 
     if args.out:
