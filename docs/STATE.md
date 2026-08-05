@@ -461,7 +461,25 @@ the one blind spot that survived the day.
 | config tuning | PSRO best-response to archive 0.522 +-0.013 — the ~100-knob space is exhausted |
 | HL-Gauss critic | our returns are exactly {-1,0,+1}, so the bins are disjoint and it is a 3-way classifier. Expected -20 to +30 Elo for two GPU-nights |
 
-### Capacity: the retraction
+### Capacity: RE-CLOSED 2026-08-05, on evidence that supports it
+
+sp13 ran 8x64 (275k params, 3.8x) overnight from `grow(sp9-i500)`, warm critic,
+same recipe. Best was comp-eval 0.703 at iteration 100 against a base of 0.682
+(+0.021, inside noise) and it declined after. Head-to-head against `sp9-i600` at
+8x32: **accept H0, no improvement, faults 0.**
+
+So the entry goes back — but for the right reason this time. The old
+justification was BC top-1, a metric this same file calls worthless. The new one
+is a 600-game head-to-head against the reigning champion.
+
+Two earlier attempts failed on confounds and are not evidence either way: sp11
+(12x64) died of the 12-layer plain-trunk critic collapse, sp12 (8x64) stalled at
+`[critic warmup 20/20]` starting cold at stage 4.
+
+Also observed: the wider net builds 0.16 castles/game against i600's 0.69. Every
+strong checkpoint this project has produced builds MORE.
+
+### Capacity: the retraction (superseded by the above)
 
 "Bigger networks" sat in that table on two claims and neither holds.
 
