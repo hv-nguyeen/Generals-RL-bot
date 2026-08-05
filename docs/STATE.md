@@ -364,6 +364,29 @@ biggest, continuously, from turn one. That is a leak, not a sniper.
 Consequence: any comp-eval `snipe` column taken before this is fixed measures
 nothing. Do not read it.
 
+**Banking was tried and is WORSE.** Feed the general's surplus into a fixed
+staging tile with half-moves, keeping a garrison, then commit when it is big —
+thor's shape, and it measured **-137 / -111 / -100 Elo** at thresholds 60/100/140
+with the bank firing on ~10% of turns. Reverted. Spending a tenth of your moves
+shuffling army and thinning your own general is worse than not doing it, against
+a policy that punishes both.
+
+### The pattern: hand-written overrides lose to this net
+
+```
+guard  (win-in-one + garrison veto)      +4.7 Elo, fires on 1 of 10 real cases
+snipe  (march the biggest stack)        -20.9 when it actually fires
+snipe  (bank, then commit)         -100 to -137
+```
+
+Three attempts, three results in the same direction. **The net is now strong
+enough that a human-specified rule interrupting it costs more than it gains** —
+even one aimed at a defect with ladder evidence behind it. That retires the guard
+as well, and it means the decapitating opponent probably cannot be hand-built.
+
+What remains for measuring decapitation resistance: the ladder itself, or a net
+TRAINED to snipe. Not an afternoon's work either way.
+
 ## Four things measured on 2026-08-05 that change how runs are set up
 
 **Stage 3 is exhausted for `sp8.best`. Start at stage 4.** sp9 ran 400 iterations
