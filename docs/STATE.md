@@ -264,6 +264,40 @@ the win-probability differential is zero. No reward change, no critic change and
 no extra sampling alters that. Either the opponent builds at a different rate
 than you do, or the rate is set after training.
 
+## Four things measured on 2026-08-05 that change how runs are set up
+
+**Stage 3 is exhausted for `sp8.best`. Start at stage 4.** sp9 ran 400 iterations
+at stage 3 and its stage-eval read **0.495** — 0.500 is the exact fixed point for
+a policy against its own stage-entry weights, so it could not beat itself from
+400 iterations earlier. comp-eval agreed, oscillating around 0.635 against a base
+of 0.641. Two independent instruments, one negative result. Do not spend another
+night there.
+
+**The build "collapse" was correct behaviour, not a pathology.** `bld` sat at
+0.01 for all of stage 3 and jumped to **0.43-0.68 within four iterations of
+entering stage 4**. Stage 0-3 boards are 11-17 apart with no safe rear;
+`tools/buildprior.py` says exactly that. The policy declines to build where
+building is wrong and builds where it pays. This retires the whole
+"self-play deletes castles" thread AND the `--stage-replay`-suppresses-builds
+theory — sp11 with `--stage-replay 0` behaved identically.
+
+**A 12-layer PLAIN trunk kills the critic. Two for two.** sp5 (12x32): evar
+0.405 -> under 0.05 for 20 iterations -> KILL 2. sp11 (12x64): evar 0.14 ->
+negative by iteration 43, policy frozen. Every 8-layer run has a stable critic.
+The mechanism is in `net.py:145` — the residual wiring exists precisely so "the
+skip path stays linear all the way through, which is the whole reason deep stacks
+train", and neither run used it. **Depth beyond 8 requires `--residual`** (odd
+layer count only). Until then, widen instead of deepening.
+
+**`tools/vprobe` measures what the critic believes.** sp9's critic values a
+castle at **+0.28 in z units** — the +111 Elo castle effect implies ~0.34 per
+castle at v16's ~0.9/game, so it is within 20% of an independently measured
+value. The castle asset is NOT unpriced and the blind-critic diagnosis is dead.
+But `garrison 25 vs 2` reads **+0.0040 +-0.0017**: 23 extra army on the general
+is worth 0.4% of a win, so the critic cannot tell a defended general from an
+empty one. That is the decapitation problem with a mechanism attached, and it is
+the one blind spot that survived the day.
+
 ## Measured non-starters — do not propose these again
 
 | | evidence |
