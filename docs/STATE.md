@@ -108,6 +108,35 @@ The curriculum is why RL works here after six failures. At short distance the
 critic reached explained variance 0.12 in 15 iterations; at competition distance
 it never crossed it in 1400.
 
+## RUNNING overnight 2026-08-05: the first controlled experiment
+
+Same init (`sp9-i600`), same warm critic, same stage 4, same `--stage-cap 1200`,
+same gauntlet including the champion itself. **One variable: the encoder.**
+
+| | tree | encoder |
+|---|---|---|
+| `sp17` | `/local/data/vng205/generals-bot` | 24ch — GARRISON, HIDDEN_OPP, MAX_STACK x2 |
+| `sp18` | `/local/data/vng205/c20/generals-bot` | 20ch — control, built from tag `c20-nn10` |
+
+At iteration 100, the `sp9-i600` column:
+
+```
+sp17   0.50 -> 0.56
+sp18   0.50 -> 0.46
+```
+
+Both start at exactly 0.50, which is the migration verifying itself — the policy
+IS i600 there, playing a copy of itself. Then they diverge in opposite
+directions. 150 games each, so the 0.10 gap is ~1.7 se: suggestive, not settled.
+
+**The verdict is the arena, not comp-eval:**
+
+```bash
+$PY -m arena.runner --a clone:runs/nn/sp17.best.npz --b clone:SP18BEST --games 2000 --workers 32
+```
+
+Both are 24- and 20-channel respectively, so `tools.grow` the control up first.
+
 ## Where the checkpoints physically are
 
 `/local/data` is per-node and nothing syncs it, so each run can only see its own
