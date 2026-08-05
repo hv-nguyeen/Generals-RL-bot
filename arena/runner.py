@@ -72,6 +72,12 @@ def play(g: GameSpec) -> dict:
     total_ms = [0.0, 0.0]
     modes: list[dict[str, int]] = [{}, {}]
     first_castle = [None, None]
+    built = [0, 0]
+    captured = [0, 0]
+    # Copies: the engine mutates these arrays in place, so a reference would
+    # compare the board against itself and report zero of everything.
+    prev_castles = st.castles.copy()
+    prev_own = [st.own[0].copy(), st.own[1].copy()]
     actions_log: list[list[list[int]]] = []
     series: list[list[int]] = []
 
@@ -113,9 +119,29 @@ def play(g: GameSpec) -> dict:
         done = engine.step(st, acts[0], acts[1])
         turn += 1
 
+        # Built vs CAPTURED, exactly, and they are different strategies. Building
+        # is symmetric -- both sides do it, both gain, and the win-probability
+        # differential in a mirror is ~0, which is why the gradient on it is so
+        # weak. Taking THEIR castle is zero-sum: they lose the income and we gain
+        # it, so self-play can see it without any opponent surgery. It is also
+        # cheaper, costing the garrison rather than 35 + 14 per nearby structure.
+        #
+        # `series` samples every 10 turns and cannot separate the two -- a build
+        # and a capture inside one window look identical, and a castle taken and
+        # retaken is invisible. This is per-turn and exact.
+        fresh = st.castles & ~prev_castles          # tiles that became castles
         for p in (0, 1):
+            # A build converts a tile you ALREADY own, so ownership does not
+            # change and only the castle flag does. A capture is the opposite:
+            # the tile was already a castle and changed hands. Testing for an
+            # ownership change on both counted zero builds against v16, which
+            # builds one castle a game.
+            built[p] += int((fresh & st.own[p]).sum())
+            captured[p] += int((prev_castles & st.own[p] & ~prev_own[p]).sum())
             if first_castle[p] is None and bool((st.castles & st.own[p]).any()):
                 first_castle[p] = turn
+        prev_castles = st.castles.copy()
+        prev_own = [st.own[0].copy(), st.own[1].copy()]
 
         if turn % SAMPLE_EVERY == 0 or done:
             land, army = st.land(), st.army()
@@ -140,6 +166,7 @@ def play(g: GameSpec) -> dict:
         "land": list(land), "army": list(army),
         "castles": [int((st.castles & st.own[0]).sum()), int((st.castles & st.own[1]).sum())],
         "first_castle": first_castle,
+        "built": built, "captured": captured,
         "faults": faults,
         "max_ms": [round(x, 2) for x in max_ms],
         "mean_ms": [round(total_ms[p] / max(turn, 1), 3) for p in (0, 1)],
@@ -319,6 +346,11 @@ def main() -> None:
     firsts = [t for t in firsts if t]
     when = f", A first builds turn {np.mean(firsts):.0f} in {len(firsts)}/{len(results)} games" if firsts else ""
     print(f"  castles/game  A {ca:.2f}  B {cb:.2f}{when}")
+    ba = float(np.mean([r["built"][r["a_seat"]] for r in results]))
+    bb = float(np.mean([r["built"][1 - r["a_seat"]] for r in results]))
+    xa = float(np.mean([r["captured"][r["a_seat"]] for r in results]))
+    xb = float(np.mean([r["captured"][1 - r["a_seat"]] for r in results]))
+    print(f"  built/game    A {ba:.2f}  B {bb:.2f}     captured/game  A {xa:.2f}  B {xb:.2f}")
     print(f"  wall {time.time() - t0:.1f}s")
 
     if args.out:
