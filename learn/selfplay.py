@@ -696,6 +696,52 @@ def _unflat(prefix: str, arrays: dict) -> dict:
     return {k[len(p):]: v for k, v in arrays.items() if k.startswith(p)}
 
 
+def load_critic(path: str, arch: dict, blank: dict) -> dict:
+    """A trained critic out of a run's `.resume.npz`, checked against `arch`.
+
+    Every run starts its critic from scratch, because `--init` reads `.best.npz`
+    and that file carries the POLICY only. Relearning "what does a winning
+    position look like" takes ~40 iterations of short games, and on long ones it
+    often never converges at all -- the policy stays frozen behind the `evar`
+    gate while it tries. That cost three runs on 2026-08-05: sp7 froze at stage 5,
+    sp12 stalled at stage 4 at `[critic warmup 20/20]`, and sp9 paid the stage-3
+    tax purely to warm one, learning nothing there (`stage-eval 0.495` after 400
+    iterations).
+
+    None of that was necessary. `save_resume` has been writing a trained `phi`
+    all along and nothing ever read it back into a NEW run. This does.
+
+    It is also what makes `--start-stage 5` viable: the reason a run cannot begin
+    at the distance its policy actually plays is the cold critic, not the policy.
+
+    The critic belongs to the policy it was trained on, so a mismatched pair is
+    worse than a blank one -- every shape is checked and anything unexpected
+    raises here rather than producing quiet nonsense 200 iterations in.
+    """
+    z = np.load(path)
+    got = _unflat("phi", {k: z[k] for k in z.files})
+    if not got:
+        raise SystemExit(
+            f"{path} has no phi__* keys. The critic lives in a run's "
+            f".resume.npz -- .best.npz and --out carry the policy only.")
+    a = arch_of(got)
+    for k in ("layers", "channels", "residual"):
+        if a[k] != arch[k]:
+            raise SystemExit(
+                f"critic in {path} is {a['layers']}x{a['channels']} "
+                f"(residual={a['residual']}), this run is {arch['layers']}x"
+                f"{arch['channels']} (residual={arch['residual']}). Grow or "
+                f"retrain it; a critic for a different trunk is not loadable.")
+    if set(got) != set(blank):
+        missing = sorted(set(blank) - set(got)) or None
+        extra = sorted(set(got) - set(blank)) or None
+        raise SystemExit(f"critic keys do not match: missing {missing}, extra {extra}")
+    for k, v in blank.items():
+        if tuple(np.shape(got[k])) != tuple(np.shape(v)):
+            raise SystemExit(f"critic {k} is {np.shape(got[k])}, expected {np.shape(v)}")
+    return {k: np.asarray(got[k], np.float32) for k in blank}
+
+
 # --------------------------------------------------------------------------
 def selfcheck() -> None:
     """Everything provable without a game, a GPU or a worker. ~0.6 s."""
@@ -803,6 +849,38 @@ def selfcheck() -> None:
     assert SP_GATE_SEED0 < SP_POOL_SEED0
     assert pool_seed_span() > SP_POOL_SEED0
     # jobs land inside their own block
+    # --- the critic round-trips out of a resume file, and refuses a wrong one
+    with tempfile.TemporaryDirectory() as _d:
+        _rng = np.random.default_rng(3)
+        _phi = {}
+        for _i in range(3):
+            _cin = features.C if _i == 0 else 8
+            _phi[f"conv{_i}_w"] = _rng.normal(0, .2, (8, _cin, 3, 3)).astype(np.float32)
+            _phi[f"conv{_i}_b"] = _rng.normal(0, .1, (8,)).astype(np.float32)
+        _phi["v_w"] = _rng.normal(0, .2, (8,)).astype(np.float32)
+        _phi["v_b"] = np.float32(0.0)
+        _p = Path(_d) / "r.npz"
+        np.savez(_p, **_flat("phi", _phi), it=0)
+        _arch = arch_of(_phi)
+        _got = load_critic(str(_p), _arch, _phi)
+        assert set(_got) == set(_phi)
+        for _k in _phi:
+            assert np.array_equal(_got[_k], _phi[_k]), _k
+        # a critic for a different trunk must RAISE, not silently half-load: it
+        # belongs to the policy it was trained on and a mismatched pair is worse
+        # than a blank one.
+        try:
+            load_critic(str(_p), {**_arch, "channels": 32}, _phi)
+            raise AssertionError("accepted a critic with the wrong width")
+        except SystemExit:
+            pass
+        np.savez(Path(_d) / "nope.npz", it=0)
+        try:
+            load_critic(str(Path(_d) / "nope.npz"), _arch, _phi)
+            raise AssertionError("accepted a file with no critic in it")
+        except SystemExit:
+            pass
+
     jt = build_jobs(1199, 256, 0)
     assert len(jt) == 256 and len({j[0] for j in jt}) == 256
     assert max(j[0] for j in jt) < SP_STAGE_SEED0
@@ -1093,6 +1171,16 @@ def main() -> None:
                          "them on the same boards, so adding one costs games "
                          "and not wall clock. Default is the single v16 so a "
                          "run without this flag reproduces the old instrument")
+    ap.add_argument("--init-critic", default=None, metavar="RESUME.NPZ",
+                    help="warm-start the critic from a previous run's "
+                         ".resume.npz. --init reads .best.npz, which carries the "
+                         "POLICY only, so every run has been relearning 'what "
+                         "does a winning position look like' from scratch -- ~40 "
+                         "iterations on short games, and often never on long "
+                         "ones. That cost three runs on 2026-08-05 and is the "
+                         "only reason --start-stage cannot be set to where the "
+                         "policy actually plays. The trunk must match; every "
+                         "shape is checked")
     ap.add_argument("--stage-eval-every", type=int, default=10)
     ap.add_argument("--stage-eval-games", type=int, default=200)
     ap.add_argument("--comp-eval-every", type=int, default=50)
@@ -1277,6 +1365,15 @@ def main() -> None:
         phi["v_w"] = jax.random.normal(jax.random.fold_in(
             jax.random.PRNGKey(args.seed), 8), (ch, args.hl_bins)) * 0.01
         phi["v_b"] = jnp.zeros((args.hl_bins,))
+    if args.init_critic:
+        # AFTER the hlgauss reshape, so the shape check compares against the head
+        # this run will actually use rather than the scalar one it started from.
+        warm = load_critic(args.init_critic, arch, {k: np.asarray(v) for k, v in phi.items()})
+        phi = {k: jnp.asarray(v) for k, v in warm.items()}
+        print(f"critic: warm start from {args.init_critic} "
+              f"({arch['layers']}x{arch['channels']}) -- no warmup tax, and "
+              f"--start-stage is not bounded by what a blank critic can fit",
+              flush=True)
     opt_p = {k: (jnp.zeros_like(v), jnp.zeros_like(v)) for k, v in theta.items()}
     opt_v = {k: (jnp.zeros_like(v), jnp.zeros_like(v)) for k, v in phi.items()}
 
