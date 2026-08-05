@@ -335,9 +335,34 @@ stays on it.
 @160     +5.2 [-28.4, +38.9]
 ```
 
-**From 60 up it is a peer of the champion while winning a completely different
-way.** Put it in `--opp` and comp-eval finally reports, every 50 iterations,
-whether the policy is learning to survive the thing that actually kills it.
+**IT WAS ONLY A PEER BECAUSE IT WAS INERT.** Measured 2026-08-05 with the mode
+histogram, sniper on the A side so its firing rate prints, against the real net
+on identical weights:
+
+```
+threshold   fires    Elo (sniper vs plain net)
+@40        13.8%      -20.9
+@50         9.1%      -17.4
+@60         6.8%      -20.9
+@80         3.1%       +6.9
+@60-200     1.7%       +8.7     <- the shipped default
+```
+
+The more it snipes, the WORSE it does, and at the default it fires on 1.7% of
+turns — it is a 98%-identical copy of the net. The earlier sweep that made it
+look like a peer was measuring inertness.
+
+Against `Greedy` as the inner policy the opposite holds (0.500 inert at @120,
+0.592 firing at @60, and every win a thin general against a 68-74 stack), so the
+strike logic is correct. A strong policy simply punishes the commitment: marching
+a 40-60 stack across the map donates army.
+
+**The design flaw: it does not BANK.** thor's signature is equal land with MORE
+army — refusing to spend, then committing once. This marches whatever stack is
+biggest, continuously, from turn one. That is a leak, not a sniper.
+
+Consequence: any comp-eval `snipe` column taken before this is fixed measures
+nothing. Do not read it.
 
 ## Four things measured on 2026-08-05 that change how runs are set up
 
