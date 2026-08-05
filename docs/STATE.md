@@ -268,11 +268,44 @@ than you do, or the rate is set after training.
 
 | | evidence |
 |---|---|
-| bigger networks | four sizes 70k-270k, all 0.489-0.499 BC top-1; depth 12 matched depth 8 per iteration at 2x wall clock |
+| ~~bigger networks~~ **RETRACTED 2026-08-05, see below** | the evidence was BC top-1, which this same file calls worthless |
 | rollout throughput | projected 23x measured 1.7x; projected 2.5-4x measured 0.7x. The rollout is 11-24% of an iteration's arithmetic, so even a free one caps at ~1.2x |
 | behaviour cloning | ceiling is median field play; saturates on label noise |
 | config tuning | PSRO best-response to archive 0.522 +-0.013 — the ~100-knob space is exhausted |
 | HL-Gauss critic | our returns are exactly {-1,0,+1}, so the bins are disjoint and it is a 3-way classifier. Expected -20 to +30 Elo for two GPU-nights |
+
+### Capacity: the retraction
+
+"Bigger networks" sat in that table on two claims and neither holds.
+
+**Four sizes 70k-270k all scored 0.489-0.499 BC top-1.** Top-1 is the metric this
+file separately calls *worthless as a model-selection metric* — a net that
+predicts the heuristic's move 65% of the time wins 1 game in 100 against it. The
+capacity question was closed with an instrument we rejected.
+
+**"Depth 12 matched depth 8 at 2x wall clock."** sp5 IS 12x32. It reached
+comp-eval 0.800 from a much weaker init and EARNED all three of its stage
+promotions where sp8 had both of its forced. That is not evidence against depth.
+
+Compute is not the constraint either: 8x32 is ~32M MACs a move at 1.1 ms, and
+12x128 (~4M params) is ~780M MACs, roughly 26 ms against a 150 ms budget. We use
+under 1% of what the rules allow.
+
+What capacity still cannot fix is the three measured bottlenecks — self-play's
+blindness to symmetric strategies, a critic already near its martingale ceiling,
+and information absent from the input. A larger net trained by a blind signal is
+blind at 2x the wall clock.
+
+**The exception, and the reason to test it: receptive field is exactly the layer
+count.** 8 layers, radius 8, on a 21x21 board — no cell can see the far corner.
+If the field's larger bots are DEEPER rather than merely wider, they may be
+winning on global context, which is a real gap. Our largest measured gain ever
+(0.152 -> 0.360) came from 8 broadcast scalars, a crude substitute for the same
+thing.
+
+**The test:** 12x64 (~290k, 4x current) on the same recipe, head-to-head against
+sp10 at 2000 games on the gauntlet. One GPU-night. Until it runs, capacity is
+OPEN, not a non-starter.
 
 ## Rules that survived contact
 
