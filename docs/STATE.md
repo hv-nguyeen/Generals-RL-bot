@@ -466,7 +466,12 @@ the one blind spot that survived the day.
 sp13 ran 8x64 (275k params, 3.8x) overnight from `grow(sp9-i500)`, warm critic,
 same recipe. Best was comp-eval 0.703 at iteration 100 against a base of 0.682
 (+0.021, inside noise) and it declined after. Head-to-head against `sp9-i600` at
-8x32: **accept H0, no improvement, faults 0.**
+8x32: **255W 13D 332L, -44.8 Elo [-72.9, -17.3], accept H0, faults 0.**
+
+Read that as ZERO GAIN, not as "wide is worse". sp13 started from `sp9-i500`,
+and i600 beats i500 by +43.3 on 2000 games — so -44.8 against i600 is almost
+exactly the head start it never closed. A full night at 3.8x the parameters
+moved the policy nowhere.
 
 So the entry goes back — but for the right reason this time. The old
 justification was BC top-1, a metric this same file calls worthless. The new one
