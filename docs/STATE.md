@@ -173,6 +173,51 @@ Precedent: adding the 8 broadcast scalars moved the clone from 0.152 to 0.360 �
 the largest single measured gain in the project. Information has beaten capacity
 and schedule every time here.
 
+## The castle sweep, and why its numbers cannot set the rate
+
+`sp8.best` builds 0.23/game at p(build|legal) = 0.0034. `tools/buildprior.py`
+shifts one scalar — slot 8's bias in the 3x3 head, shared by every cell. Each arm
+is 2000 games against unmodified `sp8.best`, `faults 0`:
+
+```
+target 0.008   +22.8  [+7.8, +37.9]
+target 0.015   +47.0  [+31.9, +62.3]   <- peak
+target 0.030   +31.4  [+16.4, +46.4]   <- the rate the ladder rejected
+```
+
+**The 0.030 arm was a pre-registered control and it failed.** That is the setting
+that gave sp8 `bld 2.48` and cost ladder rank, and the arena scores it +31.4. The
+arena over-rates castles, for a reason that is not mysterious: every opponent
+here is our own lineage and none of them punish over-building. Nobody rushes you
+while you are 35 army down. **These numbers cannot pick the rate.**
+
+What survives: all three arms positive over 6000 games, so the direction — more
+than self-play's 0.23/game equilibrium — is consistent; and the curve has an
+INTERIOR peak, so even a castle-biased instrument finds a point where more stops
+helping. The peak is ~2.2 se above the 0.008 arm and indistinguishable from
+0.030, so "0.015 is optimal" is NOT supported. "Somewhere in 0.008-0.030 beats
+0.0034" is.
+
+Fairness both ways: the ladder verdict was on `sp3-bp-0807`, a different base
+policy, at an unrecorded `n`. Two weak instruments disagreeing is not one
+refuting the other.
+
+Settle it on the ladder, one variable at a time: **nn7 = sp8.best plain**,
+**nn8 = sp8-bp015**, identical but for the prior.
+
+## Why self-play will never answer this
+
+PPO is not failing to learn about castles. At `bld 2.48` with 256 games an
+iteration it saw ~635 builds per iteration and took 50 iterations to crush the
+rate — ~30,000 samples against the ~2000 that `ml-log.md:939` computes are needed
+for a confident read at 0.11 signal-to-noise per build decision.
+
+It had fifteen times the evidence required and concluded castles were not worth
+it. **In a mirror that is correct**: both sides build, both gain the same income,
+the win-probability differential is zero. No reward change, no critic change and
+no extra sampling alters that. Either the opponent builds at a different rate
+than you do, or the rate is set after training.
+
 ## Measured non-starters — do not propose these again
 
 | | evidence |
