@@ -500,9 +500,17 @@ def _short(spec: str) -> str:
 
     Only a path-shaped argument is shortened: `hunter:2` is a garrison setting,
     not a file, and labelling that column `2` would be worse than not shortening.
+
+    The KIND is kept for anything but `clone:`, because two opponents built from
+    the same weights differ only in their wrapper -- `clone:sp9-i500` and
+    `snipe:sp9-i500` both shortened to `sp9-i500` and the breakdown gave no way
+    to tell which column was the sniper.
     """
-    arg = spec.partition(":")[2]
-    return Path(arg).stem if "/" in arg else spec
+    kind, _, arg = spec.partition(":")
+    if "/" not in arg:
+        return spec
+    stem = Path(arg).stem
+    return stem if kind == "clone" else f"{kind}:{stem}"
 
 
 def eval_jobs(n: int, dmin: int, dmax: int | None, seed0: int,
