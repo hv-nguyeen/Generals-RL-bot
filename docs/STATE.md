@@ -84,6 +84,35 @@ both bests are safe.
 
 Both `.best` scores are a max over ~24 draws and are ~1 SE optimistic.
 
+## The head-to-heads that decided it
+
+2000 games each, `faults 0` on all three:
+
+```
+sp8 vs sp3   +59.5  [+44.5, +74.6]   accept H1
+sp5 vs sp3   +32.2  [+17.2, +47.4]   accept H1
+sp5 vs sp8   -25.2  [-40.3, -10.3]   accept H0
+```
+
+**sp8 > sp5 > sp3, and the triangle closes.** Common-opponent predicts sp8 over
+sp5 by 59.5 - 32.2 = +27.3; measured directly it is +25.2. Two Elo apart. That
+is the first internal validation any instrument here has passed — every earlier
+one was a single number nothing could contradict.
+
+`runs/nn/sp8.best.npz` is the new champion, +59.5 over the checkpoint that
+scored 1849 on the ladder.
+
+Caveat that still stands: sp3, sp8 and sp5 share an ancestor, so a blind spot
+common to all three is invisible to all three comparisons. v16 is the only
+strong opponent from another lineage.
+
+## 2000 games costs 85 seconds
+
+Every Elo number in this project before 2026-08-05 was 400 games at +-29,
+because 400 games used to be slow. It is not: 400 in 14s, 2000 in ~85s at 32
+workers, SE +-8. **Default to 2000.** sp8's comp-eval gain read as 1.2 SE of
+noise and it is +59.5 in the arena; the instrument was too blunt to see it.
+
 ## Next, in order
 
 **1. A/B the guard.** `bot/policy/guard.py` is written, selfchecked and
