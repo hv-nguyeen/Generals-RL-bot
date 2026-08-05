@@ -36,7 +36,10 @@ The veto picks the net's next-best legal move rather than a hand-written
 alternative: the network still chooses, it is only forbidden one option. That
 keeps the policy's judgement everywhere the guard has no opinion.
 
-Read `guard` in the debug dict to see which override fired, and how often.
+The debug dict reports which override fired under the key `mode`, which is what
+`arena/runner.py` already tallies -- a guard whose firing rate nobody can see is
+indistinguishable from a guard that never fires, and the two demand opposite
+fixes.
 """
 
 from __future__ import annotations
@@ -139,7 +142,7 @@ class GuardedPolicy:
         win = winning_move(obs, mask)
         if win is not None:
             self.fired["win"] += 1
-            self.last_debug = {"guard": "win", "turn": obs.turn}
+            self.last_debug = {"mode": "guard-win", "turn": obs.turn}
             return features.index_to_action(win)
 
         # Ask the network, then veto. Scoring once and walking the order is what
@@ -148,7 +151,7 @@ class GuardedPolicy:
         scored = getattr(self.inner, "net", None)
         if scored is None:
             act = self.inner.act(obs, deadline)
-            self.last_debug = {"guard": "passthrough", "turn": obs.turn}
+            self.last_debug = {"mode": "passthrough", "turn": obs.turn}
             return act
 
         logits = np.where(mask, scored.logits(obs), -np.inf)
@@ -161,14 +164,14 @@ class GuardedPolicy:
                 continue
             if rank:
                 self.fired["veto"] += 1
-            self.last_debug = {"guard": "veto" if rank else "net",
+            self.last_debug = {"mode": "guard-veto" if rank else "net",
                                "rank": rank, "turn": obs.turn}
             return features.index_to_action(int(idx))
 
         # Every legal move drains the general and something comparable is next to
         # it. Nothing here can save the position; take the net's first choice
         # rather than passing, which would hand over a free tempo.
-        self.last_debug = {"guard": "forced", "turn": obs.turn}
+        self.last_debug = {"mode": "guard-forced", "turn": obs.turn}
         return features.index_to_action(int(order[0]))
 
 

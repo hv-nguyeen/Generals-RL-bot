@@ -275,6 +275,18 @@ def main() -> None:
     mean = float(np.mean([r["mean_ms"][r["a_seat"]] for r in results]))
     faults = sum(sum(r["faults"]) for r in results)
     print(f"  time A mean {mean:.1f} ms, slowest move in run {slow:.1f} ms, faults {faults}")
+    # A's mode histogram. Without it an override that never fires and one that
+    # fires and changes nothing produce the same 0.500, and they want opposite
+    # fixes -- loosen the trigger, or drop the override.
+    hist: dict[str, int] = {}
+    for r in results:
+        for k, v in r["modes"][r["a_seat"]].items():
+            hist[k] = hist.get(k, 0) + v
+    if hist:
+        tot = sum(hist.values())
+        print("  A modes " + " ".join(
+            f"{k} {v} ({100 * v / tot:.2f}%)"
+            for k, v in sorted(hist.items(), key=lambda kv: -kv[1])))
     print(f"  wall {time.time() - t0:.1f}s")
 
     if args.out:

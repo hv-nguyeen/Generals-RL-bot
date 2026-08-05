@@ -19,6 +19,18 @@ v18 heuristic              1587   n=90
 The heuristic is retired as a submission. It survives as an opponent, a
 calibration point, and the source of `configs/v16.json`.
 
+**On the ladder now: `generals-bot-nn6`** — `sp5.best.npz` packaged with
+`configs/v13.json`, guard active. Early reading is bad. Record `n` before
+treating that as a result: SE is +-58 at n=36, and this file's own rule is that
+Elo needs 100+ games.
+
+If it holds past n=100 it is a genuine contradiction, not a mis-ship. The arena
+put sp5 **+32.2 Elo over sp3** on 2000 games, and sp3 is the checkpoint that
+read 1849/1808. A ladder result below sp3 cannot be explained by "we shipped the
+weaker overnight run" — sp5 losing to sp8 by 25.2 says nothing about sp5 vs the
+thing currently ranked. That would make comp-eval-plus-arena instrument twelve,
+and the first one to fail *after* passing an internal consistency check.
+
 ## Checkpoints that matter
 
 | file | what | vs v16 |
@@ -115,20 +127,36 @@ noise and it is +59.5 in the arena; the instrument was too blunt to see it.
 
 ## Next, in order
 
-**1. A/B the guard.** `bot/policy/guard.py` is written, selfchecked and
-UNTESTED against a baseline. It targets the 16-of-50 losses where the net
-emptied its own general with an enemy stack within 3 steps. No training needed.
+**1. Measure the guard against an opponent that punishes.** The mirror A/B is
+done and says nothing:
 
 ```
-python -m arena.runner --a clone:runs/nn/sp3-i500-0733.npz --b ours:configs/v16.json --games 400 --workers 32
+guard:sp8.best vs clone:sp8.best   2000 games   0.507   +4.7  [-10.3, +19.7]   faults 0
 ```
 
-then package the same weights (the guard wraps automatically when
-`bot/weights.npz` exists) and replay the same 400 games through `stdio:`.
-Wrapped must beat raw or the veto radius/ratio needs loosening.
+Neutral to within +-15 Elo, so the guard is NOT what sank nn6 on the ladder.
+But this is the weakest possible test of it. The guard vetoes one thing — the
+net emptying its own general with an enemy stack within 3 steps — and `clone:`
+on identical weights has to *convert* that blunder for the veto to score.
+`bot/policy/net.py:216` already says the local gauntlet cannot: none of our
+opponents punish the mistakes the field punishes. A mirror is the worst case,
+because both seats make the same blunder and neither exploits it.
 
-**2. Read the overnight runs.** sp8 above 0.807 means removing castles helped.
-sp5 above 0.739 means depth has a higher ceiling and 8x32 gets retired.
+`hunter` is the only opponent we have that goes for the general. Run both and
+take the gap; that number is the guard's value, and the 0.507 above is not.
+
+```
+$PY -m arena.runner --a guard:runs/nn/sp8.best.npz --b hunter --games 2000 --workers 32
+$PY -m arena.runner --a clone:runs/nn/sp8.best.npz --b hunter --games 2000 --workers 32
+```
+
+First check it ever fires. If the veto count is ~0 over 2000 games, 0.507 is
+explained trivially and the veto radius/ratio is too tight to matter.
+
+**2. Decide what the ladder is measuring.** nn6 (sp5 + guard) is underperforming
+against an arena that predicted +32.2 over sp3. Get `n` first. If it is real,
+the arena triangle passing its own consistency check did not make it valid, and
+`sp3-i500-0733.npz` on cluster 1 is the rollback to a known 1808.
 
 **3. Information channels.** Threat (nearest enemy stack, size, distance to our
 general), dist-home BFS, fog memory, per-cell build cost. All computable, none
@@ -182,3 +210,16 @@ distances that is correct tempo, and in a mirror both sides do it.
   leaves alone.
 * Two runs on one L4 OOM at ~22 GB. Always `export XLA_PYTHON_CLIENT_PREALLOCATE=false`
   and check nothing else holds the card.
+* The arena needs the four BLAS exports from `docs/CLUSTER.md:90` as much as
+  training does, and there it fails silently instead of loudly: 32 workers
+  oversubscribe to a ~350 ms mean move, every move over 150 ms becomes a fault
+  and a forced pass, and the match scores 0.500 — reproducible and wrong. Read
+  the `faults` line before the Elo line, every time. Caught once this session
+  mid-run; the giveaway was 2000 games crawling where 400 took 62s.
+* `make` targets hardcode `PY := .venv/bin/python`, which does not exist on the
+  cluster. Every cluster invocation needs `PY=` (`docs/CLUSTER.md:63`).
+* The submit recipe's last line writes a score-stamped snapshot so the live
+  `.best.npz` cannot overwrite the keep. Write a NEW filename. A copy of the
+  form `cp runs/nn/spN.npz runs/nn/sp3-bp-0807.npz` lands on an existing
+  checkpoint and destroys it, which is the one thing this file says never to do
+  — and it leaves a file whose name lies about its contents.
