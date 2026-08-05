@@ -264,6 +264,58 @@ the win-probability differential is zero. No reward change, no critic change and
 no extra sampling alters that. Either the opponent builds at a different rate
 than you do, or the rate is set after training.
 
+## THE FINDING: it dies to army it cannot see
+
+Ladder forensics on the ten shortest losses, measured at the tick the general is
+EMPTIED rather than at the tick it falls:
+
+```
+id       garrison   enemy total   visible   HIDDEN   visible threat <=3
+109479      27          237          33       204            2
+109498      45          150          31       119            2
+109484      50          134          18       116            0
+109470      19          159          12       147            2
+109478      26          121          24        97            7
+109476      13          162          76        86            0
+109486      31          172         105        67           51
+109471      22          102          60        42            2
+109475      21          112          87        25            0
+109466      15           41          19        22            0
+```
+
+**Hidden enemy army exceeds the garrison in 10/10, by 1.2x to 7.7x. Visible
+threat within 3 is ~0 in 9/10.** The killer arrives 7-36 turns later.
+
+Measure at the DEATH tick and the killer is adjacent in all ten — that reading is
+worthless and was reported as decisive earlier in the day. The decision that loses
+the game happens 10-36 turns before, when the board looks safe.
+
+So this is not garrison valuation and not receptive field. **The bot has no idea
+how much army it cannot see.** It also explains thor (6-0 against us): thor ends
+with more army on equal land because it stockpiles, and a stockpile in fog is
+invisible until it lands.
+
+**`bot/policy/guard.py` is dead as designed.** `drains_general` requires a visible
+enemy within radius 3 at decision time; that condition holds in 1 of 10. It
+measured neutral in the arena because it almost never fires.
+
+### The fix, and both halves are already in the observation
+
+`opp_army` (scoreboard total) is ALREADY one of the eight broadcast scalars.
+Visible enemy army is a sum over the observation. The bot has both and never
+computes the difference.
+
+```
+GARRISON      log1p(my general's army) / 6
+HIDDEN_OPP    log1p(max(0, opp_army_total - visible_opp_army)) / 6
+```
+
+The ratio comes free: `log1p(hidden) - log1p(garrison)` is the log ratio and is a
+linear combination of two scalars, which the first stem layer computes itself.
+
+Visible-threat scalars are the WRONG fix for the same reason the guard is: visible
+is precisely what is not dangerous at decision time.
+
 ## Four things measured on 2026-08-05 that change how runs are set up
 
 **Stage 3 is exhausted for `sp8.best`. Start at stage 4.** sp9 ran 400 iterations
