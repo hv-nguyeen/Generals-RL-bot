@@ -1771,7 +1771,28 @@ def main() -> None:
         # here or the curriculum band cannot afford them (stage 0 reaches 35 army
         # around turn 68 but has no rear to build in), and either way the 3529 ->
         # 3970 change bought nothing at that stage.
-        builds = int((idxs % features.PER_CELL == features.BUILD_OFFSET).sum())
+        bmask = (idxs % features.PER_CELL) == features.BUILD_OFFSET
+        builds = int(bmask.sum())
+        # `bldA` is the mean NORMALISED advantage PPO actually applied to those
+        # build actions -- the gradient itself, not an inference about it.
+        #
+        # It exists because three measurements could not all be true at once.
+        # `tools/vprobe` says this critic values a castle at +0.28 in z units,
+        # within 20% of the +111 Elo the heuristic measures for castles; the 35
+        # army costs it only -0.004; and yet PPO drove `bld` from 0.57 to 0.08 in
+        # 31 iterations with `--stage-replay 0`, so the replay boards are not the
+        # cause either. Under the straightforward GAE story the delta at a build
+        # is V(after) - V(before) > 0 and the rate should RISE.
+        #
+        # bldA > 0 -> the gradient does favour building and something downstream
+        #             suppresses it anyway. Look at the ratio clip and the KL term.
+        # bldA < 0 -> the critic's castle valuation does not survive at the states
+        #             where builds really happen, vprobe's rear-tile perturbation
+        #             is unrepresentative, and its conclusion does not hold.
+        #
+        # Normalised, so read the SIGN and the size relative to ADV_CLIP; it is
+        # not comparable across iterations in absolute units.
+        bld_adv = float(adv[bmask].mean()) if builds else 0.0
         # The freeze counter is in the tag, not just the fact of it: a frozen
         # policy is a legitimate state for a few iterations and a dead run after
         # FROZEN_KILL, and the line has to say which one you are looking at.
@@ -1779,6 +1800,7 @@ def main() -> None:
         print(f"iter {it:5d}  stage {stage} ({dmin}{hi})  games {len(g0)}  "
               f"W/D/L {w}/{d}/{len(g0) - w - d}  samp {n // 1000:3d}k  "
               f"turns {turns:.0f}  dist {dist:.1f}  bld {builds / len(g0):.2f}"
+              f" bldA {bld_adv:+.2f}"
               f"{util}{tag}\n"
               # `v` is MSE on the scalar head and KL nats on hlgauss -- two
               # different units, so the field is NAMED after the head rather
