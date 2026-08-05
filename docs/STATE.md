@@ -50,15 +50,39 @@ The curriculum is why RL works here after six failures. At short distance the
 critic reached explained variance 0.12 in 15 iterations; at competition distance
 it never crossed it in 1400.
 
-## What is running
+## Where the checkpoints physically are
 
-| node | run | init | status |
-|---|---|---|---|
-| c1 | `sp8` | `sp3-bp-0807` | stage 3, PPO deleted the castles, comp-eval ~0.740 |
-| c2 | `sp5` | `clone20-d12-bp` | 12x32 depth test, 0.677 at iteration 250 |
+`/local/data` is per-node and nothing syncs it, so each run can only see its own
+files. This has cost time twice; the map:
 
-Both write `.best.npz` whenever comp-eval improves, so killing either at any
-point keeps its best.
+| cluster | holds | reach it |
+|---|---|---|
+| 1 | `sp3-i500-0733`, `sp3-bp-0807`, `sp8.*`, `configs/` | `ssh -J vng205@ssh.data.vu.nl vng205@1.compute.vu.nl` |
+| 2 | `clone20*`, `sp5.*` | JupyterHub lands here |
+
+Any head-to-head needs both sides on ONE node. Copy through `~` and verify the
+file arrived before running anything.
+
+## Overnight runs, both finished
+
+| run | init | base | best | promotions | ended by |
+|---|---|---|---|---|---|
+| `sp8` | `sp3-bp-0807` | 0.759 | **0.820** @200 | both FORCED | iterations |
+| `sp5` | `clone20-d12-bp` | 0.335 | **0.800** @350 | three EARNED | KILL 2 |
+
+Read each against its own `base`, not against numbers from another instrument —
+sp3-bp scores 0.807 in the arena and 0.759 in comp-eval, and they are not
+comparable. sp8 moved 1.2 SE and both its stage promotions were cap-forced,
+which is the trainer reporting the policy was not ready. sp5 moved +0.465,
+cleared every gate, and hit 0.800 on the dist-17+ eval while training only at
+7-13.
+
+sp5's critic reached **evar 0.405, the highest ever recorded here**, then fell
+under 0.05 and stayed there for 20 iterations until KILL 2 fired. The run did
+not plateau; its value function died. `.best.npz` is written before the kill, so
+both bests are safe.
+
+Both `.best` scores are a max over ~24 draws and are ~1 SE optimistic.
 
 ## Next, in order
 
