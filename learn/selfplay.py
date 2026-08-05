@@ -729,10 +729,26 @@ def load_critic(path: str, arch: dict, blank: dict) -> dict:
     z = np.load(path)
     got = _unflat("phi", {k: z[k] for k in z.files})
     if not got:
+        # A run's `.resume.npz` stores the critic under `phi__*`; `learn.valuetrain`
+        # writes a STANDALONE one with bare keys via `train.save`. Both are
+        # critics and both should load — the second is the whole point of
+        # `learn/valuedata.py`, whose docstring names our exact problem: "an
+        # evaluation function grounded in games where REAL opponents did the
+        # punishing. Our local opponents never punish over-commitment."
+        #
+        # Until `--init-critic` existed there was no way to get such a model into
+        # a run, which is presumably why `/local/data/vng205/val` was built and
+        # then went unused.
+        got = {k: z[k] for k in z.files}
+    if not got:
+        raise SystemExit(f"{path} is empty")
+    try:
+        a = arch_of(got)
+    except ValueError as e:
         raise SystemExit(
-            f"{path} has no phi__* keys. The critic lives in a run's "
-            f".resume.npz -- .best.npz and --out carry the policy only.")
-    a = arch_of(got)
+            f"{path} has no critic in it ({e}). Expected either a run's "
+            f".resume.npz (critic under phi__*) or a standalone value model "
+            f"from `learn.valuetrain` (bare conv*/v_w keys).") from e
     for k in ("layers", "channels", "residual"):
         if a[k] != arch[k]:
             raise SystemExit(
@@ -879,6 +895,15 @@ def selfcheck() -> None:
         np.savez(_p, **_flat("phi", {**_phi, **arch_record(_phi)}), it=0)
         _arch = arch_of(_phi)
         _got = load_critic(str(_p), _arch, _phi)
+
+        # A STANDALONE critic too: `learn.valuetrain` writes bare keys via
+        # `train.save`, and that file is the ladder-grounded value model the
+        # whole `valuedata` pipeline exists to produce.
+        _b = Path(_d) / "value.npz"
+        np.savez(_b, **{**_phi, **arch_record(_phi)})
+        _bare = load_critic(str(_b), _arch, _phi)
+        for _k in _phi:
+            assert np.array_equal(_bare[_k], _phi[_k]), f"bare critic {_k}"
         assert set(_got) == set(_phi)
         for _k in _phi:
             assert np.array_equal(_got[_k], _phi[_k]), _k
