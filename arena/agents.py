@@ -390,11 +390,15 @@ def make(spec: str, player_id: int, h: int, w: int, seed: int = 0):
         path, _, k = arg.partition("@")
         return Sniper(player_id, h, w, path, int(k) if k else None, seed)
     if name == "guard":
+        # `guard:weights.npz@1.5` sets the HIDDEN-army trigger; @0 disables it and
+        # restores the visible-only rule, which fires on 1 of 10 real deaths.
         from bot.policy.guard import GuardedPolicy
         from bot.policy.net import ClonePolicy
+        path, _, hr = arg.partition("@")
         cfg = Config()          # radius/ratio track the tuned defaults, not literals
-        return GuardedPolicy(ClonePolicy(player_id, h, w, arg),
-                             cfg.general_block_radius, cfg.general_block_ratio)
+        return GuardedPolicy(ClonePolicy(player_id, h, w, path),
+                             cfg.general_block_radius, cfg.general_block_ratio,
+                             float(hr) if hr else 0.0)
     if name == "stdio":
         from arena.stdio_agent import StdioAgent
         return StdioAgent(arg, player_id, h, w)

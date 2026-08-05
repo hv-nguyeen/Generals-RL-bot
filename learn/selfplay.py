@@ -1750,14 +1750,23 @@ def main() -> None:
             rv = float(r.var())
             return float(1.0 - ((r - v).var() / rv)) if rv > 1e-9 else float("nan")
 
-        # The ceiling-free control: least squares on the EIGHT BROADCAST SCALAR
-        # planes (turn, parities, the four log1p totals), which are constant over
-        # the grid, so channel `C-8:` at any cell is the whole feature vector.
-        # A predictor with no board at all, fit on the same subset, facing the
-        # same martingale ceiling. `evar_l - sc_l <= 0` says the critic extracts
-        # nothing the clock does not already give; both low and equal says the
-        # state does not contain it and no value loss recovers it.
-        sc = np.c_[xs[:, features.C - 8:, 0, 0].astype(np.float32), np.ones(n, np.float32)]
+        # The ceiling-free control: least squares on ALL the broadcast scalar
+        # planes, which are constant over the grid, so `features.CLOCK:` at any
+        # cell is the whole feature vector. A predictor with no board at all, fit
+        # on the same subset, facing the same martingale ceiling. `evar_l - sc_l
+        # <= 0` says the critic extracts nothing the clock does not already give;
+        # both low and equal says the state does not contain it and no value loss
+        # recovers it.
+        #
+        # `features.C - 8` until 2026-08-05, which was right at C=20 and silently
+        # WRONG the moment the encoder grew: at C=22 it selected channels 14-21
+        # and dropped CLOCK and PARITY, at C=24 it also dropped GROW_PHASE and
+        # DEATHTOUCH -- so the control lost the clock, the one scalar this
+        # module's own docstring calls mechanically necessary for predicting a
+        # draw, and every sc number printed after the migration was a different
+        # instrument under the old name. Anchored to the first scalar channel
+        # instead of counted back from the end, so it survives the next one.
+        sc = np.c_[xs[:, features.CLOCK:, 0, 0].astype(np.float32), np.ones(n, np.float32)]
 
         def _evar_scalars(m):
             a, r = sc[m], ret[m]

@@ -92,15 +92,44 @@ def winning_move(obs: Obs, mask: np.ndarray):
     return None
 
 
-def drains_general(obs: Obs, idx: int, gen, radius: int, ratio: float) -> bool:
-    """Would this move empty the general while something comparable is close?
+def drains_general(obs: Obs, idx: int, gen, radius: int, ratio: float,
+                   hidden_ratio: float = 0.0) -> bool:
+    """Would this move empty the general while something dangerous is out there?
 
-    `ratio` is measured against the garrison BEFORE the move, matching v16's
-    `general_block_ratio`. The threat scan is Chebyshev distance on visible enemy
-    tiles only — no belief, no memory, because this file runs inside the
-    submission and must stay numpy-only and cheap.
+    TWO triggers, and the second one is the one that matters.
+
+    The VISIBLE trigger — an enemy within `radius` out-sizing the garrison — is
+    v16's `general_block_ratio` and it is nearly dead. Ladder forensics on the ten
+    shortest losses, measured at the tick the general is EMPTIED rather than the
+    tick it falls: the visible threat within 3 tiles is ~0 in 9 of 10, and this
+    condition fires on 1 of 10. The killer arrives 7-36 turns LATER. Measuring at
+    the death tick shows it adjacent every time, which is tautological and is how
+    it looked correct for a day.
+
+    The HIDDEN trigger looked obvious and is OFF BY DEFAULT because it measured
+    catastrophic. Hidden army exceeds the garrison in 10 of 10 losses at the
+    drain tick (1.2x to 7.7x; medians 191 against 38 in losses, 28 against 34 in
+    wins), so it reads as a clean discriminator. It is not a usable trigger:
+
+        hidden_ratio   veto fires    Elo vs the plain net, 300 games
+        0 (visible)      0.23%      +5.8      <- default
+        1.0             98.04%    -322.7
+        2.0             46.63%    -332.8
+        4.0             10.29%     -60.8
+
+    At 1.0 the general can essentially never move. The condition holds at the
+    drain tick in losses AND most of the time in every game including the wins --
+    the forensics measured the signal at the moment of failure and never measured
+    its FALSE-POSITIVE RATE across all the other states. A discriminator at one
+    tick is not a trigger, and this is the fifth hand-written override in a day
+    to measure neutral or negative against this policy.
+
+    `opp_army` is the scoreboard total including their fogged tiles, so
+    subtracting what we can see leaves the army we cannot. Both halves arrive on
+    the wire every turn; this stays numpy-only and allocates nothing per call
+    beyond the sum.
     """
-    if gen is None or radius <= 0:
+    if gen is None:
         return False
     act = features.index_to_action(idx)
     if act is None or act[0] != rules.MOVE:
@@ -109,6 +138,15 @@ def drains_general(obs: Obs, idx: int, gen, radius: int, ratio: float) -> bool:
     if (r, c) != gen:
         return False
     gr, gc = gen
+
+    garrison = max(int(obs.army_grid[gr, gc]), 1)
+    if hidden_ratio > 0:
+        visible_opp = int(obs.army_grid[obs.owner_grid == rules.OWNER_OPP].sum())
+        hidden = max(int(obs.opp_army) - visible_opp, 0)
+        if hidden >= hidden_ratio * garrison:
+            return True
+    if radius <= 0:
+        return False
     lo_r, hi_r = max(0, gr - radius), min(obs.H, gr + radius + 1)
     lo_c, hi_c = max(0, gc - radius), min(obs.W, gc + radius + 1)
     near = obs.army_grid[lo_r:hi_r, lo_c:hi_c]
@@ -127,9 +165,14 @@ class GuardedPolicy:
     can prove and forbids one specific move it can prove is bad.
     """
 
-    def __init__(self, inner, radius: int = 3, ratio: float = 0.5):
+    def __init__(self, inner, radius: int = 3, ratio: float = 0.5,
+                 hidden_ratio: float = 0.0):
         self.inner = inner
         self.radius, self.ratio = radius, ratio
+        # Hidden army >= this multiple of the garrison vetoes leaving it. 0
+        # disables, restoring the visible-only trigger that fires on 1 of 10
+        # real death states.
+        self.hidden_ratio = hidden_ratio
         self.fired = {"win": 0, "veto": 0, "turns": 0}
         self.last_debug: dict = {}
 
@@ -160,7 +203,8 @@ class GuardedPolicy:
         for rank, idx in enumerate(order):
             if not np.isfinite(logits[idx]):
                 break
-            if drains_general(obs, int(idx), gen, self.radius, self.ratio):
+            if drains_general(obs, int(idx), gen, self.radius, self.ratio,
+                              self.hidden_ratio):
                 continue
             if rank:
                 self.fired["veto"] += 1
