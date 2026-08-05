@@ -78,6 +78,74 @@ The tarball has a top-level `generals-bot/` directory, so `-C /local/data/vng205
 lands it in the right place. It carries no `runs/`, so extracting over an
 existing tree keeps every checkpoint and log.
 
+## Bringing up a NODE THAT HAS NOTHING
+
+Only `/home/vng205` is shared. `/local/data` is per-node, so a fresh node needs
+the venv, the repo, the board pools and the checkpoints. In that order.
+
+`make setup` installs numpy ONLY — `bot/` is numpy-only by design and the
+training stack's jax+CUDA is not in the Makefile. Pin the versions off a working
+node first so the new one matches:
+
+```bash
+$PY -c "import jax, jaxlib, numpy; print(jax.__version__, jaxlib.__version__, numpy.__version__)"
+```
+
+```bash
+mkdir -p /local/data/vng205
+```
+
+```bash
+python3 -m venv /local/data/vng205/venv
+```
+
+```bash
+/local/data/vng205/venv/bin/python -m pip install "jax[cuda12]==VERSION" numpy
+```
+
+```bash
+/local/data/vng205/venv/bin/python -c "import jax; print(jax.devices())"
+```
+
+Wants `[CudaDevice(id=0)]`. **If pip cannot reach the network**, copy the venv
+node-to-node — it CANNOT go through home, which has a ~3 GB quota against the
+venv's 5.5 GB:
+
+```bash
+rsync -a --info=progress2 /local/data/vng205/venv vng205@OTHERNODE:/local/data/vng205/
+```
+
+Then the repo (tarball through home), and the pools, which regenerate locally in
+a few minutes and are deterministic, so they match every other node exactly:
+
+```bash
+$PY -m tools.pools --out runs/pools --workers 60
+```
+
+Checkpoints are ~300 KB each and go through home. From a node that has them:
+
+```bash
+cp runs/nn/sp9-i600.npz runs/nn/sp9-i500.npz runs/nn/sp3-i500-0733.npz runs/nn/sp9.resume.npz ~/
+```
+
+`field/` (~86 MB of harvested replays) is only needed for behaviour cloning, not
+for RL. Do not re-harvest it — the fetcher got the cluster IP 403'd once.
+
+**After 2026-08-05 the encoder is 22 channels and every older checkpoint is 20.**
+`net.py:181` refuses the mismatch on purpose. Migrate before running anything:
+
+```bash
+$PY -m tools.grow --net runs/nn/CKPT.npz --out runs/nn/CKPT-c22.npz --layers 8 --channels 32
+```
+
+```bash
+$PY -m tools.grow --net runs/nn/RUN.resume.npz --out runs/nn/RUN-critic-c22.npz --prefix phi --layers 8 --channels 32
+```
+
+The second is the CRITIC, which lives inside a resume file under `phi__*` and
+needs `--prefix`. Without it `--init-critic` silently has nothing to load and the
+run starts blank — which is what killed three runs before the flag existed.
+
 ## Environment — every new shell
 
 ```bash
