@@ -162,6 +162,20 @@ def mix(out: Path | str, stage: int, replay: float, seed: int = 0) -> dict:
             parts[key].append(old[key][j])
     mixed = {key: np.concatenate(v) for key, v in parts.items()}
     assert len(mixed["dist"]) == n, "mix must preserve pool size"
+    # SHUFFLE, and it is not cosmetic. `selfplay.play_train` walks the pool
+    # sequentially -- idx = (it * games + arange) % npool -- so a concatenated
+    # block is not a 25% mixture, it is 75% of the run at the current stage
+    # followed by 25% entirely at replay distances. Measured: with 32768 boards
+    # and 256 games, iteration 96 flipped to dist 3.7 under a stage-3 header and
+    # stayed there.
+    order = rng.permutation(n)
+    mixed = {key: val[order] for key, val in mixed.items()}
+    # Cheap guard against that ever coming back: any slice of the pool must
+    # still be mostly the current stage. Runs once per stage change.
+    head = in_range(stage, mixed["dist"][:max(n // 8, 1)])
+    assert head > 0.5, (f"first eighth of the mixed pool is {head:.2f} in band "
+                        f"for stage {stage} -- the replay boards are clustered, "
+                        f"and play_train walks this array in order")
     return mixed
 
 
