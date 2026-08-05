@@ -70,6 +70,17 @@ def _get(url: str, tries: int = 4) -> dict:
             with urllib.request.urlopen(req, timeout=30) as r:
                 return json.loads(r.read().decode())
         except urllib.error.HTTPError as e:
+            if e.code == 403 and attempt < tries - 1:
+                # A 403 here has been throttling at least once, not a ban — but
+                # retrying it fast is how throttling BECOMES a ban, and this is a
+                # small site whose ladder the whole project depends on. Long
+                # backoff, and it still gives up rather than looping: 30s, 60s,
+                # 120s and then the caller records the id and moves on.
+                wait = 30.0 * (2 ** attempt)
+                print(f"    403, waiting {wait:.0f}s ({attempt + 1}/{tries - 1})",
+                      flush=True)
+                time.sleep(wait)
+                continue
             if e.code in (401, 403, 404):
                 raise Forbidden(f"{e.code}") from e
             if e.code in (429, 500, 502, 503, 504) and attempt < tries - 1:
