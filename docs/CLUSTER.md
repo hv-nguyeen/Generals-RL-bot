@@ -95,6 +95,15 @@ export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_TH
 Without these OpenBLAS spawns 64 threads per worker and the node kills the
 process.
 
+They matter for the arena too, and there the failure is silent rather than
+loud. `arena/runner.py` turns any move over 150 ms into a fault and a forced
+pass, and forfeits the game at 50 of them. Unset, 32 workers oversubscribe the
+box to a ~350 ms mean move and every game ends as a timeout race that scores
+0.500 — a real result, in the sense that it is reproducible and wrong.
+
+**Always read the `faults` line before the Elo line.** Anything but 0 means
+throw the run away.
+
 ```bash
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 ```
