@@ -146,6 +146,39 @@ The second is the CRITIC, which lives inside a resume file under `phi__*` and
 needs `--prefix`. Without it `--init-critic` silently has nothing to load and the
 run starts blank — which is what killed three runs before the flag existed.
 
+## Going back a version
+
+The encoder width is the only thing that makes an old checkpoint unloadable, so
+the tags are the encoder boundaries:
+
+```bash
+git tag -n1
+```
+
+```
+c20-nn10       C=20. What nn10 on the ladder was built from. Every checkpoint
+               from before 2026-08-05 evening loads here with no migration.
+c22-hidden     C=22. GARRISON + HIDDEN_OPP (hidden army separates 6.8x).
+c24-maxstack   C=24. + MAX_STACK_MINE/OPP (3.1x and 2.2x).
+```
+
+To run an old build exactly as it was, use a WORKTREE rather than checking out —
+a checkout would break every job running from this tree:
+
+```bash
+git worktree add /local/data/vng205/gb-c20 c20-nn10
+```
+
+Then run from `/local/data/vng205/gb-c20`, which has its own `bot/features.py`
+at the old width and needs no migrated checkpoints.
+
+**Do not `git checkout` a tag on a node with a run in flight.** The process has
+its code in memory and survives, but it writes checkpoints at its own width, and
+anything that auto-resumes picks up the new checkout and dies on a shape error.
+
+Going FORWARD needs no worktree — `tools.grow` pads any narrower stem to the
+current `features.C` with zero columns, so 20 -> 24 in one hop is fine.
+
 ## Environment — every new shell
 
 ```bash
