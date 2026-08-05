@@ -44,7 +44,7 @@ from pathlib import Path
 import numpy as np
 
 from bot import features
-from bot.policy.net import arch_of, trunk_keys
+from bot.policy.net import arch_of, arch_record, trunk_keys
 
 # Incoming weights for new channels. Small enough not to saturate relu on the
 # first step, large enough that the outgoing gradient is not denormal.
@@ -100,9 +100,16 @@ def grow(z, layers: int, channels: int, seed: int = 0) -> dict:
     npw[:pw.shape[0]] = pw
     out["pass_w"], out["pass_b"] = npw, np.asarray(z["pass_b"], np.float32)
 
-    for k in z.files:                              # carry anything else verbatim
-        if k not in out and not k.startswith(("conv", "head", "pass")):
+    # Carry anything else verbatim EXCEPT the arch record, which describes the
+    # net we just stopped being. `arch_of` cross-checks that metadata against the
+    # trunk keys and refuses to load a file whose two answers disagree — which is
+    # the right behaviour, and is how this bug surfaced instead of shipping a
+    # checkpoint that claimed to be 8x32 while being 12x64.
+    stale = set(arch_record(out))
+    for k in z.files:
+        if k not in out and k not in stale and not k.startswith(("conv", "head", "pass")):
             out[k] = z[k]
+    out.update(arch_record(out))
     return out
 
 
@@ -188,12 +195,19 @@ def selfcheck() -> None:
     p["head_b"] = rng.normal(0, 0.1, (features.PER_CELL,)).astype(np.float32)
     p["pass_w"] = rng.normal(0, 0.2, (C,)).astype(np.float32)
     p["pass_b"] = np.float32(0.3)
+    # A real checkpoint carries its own wiring, and the grown file must carry the
+    # NEW wiring: `arch_of` cross-checks the record against the trunk keys and
+    # refuses a file whose two answers disagree. Without this line the fixture is
+    # unrepresentative and the stale-record bug is invisible here.
+    p.update(arch_record(p))
 
     import tempfile
     with tempfile.TemporaryDirectory() as d:
         a, b = Path(d) / "a.npz", Path(d) / "b.npz"
         np.savez(a, **p)
         np.savez(b, **grow(np.load(a), L + 2, C * 2))
+        got = arch_of(np.load(b))
+        assert (got["layers"], got["channels"]) == (L + 2, C * 2), got
         n, worst = _same_moves(str(a), str(b), 3, 12_345)
         assert worst < 1e-3, f"logit gap {worst:.2e} is too large to be round-off"
 
