@@ -10,7 +10,11 @@ A spec is a string so runs are reproducible from a command line:
     random                   uniform over legal moves
     idle                     always passes
     clone:weights.npz        a behaviour-cloned policy (learn/train.py)
+    guard:weights.npz        the same policy under bot/policy/guard.py's overrides
     stdio:dist/x/run.sh      a packaged submission, over the real wire protocol
+
+`guard:` against `clone:` on the same weights is the only way to measure the
+guard on its own — via `stdio:` the packaging differences ride along with it.
 
 `expander` is deliberately a faithful port, bug included: it treats
 structure-in-fog (type 5) as impassable, when in fact only mountains are. That
@@ -250,6 +254,12 @@ def make(spec: str, player_id: int, h: int, w: int, seed: int = 0):
     if name == "clone":
         from bot.policy.net import ClonePolicy
         return ClonePolicy(player_id, h, w, arg)
+    if name == "guard":
+        from bot.policy.guard import GuardedPolicy
+        from bot.policy.net import ClonePolicy
+        cfg = Config()          # radius/ratio track the tuned defaults, not literals
+        return GuardedPolicy(ClonePolicy(player_id, h, w, arg),
+                             cfg.general_block_radius, cfg.general_block_ratio)
     if name == "stdio":
         from arena.stdio_agent import StdioAgent
         return StdioAgent(arg, player_id, h, w)
