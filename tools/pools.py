@@ -122,6 +122,49 @@ def load(out: Path | str, stage: int) -> dict:
     return {k: z[k] for k in ("grid", "h", "w", "dist")}
 
 
+KEYS = ("grid", "h", "w", "dist")
+
+
+def mix(out: Path | str, stage: int, replay: float, seed: int = 0) -> dict:
+    """`stage`'s pool with a `replay` share swapped for already-cleared stages.
+
+    Promotion is otherwise a hard switch: enter stage 4 and every board is 11-17
+    from then on, stage 3 never appearing again. After a FORCED promotion that is
+    the damaging case -- the policy is handed positions it loses whatever it
+    plays, terminal reward carries no gradient there, and it loses the distances
+    it had. sp8 fell from comp-eval 0.820 through both of its forced promotions.
+
+    The pool KEEPS ITS SIZE, so `npool` and the `it * games` board-index walk in
+    `selfplay.play_train` are unchanged and a mixed run stays comparable to a
+    plain one. The current stage still supplies `1 - replay` of every batch and
+    the promotion gate is untouched, so the curriculum does not slow down.
+
+    Costs no wall clock: the vectorised rollout runs to `--max-turns` under a
+    done mask either way, so a short board frees no time and a long one adds none.
+    """
+    cur = load(out, stage)
+    n = len(cur["dist"])
+    k = int(round(replay * n))
+    if stage == 0 or replay <= 0.0 or k == 0:
+        return cur
+
+    rng = np.random.default_rng(seed)
+    keep = rng.permutation(n)[:n - k]
+    parts = {key: [cur[key][keep]] for key in KEYS}
+    drawn = rng.integers(0, stage, size=k)          # which cleared stage each replay board comes from
+    for s in range(stage):
+        m = int((drawn == s).sum())
+        if not m:
+            continue
+        old = load(out, s)
+        j = rng.permutation(len(old["dist"]))[:m]
+        for key in KEYS:
+            parts[key].append(old[key][j])
+    mixed = {key: np.concatenate(v) for key, v in parts.items()}
+    assert len(mixed["dist"]) == n, "mix must preserve pool size"
+    return mixed
+
+
 def write(out: Path | str, stages=None, size: int = DEFAULT_SIZE,
           workers: int = 1) -> None:
     out = Path(out)

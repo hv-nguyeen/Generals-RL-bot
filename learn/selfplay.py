@@ -457,16 +457,42 @@ def _pack(buf: list, winner: int, turns: int, dist: int) -> list[dict] | None:
 
 
 # --------------------------------------------------------------------------
-def build_jobs(it: int, games: int, stage: int) -> list[tuple]:
+def build_jobs(it: int, games: int, stage: int, replay: float = 0.0) -> list[tuple]:
     """Self-play training jobs. ONE job = one board = one game = TWO trajectories.
 
     There is no seat loop and no opponent index. Both seats are the same
     network on the same board, so seat bias cancels inside the game rather than
     across a pair of them, and the batch is exactly zero-sum.
+
+    `replay` is the share of boards drawn from an ALREADY-CLEARED stage instead
+    of the current one. Promotion is otherwise a hard switch -- enter stage 4 and
+    every board is 11-17 forever, stage 3 never appears again -- and after a
+    FORCED promotion that is the worst case: the policy is dropped into
+    positions it loses whatever it does, terminal reward carries no gradient
+    there, and it forgets the distances it had. sp8 is the evidence, comp-eval
+    0.820 at iteration 200 and falling through both of its forced promotions.
+
+    Mixing does not slow the curriculum down: the current stage still gets
+    `1 - replay` of every batch and the promotion gate is unchanged. It only
+    stops the earlier distances from vanishing.
+
+    Board seeds are untouched by `replay` -- the same `it` and `b` give the same
+    seed, only the distance band moves -- so the seed-block assertions in
+    `selfcheck` hold and two runs at different `replay` remain comparable.
     """
-    dmin, dmax, _ = STAGES[stage]
     base = SP_TRAIN_SEED0 + it * games
-    return [(base + b, dmin, dmax, 0, 0) for b in range(games)]
+    if stage == 0 or replay <= 0.0:
+        dmin, dmax, _ = STAGES[stage]
+        return [(base + b, dmin, dmax, 0, 0) for b in range(games)]
+
+    rng = np.random.default_rng(SP_TRAIN_SEED0 + it)
+    picks = np.where(rng.random(games) < replay,
+                     rng.integers(0, stage, size=games), stage)
+    jobs = []
+    for b, s in enumerate(picks):
+        dmin, dmax, _ = STAGES[int(s)]
+        jobs.append((base + b, dmin, dmax, 0, 0))
+    return jobs
 
 
 def eval_jobs(n: int, dmin: int, dmax: int | None, seed0: int,
@@ -771,6 +797,17 @@ def selfcheck() -> None:
     assert len(jt) == 256 and len({j[0] for j in jt}) == 256
     assert max(j[0] for j in jt) < SP_STAGE_SEED0
     assert all(j[3] == 0 for j in jt)
+
+    # stage replay: same board seeds, only the distance band moves, and the
+    # current stage still supplies the majority. replay=0 must be bit-identical
+    # to every run before it existed.
+    assert build_jobs(7, 256, 3, 0.0) == build_jobs(7, 256, 3)
+    mixed = build_jobs(7, 256, 3, 0.25)
+    assert [j[0] for j in mixed] == [j[0] for j in build_jobs(7, 256, 3)]
+    cur = sum(1 for j in mixed if (j[1], j[2]) == STAGES[3][:2])
+    assert 0.6 < cur / len(mixed) < 0.9, f"current stage got {cur}/{len(mixed)}"
+    assert all((j[1], j[2]) in [s[:2] for s in STAGES[:4]] for j in mixed)
+    assert build_jobs(7, 256, 0, 0.25) == build_jobs(7, 256, 0)   # stage 0 has no past
     je = eval_jobs(200, 7, 13, SP_STAGE_SEED0)
     assert len(je) == 200 and all(j[3] == 1 for j in je)
     assert sorted(j[4] for j in je) == [0] * 100 + [1] * 100
@@ -1048,6 +1085,13 @@ def main() -> None:
                     help="iterations at one stage before promotion is FORCED. "
                          "5 x this must be under --iters or the run never "
                          "reaches the competition distribution it is gated on")
+    ap.add_argument("--stage-replay", type=float, default=0.25,
+                    help="share of training boards drawn from already-cleared "
+                         "stages instead of the current one. Keeps the forced "
+                         "promotion (the run must reach competition distance) "
+                         "without letting the earlier distances vanish, which "
+                         "is what sp8 lost after each of its two forced ones. "
+                         "0.0 reproduces every run before 2026-08-05")
     ap.add_argument("--max-turns", type=int, default=rules.TURN_LIMIT)
     ap.add_argument("--probe", type=int, default=0, metavar="ITERS",
                     help="CHEAP HYPOTHESIS TEST, run this before the night. Pins "
@@ -1399,10 +1443,12 @@ def main() -> None:
         from tools import pools
 
         if vec["stage"] != stage:
-            host = pools.load(args.pool_dir, stage)
+            host = pools.mix(args.pool_dir, stage, args.stage_replay)
             vec.update(stage=stage, pool=vecroll.device_pool(host))
             print(f"  pool: stage {stage}, {len(host['dist'])} boards, "
-                  f"mean dist {host['dist'].mean():.1f}", flush=True)
+                  f"mean dist {host['dist'].mean():.1f}"
+                  f"{f', {args.stage_replay:.0%} replay of stages 0-{stage - 1}' if stage and args.stage_replay else ''}",
+                  flush=True)
         if vec["step"] is None:
             vec["step"] = vecroll.make_step(bc.forward)
             vec["scan"] = vecroll.make_scan(vec["step"], args.scan_chunk)
@@ -1455,7 +1501,8 @@ def main() -> None:
         dmin, dmax, _ = STAGES[stage]
         snapshot = {k: np.asarray(v) for k, v in theta.items()}
         results = (play_train(it, stage) if vec_backend
-                   else play(build_jobs(it, args.games, stage), snapshot))
+                   else play(build_jobs(it, args.games, stage, args.stage_replay),
+                             snapshot))
         # WHERE THE ITERATION GOES, printed every iteration, because two
         # speedup attempts were designed against a guess about this and both
         # under-delivered. Four phases, and they are the four terms of the
