@@ -17,7 +17,7 @@ from bot import rules
 from bot.obs import Obs
 
 PAD = 21                      # every competition board fits in 21x21
-C = 20                        # feature channels: 12 spatial, then 8 broadcast
+C = 22                        # feature channels: 12 spatial, then 10 broadcast
 DIRS_N = 4
 SPLITS = 2
 BUILD_OFFSET = DIRS_N * SPLITS      # slot 8 of a cell is "build a castle here"
@@ -27,14 +27,16 @@ PASS_INDEX = N_ACTIONS - 1
 
 (MINE, OPP, NEUTRAL, FOG, MOUNTAIN, CASTLE,
  MY_GEN, OPP_GEN, ARMY_MINE, ARMY_OPP, ARMY_NEUTRAL, VALID,
- # broadcast scalars, constant over the board; CLOCK..LAND_OPP must stay the
+ # broadcast scalars, constant over the board; CLOCK..HIDDEN_OPP must stay the
  # LAST channels and stay contiguous — `encode` fills them as one slice.
  CLOCK, PARITY, GROW_PHASE, DEATHTOUCH,
- ARMY_TOTAL_MINE, ARMY_TOTAL_OPP, LAND_MINE, LAND_OPP) = range(C)
+ ARMY_TOTAL_MINE, ARMY_TOTAL_OPP, LAND_MINE, LAND_OPP,
+ GARRISON, HIDDEN_OPP) = range(C)
 
 
-def scalar_features(turn, my_army, opp_army, my_land, opp_land, log1p=np.log1p):
-    """The eight broadcast scalars, in channel order, for CLOCK..LAND_OPP.
+def scalar_features(turn, my_army, opp_army, my_land, opp_land,
+                    garrison, hidden_opp, log1p=np.log1p):
+    """The ten broadcast scalars, in channel order, for CLOCK..HIDDEN_OPP.
 
     ONE definition called by both encoders — `bot.features.encode` with
     `np.log1p` and `learn.rlenv.encode_jax` with `jnp.log1p` — because two
@@ -55,6 +57,29 @@ def scalar_features(turn, my_army, opp_army, my_land, opp_land, log1p=np.log1p):
         `opp_army - (visible enemy army)` is the hidden army the heuristic's
         `belief.hidden_enemy_army` runs on — by construction not computable from
         the board the network sees.
+      * GARRISON and HIDDEN_OPP, added 2026-08-05 off ladder forensics. Measured
+        at the tick our general is EMPTIED — not the tick it falls, which is
+        tautological — hidden enemy army exceeds the garrison in 10 of 10 losses
+        by 1.2x to 7.7x, while the VISIBLE threat within 3 tiles is ~0 in 9 of
+        10; the killer arrives 7-36 turns later. Over a larger batch the median
+        hidden army is 188 in losses and 28 in wins, and garrison alone does NOT
+        discriminate (37.5 vs 34). The bot empties its general because the board
+        LOOKS safe.
+
+        The paragraph above already said this quantity was "by construction not
+        computable from the board the network sees" and it was left uncomputed
+        for the whole project. Both halves were always here: `opp_army` is the
+        scoreboard total and the visible sum is one reduction over the encoding.
+
+        Passed in rather than derived here because the two encoders hold the
+        board differently — numpy grids in `features.encode`, starter-kit planes
+        in `rlenv.encode_jax` — and this function must stay their one shared
+        definition of channel order. `tools.verify_engine --encoders` compares
+        them and would catch drift.
+
+        The RATIO comes free: log1p(hidden) - log1p(garrison) is the log ratio,
+        a linear combination of two inputs, which the first conv computes itself.
+        No hand-built ratio channel.
     """
     return (turn / rules.TURN_LIMIT,
             turn % 2,                                  # structures_grow
@@ -63,7 +88,9 @@ def scalar_features(turn, my_army, opp_army, my_land, opp_land, log1p=np.log1p):
             log1p(my_army) / 6.0,
             log1p(opp_army) / 6.0,
             log1p(my_land) / 6.0,
-            log1p(opp_land) / 6.0)
+            log1p(opp_land) / 6.0,
+            log1p(garrison) / 6.0,
+            log1p(hidden_opp) / 6.0)
 
 
 def encode(obs: Obs) -> np.ndarray:
@@ -93,9 +120,16 @@ def encode(obs: Obs) -> np.ndarray:
     # Broadcast over the real board only, so the padding stays all-zero in every
     # channel: `learn.train.augment` reads the bottom-right pad cell for dst
     # cells outside a rotated non-square board and expects zeros there.
+    # `opp_army` is the scoreboard total and includes the opponent's fogged
+    # tiles; subtracting what we can actually see leaves the army that is out
+    # there unaccounted for. Clamped at 0 because the scoreboard and the
+    # observation are sampled at the same tick but nothing guarantees it.
+    visible_opp = float(np.where(opp, a, 0).sum())
+    hidden_opp = max(float(obs.opp_army) - visible_opp, 0.0)
+    garrison = float(np.where(mine & (t == rules.T_GENERAL), a, 0).sum())
     x[CLOCK:, :h, :w] = np.array(
         scalar_features(obs.turn, obs.my_army, obs.opp_army,
-                        obs.my_land, obs.opp_land),
+                        obs.my_land, obs.opp_land, garrison, hidden_opp),
         dtype=np.float32)[:, None, None]
     return x
 

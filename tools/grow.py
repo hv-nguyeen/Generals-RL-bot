@@ -66,8 +66,13 @@ def grow(z, layers: int, channels: int, seed: int = 0) -> dict:
     for i, name in enumerate(old):
         w, b = z[f"{name}_w"], z[f"{name}_b"]
         cout, cin = w.shape[0], w.shape[1]
-        # The stem's input is the observation encoding and must not change width.
-        cin2 = cin if i == 0 else channels
+        # The stem's input is the observation encoding. It grows when the encoder
+        # gains channels -- GARRISON and HIDDEN_OPP landed on 2026-08-05 -- and
+        # the new columns are ZERO, so the grown net computes the identical move
+        # while still receiving gradient on them: d(loss)/d(w_new) is the input
+        # value times the upstream error, and the input is not zero even though
+        # the weight is.
+        cin2 = max(cin, features.C) if i == 0 else channels
         cout2 = channels
         nw = np.zeros((cout2, cin2, 3, 3), np.float32)
         nb = np.zeros((cout2,), np.float32)
@@ -173,8 +178,22 @@ def main() -> None:
           f"{after['layers']}x{after['channels']} ({n_after} params, "
           f"{n_after / max(n_before, 1):.1f}x)")
 
-    n, worst = _same_moves(args.net, str(tmp), args.verify_games, 900_000)
-    print(f"verified: {n} positions, identical argmax, max |logit gap| {worst:.2e}")
+    stem_in = int(np.load(args.net)[f"{trunk_keys(before['layers'], False)[0]}_w"].shape[1])
+    if stem_in < features.C:
+        # The parent cannot be LOADED under the current encoder -- `Net.__init__`
+        # rejects a stem of the wrong width, on purpose -- so the play-based
+        # check cannot run. The guarantee is structural instead: the new input
+        # columns are exactly zero, so they contribute nothing to any activation.
+        newcols = grown[f"{trunk_keys(after['layers'], False)[0]}_w"][:, stem_in:]
+        assert np.abs(newcols).max() == 0.0, "new stem columns are not zero"
+        print(f"stem input {stem_in} -> {features.C}: the {features.C - stem_in} "
+              f"new encoder channels enter with ZERO weight, so the function is "
+              f"preserved by construction. Cannot play-verify: the parent does "
+              f"not load under a {features.C}-channel encoder, which is exactly "
+              f"the check net.py:181 exists to enforce.")
+    else:
+        n, worst = _same_moves(args.net, str(tmp), args.verify_games, 900_000)
+        print(f"verified: {n} positions, identical argmax, max |logit gap| {worst:.2e}")
     print(f"wrote {tmp}")
     print("\nResume from it at the stage the parent reached -- it plays the same "
           "game, so a difference later is capacity and not a fresh start.")

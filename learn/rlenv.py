@@ -49,10 +49,16 @@ def encode_jax(obs, valid_h, valid_w):
     # The broadcast scalars come from features.scalar_features itself rather than
     # being re-derived here: they are eight expressions in a fixed channel order,
     # and a second copy of that order is the kind of drift that trains cleanly.
+    # Same two reductions as `features.encode`, over planes instead of grids.
+    visible_opp = (obs.armies * obs.opponent_cells).sum()
+    hidden_opp = jnp.maximum(obs.opponent_army_count - visible_opp, 0.0)
+    garrison = (obs.armies * obs.generals * obs.owned_cells).sum()
+
     ones = jnp.ones_like(valid)
     scalars = [(ones * s).astype(jnp.float32) for s in features.scalar_features(
         obs.timestep, obs.owned_army_count, obs.opponent_army_count,
-        obs.owned_land_count, obs.opponent_land_count, jnp.log1p)]
+        obs.owned_land_count, obs.opponent_land_count,
+        garrison, hidden_opp, jnp.log1p)]
 
     x = jnp.stack([
         mine,
