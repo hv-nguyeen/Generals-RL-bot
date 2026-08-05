@@ -740,6 +740,12 @@ def load_critic(path: str, arch: dict, blank: dict) -> dict:
                 f"(residual={a['residual']}), this run is {arch['layers']}x"
                 f"{arch['channels']} (residual={arch['residual']}). Grow or "
                 f"retrain it; a critic for a different trunk is not loadable.")
+    # `arch_record` keys are METADATA, not parameters, and `arch_of` above has
+    # already used them for the cross-check that makes a mislabelled file fail
+    # loudly. `tools.grow` writes them into everything it produces, so a migrated
+    # critic arrives with three keys the freshly built one does not have, and an
+    # exact key match rejected it.
+    got = {k: v for k, v in got.items() if k not in arch_record(got)}
     if set(got) != set(blank):
         missing = sorted(set(blank) - set(got)) or None
         extra = sorted(set(got) - set(blank)) or None
@@ -868,7 +874,9 @@ def selfcheck() -> None:
         _phi["v_w"] = _rng.normal(0, .2, (8,)).astype(np.float32)
         _phi["v_b"] = np.float32(0.0)
         _p = Path(_d) / "r.npz"
-        np.savez(_p, **_flat("phi", _phi), it=0)
+        # WITH the arch record, because `tools.grow` writes one into every file
+        # it migrates and an exact key match rejected exactly that.
+        np.savez(_p, **_flat("phi", {**_phi, **arch_record(_phi)}), it=0)
         _arch = arch_of(_phi)
         _got = load_critic(str(_p), _arch, _phi)
         assert set(_got) == set(_phi)
