@@ -316,6 +316,36 @@ linear combination of two scalars, which the first stem layer computes itself.
 Visible-threat scalars are the WRONG fix for the same reason the guard is: visible
 is precisely what is not dangerous at decision time.
 
+### Every candidate scalar, measured before building
+
+At the drain tick, 30 long losses vs 13 long wins on the ladder. Medians, and
+the loss/win ratio is the whole decision rule — build it if the ratio is large,
+drop it if it is not:
+
+```
+                                win    loss   ratio   verdict
+hidden enemy army                28     191   6.8x    SHIPPED  (HIDDEN_OPP)
+opponent's biggest VISIBLE stack 16      49   3.1x    SHIPPED  (MAX_STACK_OPP)
+our biggest stack                13       6   2.2x    SHIPPED  (MAX_STACK_MINE)
+hidden-army density             2.1     3.2   1.5x    rejected
+BFS distance to nearest reserve   9      13   1.4x    rejected
+our garrison                     34      38   1.1x    kept only as the ratio's
+                                                       other half
+army concentration              .030    .033  1.0x    rejected
+```
+
+A global MAXIMUM is unreachable for this architecture and that is why the max
+scalars are worth channels: the army planes carry it per cell, but the critic
+mean-pools (average, not max) and the policy head is a 3x3 conv (local, not
+global).
+
+**The 2-minute check killed four ideas that reasoning liked**, including two of
+mine that were already written up as obvious. Ratios under ~2x are noise here.
+
+Incidental finding worth chasing later: in **26 of 30 losses and 9 of 13 wins
+there was no stack of 20+ army anywhere except the general.** The bot almost
+never holds a reserve — the exact inverse of thor's "equal land, more army".
+
 ### `snipe:` — the opponent that makes this measurable
 
 Nothing in our lineage decapitates, so an anti-decapitation fix reads ~0.500 in

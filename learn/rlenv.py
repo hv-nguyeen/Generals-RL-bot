@@ -53,12 +53,17 @@ def encode_jax(obs, valid_h, valid_w):
     visible_opp = (obs.armies * obs.opponent_cells).sum()
     hidden_opp = jnp.maximum(obs.opponent_army_count - visible_opp, 0.0)
     garrison = (obs.armies * obs.generals * obs.owned_cells).sum()
+    # Ours excludes the general, matching `features.encode`: GARRISON already
+    # carries that cell. A global max is unreachable for the architecture --
+    # the critic mean-pools and the policy head is a 3x3 conv.
+    max_mine = (obs.armies * obs.owned_cells * (1 - obs.generals)).max()
+    max_opp = (obs.armies * obs.opponent_cells).max()
 
     ones = jnp.ones_like(valid)
     scalars = [(ones * s).astype(jnp.float32) for s in features.scalar_features(
         obs.timestep, obs.owned_army_count, obs.opponent_army_count,
         obs.owned_land_count, obs.opponent_land_count,
-        garrison, hidden_opp, jnp.log1p)]
+        garrison, hidden_opp, max_mine, max_opp, jnp.log1p)]
 
     x = jnp.stack([
         mine,

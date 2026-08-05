@@ -17,7 +17,7 @@ from bot import rules
 from bot.obs import Obs
 
 PAD = 21                      # every competition board fits in 21x21
-C = 22                        # feature channels: 12 spatial, then 10 broadcast
+C = 24                        # feature channels: 12 spatial, then 12 broadcast
 DIRS_N = 4
 SPLITS = 2
 BUILD_OFFSET = DIRS_N * SPLITS      # slot 8 of a cell is "build a castle here"
@@ -31,12 +31,12 @@ PASS_INDEX = N_ACTIONS - 1
  # LAST channels and stay contiguous — `encode` fills them as one slice.
  CLOCK, PARITY, GROW_PHASE, DEATHTOUCH,
  ARMY_TOTAL_MINE, ARMY_TOTAL_OPP, LAND_MINE, LAND_OPP,
- GARRISON, HIDDEN_OPP) = range(C)
+ GARRISON, HIDDEN_OPP, MAX_STACK_MINE, MAX_STACK_OPP) = range(C)
 
 
 def scalar_features(turn, my_army, opp_army, my_land, opp_land,
-                    garrison, hidden_opp, log1p=np.log1p):
-    """The ten broadcast scalars, in channel order, for CLOCK..HIDDEN_OPP.
+                    garrison, hidden_opp, max_mine, max_opp, log1p=np.log1p):
+    """The twelve broadcast scalars, in channel order, for CLOCK..MAX_STACK_OPP.
 
     ONE definition called by both encoders — `bot.features.encode` with
     `np.log1p` and `learn.rlenv.encode_jax` with `jnp.log1p` — because two
@@ -80,6 +80,20 @@ def scalar_features(turn, my_army, opp_army, my_land, opp_land,
         The RATIO comes free: log1p(hidden) - log1p(garrison) is the log ratio,
         a linear combination of two inputs, which the first conv computes itself.
         No hand-built ratio channel.
+      * MAX_STACK_MINE / MAX_STACK_OPP, added the same day off the same replays.
+        At the tick our general is emptied, the opponent's biggest VISIBLE stack
+        is a median of 16 in wins and 49 in losses (3.1x), and ours is 13 vs 6
+        (2.2x). For scale: hidden army separates 6.8x, and two other candidates
+        measured that night -- hidden-army DENSITY (1.5x) and BFS distance to the
+        nearest reserve (1.4x) -- were rejected for being this weak.
+
+        A global MAXIMUM is not something this architecture can reach. The army
+        planes carry it per cell, but the critic mean-pools (so it gets the
+        average) and the policy head is a 3x3 conv (so it sees only locally).
+        "Their biggest stack anywhere is 49" is unavailable at any width.
+
+        Ours EXCLUDES the general, because GARRISON already carries that cell and
+        a max that is usually just the garrison would say nothing else.
     """
     return (turn / rules.TURN_LIMIT,
             turn % 2,                                  # structures_grow
@@ -90,7 +104,9 @@ def scalar_features(turn, my_army, opp_army, my_land, opp_land,
             log1p(my_land) / 6.0,
             log1p(opp_land) / 6.0,
             log1p(garrison) / 6.0,
-            log1p(hidden_opp) / 6.0)
+            log1p(hidden_opp) / 6.0,
+            log1p(max_mine) / 6.0,
+            log1p(max_opp) / 6.0)
 
 
 def encode(obs: Obs) -> np.ndarray:
@@ -126,10 +142,16 @@ def encode(obs: Obs) -> np.ndarray:
     # observation are sampled at the same tick but nothing guarantees it.
     visible_opp = float(np.where(opp, a, 0).sum())
     hidden_opp = max(float(obs.opp_army) - visible_opp, 0.0)
-    garrison = float(np.where(mine & (t == rules.T_GENERAL), a, 0).sum())
+    is_gen = t == rules.T_GENERAL
+    garrison = float(np.where(mine & is_gen, a, 0).sum())
+    # Ours excludes the general: GARRISON already carries that cell, and a max
+    # that is usually just the garrison would carry no extra information.
+    max_mine = float(np.where(mine & ~is_gen, a, 0).max()) if (mine & ~is_gen).any() else 0.0
+    max_opp = float(np.where(opp, a, 0).max()) if opp.any() else 0.0
     x[CLOCK:, :h, :w] = np.array(
         scalar_features(obs.turn, obs.my_army, obs.opp_army,
-                        obs.my_land, obs.opp_land, garrison, hidden_opp),
+                        obs.my_land, obs.opp_land, garrison, hidden_opp,
+                        max_mine, max_opp),
         dtype=np.float32)[:, None, None]
     return x
 
