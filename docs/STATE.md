@@ -316,6 +316,29 @@ linear combination of two scalars, which the first stem layer computes itself.
 Visible-threat scalars are the WRONG fix for the same reason the guard is: visible
 is precisely what is not dangerous at decision time.
 
+### `snipe:` — the opponent that makes this measurable
+
+Nothing in our lineage decapitates, so an anti-decapitation fix reads ~0.500 in
+the arena however well it works. `hunter` does the right thing and is saturated at
+0.979, discriminating nothing. `snipe:weights.npz` is the missing combination: the
+net plays the game, and a stack over `STACK_MIN` marches at the enemy general and
+stays on it.
+
+400 games per arm, same weights on both sides, plain net as A:
+
+```
+@30    +124.0                 a castle costs 35, so every tile that could build
+                              marched instead. built/game 0.00.
+@60     +15.6 [-18.2, +49.8]
+@90      +5.2 [-28.5, +39.0]
+@120     -6.1 [-39.8, +27.5]  <- default
+@160     +5.2 [-28.4, +38.9]
+```
+
+**From 60 up it is a peer of the champion while winning a completely different
+way.** Put it in `--opp` and comp-eval finally reports, every 50 iterations,
+whether the policy is learning to survive the thing that actually kills it.
+
 ## Four things measured on 2026-08-05 that change how runs are set up
 
 **Stage 3 is exhausted for `sp8.best`. Start at stage 4.** sp9 ran 400 iterations

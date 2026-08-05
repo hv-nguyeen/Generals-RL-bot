@@ -239,7 +239,20 @@ class Sniper:
     an opponent, and `bot/` must stay self-contained.
     """
 
-    STACK_MIN = 30
+    # Measured, 400 games per arm against the plain net on the same weights:
+    #
+    #   @30   +124.0                 a castle costs 35, so EVERY tile that could
+    #                                build instead marched. built/game was 0.00.
+    #   @60    +15.6 [-18.2, +49.8]
+    #   @90     +5.2 [-28.5, +39.0]
+    #   @120    -6.1 [-39.8, +27.5]
+    #   @160    +5.2 [-28.4, +38.9]
+    #
+    # Anything from 60 up is a peer. Below the build cost it is an
+    # army-donation machine. 120 is the most adversarial point estimate, though
+    # picking the max of a noisy sweep is ~1 se optimistic and 90-160 are
+    # indistinguishable -- the value of this opponent is its STYLE, not its Elo.
+    STACK_MIN = 120
 
     def __init__(self, player_id: int, h: int, w: int, weights: str,
                  stack_min: int | None = None):
