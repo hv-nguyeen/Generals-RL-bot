@@ -495,6 +495,16 @@ def build_jobs(it: int, games: int, stage: int, replay: float = 0.0) -> list[tup
     return jobs
 
 
+def _short(spec: str) -> str:
+    """`ours:configs/v16.json` -> `v16`, for the per-opponent breakdown.
+
+    Only a path-shaped argument is shortened: `hunter:2` is a garrison setting,
+    not a file, and labelling that column `2` would be worse than not shortening.
+    """
+    arg = spec.partition(":")[2]
+    return Path(arg).stem if "/" in arg else spec
+
+
 def eval_jobs(n: int, dmin: int, dmax: int | None, seed0: int,
               mode: int = 1) -> list[tuple]:
     """n//2 boards x 2 seats, argmax, the net against `specs[mode - 1]`.
@@ -1057,7 +1067,7 @@ def main() -> None:
                     help="AverageJoe's, lifted whole; not load-bearing, and "
                          "the arithmetic says so: the head is 32x128 = 4k "
                          "parameters against the trunk's ~33M MACs a sample "
-                         "(0.013%) and the (4096, 128) logits+target pair is "
+                         "(0.013%%) and the (4096, 128) logits+target pair is "
                          "4.2 MB against ~231 MB for ONE trunk activation")
     ap.add_argument("--hl-sigma", type=float, default=0.04,
                     help="sigma/w = 2.56 at 128 bins over [-1, 1]. The RATIO "
@@ -1073,9 +1083,16 @@ def main() -> None:
                     help="hold the policy frozen until the critic explains this "
                          "much of the return, and re-freeze if it stops")
     ap.add_argument("--opp", default="ours:configs/v16.json",
-                    help="the fixed instrument for comp-eval, the only progress "
-                         "number; it never generates a training gradient and it "
-                         "no longer decides promotion")
+                    help="comma-separated opponents for comp-eval, the only "
+                         "progress number; they never generate a training "
+                         "gradient and no longer decide promotion. Several is "
+                         "the point: this project's own first rule is that no "
+                         "single fixed opponent measures general strength, and "
+                         "for the whole life of the run that is what selected "
+                         "every checkpoint. --comp-eval-games is SPLIT across "
+                         "them on the same boards, so adding one costs games "
+                         "and not wall clock. Default is the single v16 so a "
+                         "run without this flag reproduces the old instrument")
     ap.add_argument("--stage-eval-every", type=int, default=10)
     ap.add_argument("--stage-eval-games", type=int, default=200)
     ap.add_argument("--comp-eval-every", type=int, default=50)
@@ -1172,19 +1189,31 @@ def main() -> None:
                          "training would run on the boards that decide promotion, "
                          "or the gate on boards a checkpoint was selected on. "
                          "Lower --iters/--games or move the block origins.")
-    # specs[0] is the comp-eval instrument; specs[1] is the promotion gate's
-    # opponent, which is a FILE this run rewrites on every stage entry (see
-    # stage_ref below) rather than a second external bot.
-    name, _, arg = args.opp.partition(":")
-    if name in ("ours", "clone") and not Path(arg).exists():
-        raise SystemExit(f"opponent {args.opp} points at a missing file")
-    try:
-        # Build it once here rather than discovering a typo inside 60 spawned
-        # workers, where `_rollout` would raise per game and the eval would
-        # come back empty with no line saying why.
-        agents.make(args.opp, 0, 18, 18, 0)
-    except Exception as e:                           # noqa: BLE001
-        raise SystemExit(f"opponent {args.opp} does not construct: {e}") from e
+    # specs[:n_opp] are the comp-eval instruments; specs[n_opp] is the promotion
+    # gate's opponent, which is a FILE this run rewrites on every stage entry
+    # (see stage_ref below) rather than an external bot.
+    opp_specs = [s.strip() for s in args.opp.split(",") if s.strip()]
+    if not opp_specs:
+        raise SystemExit("--opp is empty; comp-eval needs at least one opponent")
+    if len(set(opp_specs)) != len(opp_specs):
+        raise SystemExit(f"--opp repeats an opponent: {opp_specs}. Duplicates "
+                         "double that opponent's weight in the pooled score "
+                         "without saying so.")
+    per_opp = args.comp_eval_games // len(opp_specs) // 2 * 2
+    if per_opp < 2:
+        raise SystemExit(f"--comp-eval-games {args.comp_eval_games} over "
+                         f"{len(opp_specs)} opponents leaves {per_opp} games each")
+    for spec in opp_specs:
+        name, _, arg = spec.partition(":")
+        if name in ("ours", "clone") and not Path(arg).exists():
+            raise SystemExit(f"opponent {spec} points at a missing file")
+        try:
+            # Build each once here rather than discovering a typo inside 60
+            # spawned workers, where `_rollout` would raise per game and the
+            # eval would come back empty with no line saying why.
+            agents.make(spec, 0, 18, 18, 0)
+        except Exception as e:                       # noqa: BLE001
+            raise SystemExit(f"opponent {spec} does not construct: {e}") from e
 
     import jax
     import jax.numpy as jnp
@@ -1349,8 +1378,8 @@ def main() -> None:
     stage_ref = out.with_suffix(".stageref.npz")
     publish(theta_init, live)        # exists before the first worker starts
     publish(theta_init, stage_ref)
-    specs = [args.opp, f"clone:{stage_ref}"]
-    stage_mode = 2
+    specs = [*opp_specs, f"clone:{stage_ref}"]
+    stage_mode = len(opp_specs) + 1
 
     rng = np.random.default_rng(args.seed)
     start_it, stage, over, resident = 0, args.start_stage, 0, 0
@@ -1487,7 +1516,8 @@ def main() -> None:
         beta = min(beta * 2.0, BETA_MAX)
         return False
 
-    print(f"opponent: comp-eval {specs[0]} (progress), "
+    print(f"opponent: comp-eval {', '.join(opp_specs)} "
+          f"({per_opp} games each, progress), "
           "stage-eval this policy's own stage-entry weights (promotion only)")
     if args.probe:
         print(f"PROBE: stage 0 only, {args.iters} iterations, no promotion, no "
@@ -1796,10 +1826,15 @@ def main() -> None:
             # that result rather than independent of it. seed_span budgets +2
             # blocks, so this still cannot reach SP_GATE_SEED0.
             blk = it // args.comp_eval_every + (1 if it % args.comp_eval_every else 0)
-            jobs = eval_jobs(args.comp_eval_games, rules.MIN_GENERALS_DISTANCE,
-                             None, SP_COMP_SEED0 + blk * (args.comp_eval_games // 2))
+            # Every opponent plays the SAME boards, so the per-opponent numbers
+            # are paired and a hard block of maps cannot look like one opponent
+            # getting stronger. Splitting a fixed budget also means adding an
+            # instrument costs games rather than wall clock.
+            jobs = [j for m in range(1, len(opp_specs) + 1)
+                    for j in eval_jobs(per_opp, rules.MIN_GENERALS_DISTANCE, None,
+                                       SP_COMP_SEED0 + blk * (args.comp_eval_games // 2), m)]
             res = play(jobs, cur)
-            score, _ = tally(res, specs)
+            score, per = tally(res, specs)
             # stderr over what was PLAYED: `_rollout` returns None when the
             # opponent faults out, and quoting the requested count would both
             # understate the interval and tighten the guard below.
@@ -1817,9 +1852,16 @@ def main() -> None:
             # ~2 spurious rewinds in a 1200-iteration run, each one permanently
             # halving lr.
             band = 2.0 * se * 2 ** 0.5
+            # The breakdown is appended, never inserted: field 3 stays the score
+            # so `grep comp-eval | sort -k3 -g` keeps working on old and new logs.
+            # An opponent sitting at 1.000 is saturated -- it is spending games
+            # to say nothing and should come out of --opp.
+            detail = ("  [" + " ".join(f"{_short(s)} {per[s]:.2f}"
+                                       for s in opp_specs if s in per) + "]"
+                      if len(opp_specs) > 1 else "")
             print(f"comp-eval {it:5d}  {score:.3f} +-{se:.3f} "
                   f"({len(res)}/{len(jobs)} games, dist 17+)  "
-                  f"base {base_score:.3f} kill<{base_score - band:.3f}{mark}",
+                  f"base {base_score:.3f} kill<{base_score - band:.3f}{mark}{detail}",
                   flush=True)
 
             # Collapse guard, ARMED ONLY AT STAGE >= 3. Below that the policy is
@@ -1955,7 +1997,7 @@ def main() -> None:
          "base_score": None if base_score is None else round(base_score, 4),
          "gate_games": len(gate), "stage_reached": stage,
          "best_iter": best_iter, "best_comp_eval": round(best_score, 4),
-         "opponent": specs[0]}, indent=2) + "\n")
+         "opponent": opp_specs}, indent=2) + "\n")
 
     print(f"\ngate on {len(gate)} fresh competition-distance games: trained "
           f"{score:.3f} vs init {init_score:.3f}, needs +{margin:.3f} -> "
