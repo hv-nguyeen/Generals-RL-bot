@@ -219,9 +219,14 @@ ever agreed with the ladder, and a self-referential yardstick needs them.
 
 ## Architecture
 
-8 layers, 32 channels, ~73k parameters. 20 input channels (12 spatial + 8
+8 layers, 32 channels, ~73k parameters. 24 input channels (12 spatial + 12
 broadcast scalars). 3970 actions = 441 cells x 9 slots + pass, where slot 8 is
 BUILD. Runs 1.2 ms a move against a 150 ms budget.
+
+The 8x32 trunk is fixed for everything that has to interoperate, on either
+cluster: `learn.valuetrain` defaults to 4 layers, so a critic built without
+`--layers 8 --channels 32` cannot be loaded by `--init-critic`. Capacity is a
+closed question, not a per-node choice — see the re-closure below.
 
 `bot/main.py` ships the net when `bot/weights.npz` is present, wrapped in
 `bot/policy/guard.py`. Delete that file before packaging a heuristic build or it
