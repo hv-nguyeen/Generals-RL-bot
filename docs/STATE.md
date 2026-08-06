@@ -70,16 +70,40 @@ stage 4+ is the right game but the critic will not fit there.
 
 ## START HERE
 
-**Overnight 2026-08-06: sp19 and sp21.** Both start from `sp9-i600-c24b` (the
+**Overnight 2026-08-06: sp19 and sp22.** Both start from `sp9-i600-c24b` (the
 ladder champion, grown to C=24, verified `0`/`0` by `tools.grow --show` on both
-clusters) and both warm-start the critic from `value24.npz`, which passed the
-gate at +0.039 over its scalar control. The variable is the training
-distribution.
+clusters). They differ in BOTH stage and critic, so they are not a matched pair
+-- each answers its own question.
 
-| | cluster | start stage | boards | what it asks |
+| | cluster | stage | critic | what it asks |
 |---|---|---|---|---|
-| sp19 | 1 | 0, `--stage-cap 239` | generals 2-6, climbing | does a pretrained critic fix the standard recipe? |
-| sp21 | 2 | 5, no cap | generals 17+, all 1200 iters | does a pretrained critic make the curriculum unnecessary? |
+| sp19 | 1 | 3 (11-17) | `value24.npz`, ladder-trained | does it keep unlearning castles all night? |
+| sp22 | 2 | 4 (17-24) | `sp9-phi-c24.npz`, self-play-trained | does a same-distribution critic hold where a ladder one did not? |
+
+Three arms died first and each result stands on its own:
+
+* **stage 0** (sp19's first launch): critic fits instantly, but `comp-eval` fell
+  0.886 -> 0.807 in 100 iterations. Training an 1840-Elo policy on 3-tile boards
+  makes it worse at the ladder's.
+* **stage 5** with `value24`: warmup counter reached 12/20 by iteration 40 with
+  the policy frozen throughout.
+* **stage 4** with `value24`: KILL 2 fired at iteration 31, never once clearing
+  the gate. The diagnostic line was
+  `evar -0.10 (m-0.18 l+0.09 sc m+0.03 l+0.34)`.
+
+**Read that last line, it is the important one.** The scalar control's mid-game
+explained variance collapses from +0.27 at stage 0 to +0.03 at stage 4, so long
+mirror-match returns really are much less predictable. But `sc_l` is still +0.34
+while our critic manages +0.09 late and **-0.18 mid, worse than predicting the
+mean**. The gate is passable; `value24` just does not transfer.
+
+Why it does not: it was fitted on ladder games between DIFFERENT players, where
+outcomes often turn on a skill gap visible as an army or land asymmetry. In
+mirror self-play those cues are symmetric and carry nothing. **0.759 BCE accuracy
+on ladder positions bought negative explained variance on self-play returns** --
+so the gate in `learn/valuetrain.py` is too weak a predictor. A future critic gate
+should score explained variance on self-play returns, not accuracy on field
+positions.
 
 sp17 (+4.3) and sp18 (-3.6) are the controls and need no re-running: same
 champion, same C=24 encoder, cold critic, both flat on 2000 games.
