@@ -107,11 +107,22 @@ Against our self-play at each stage:
 | 5 | 17+ | ~500 | the ladder's 75th percentile |
 
 **`--start-stage 5` is a measured non-starter**, but NOT for the reason first
-recorded here. sp25 ran 650 iterations and its comp-eval column against the
-champion averaged 0.474 over 14 evals -- SE of the mean 0.0094, so -2.8 sigma,
-about -18 Elo, with no upward trend. sp24 differs only in `--start-stage` (both
-C=24, `--stage-replay 0`, `--warm-evar 0.05`) and measured +5.7. Controlled, that
-is ~24 Elo for stage 4 over stage 5.
+recorded here, and the first comparison offered for it was not like-for-like.
+Both arms, arena, 2000 games, `.best` against `.best`:
+
+```
+sp24.best (stage 4)   +5.7  [ -9.3, +20.8]
+sp25.best (stage 5)  -14.9  [-30.1,  +0.1]   accept H0
+```
+
+~20 Elo for stage 4, and the two differ only in `--start-stage` (both C=24,
+`--stage-replay 0`, `--warm-evar 0.05`, same init and critic). The version of
+this claim first written here compared sp24's ARENA number on `.best` against
+sp25's comp-eval AVERAGE over a whole run -- different instrument, different
+checkpoint. Caught in review, not by the author.
+
+Note sp25.best builds 0.45 castles a game and still loses, so castles are
+correlated with strength but are not the whole mechanism.
 
 **Why is unknown.** The first explanation written here -- that stage 5 trains on
 the wrong part of the distribution -- is contradicted by the distances:
