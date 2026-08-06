@@ -106,20 +106,38 @@ Against our self-play at each stage:
 | 4 | 17-24 | ~420 | close to the mean of 400 |
 | 5 | 17+ | ~500 | the ladder's 75th percentile |
 
-**`--start-stage 5` is a measured non-starter.** sp25 ran 650 iterations and its
-comp-eval column against the champion averaged 0.474 over 14 evals -- SE of the
-mean 0.0094, so -2.8 sigma, about -18 Elo, with no upward trend. It is not that
-long games are intrinsically unlearnable; stage 5 trains on the wrong quarter of
-the distribution.
+**`--start-stage 5` is a measured non-starter**, but NOT for the reason first
+recorded here. sp25 ran 650 iterations and its comp-eval column against the
+champion averaged 0.474 over 14 evals -- SE of the mean 0.0094, so -2.8 sigma,
+about -18 Elo, with no upward trend. sp24 differs only in `--start-stage` (both
+C=24, `--stage-replay 0`, `--warm-evar 0.05`) and measured +5.7. Controlled, that
+is ~24 Elo for stage 4 over stage 5.
 
-Stage 4 is the right target and the +35.7 checkpoint came from it, measured in an
-arena that plays the FULL competition distribution (`dmin` defaults to 17,
-unbounded). Bounded training transfers to unbounded evaluation.
+**Why is unknown.** The first explanation written here -- that stage 5 trains on
+the wrong part of the distribution -- is contradicted by the distances:
 
-Note self-play games run longer than ladder games at the same distance -- a
-mirror match drags because neither side has an edge, while a real game ends when
-a skill gap resolves. That is why stage 4's ~420 lines up with a ladder mean of
-400 rather than exceeding it.
+```
+real ladder generals-distance (600 games):  mean 22.7  median 22
+  17-24: 69.0%    <- all stage 4 ever sees
+  25-30: 23.7%
+  31-40:  7.3%
+```
+
+Stage 5 self-play runs at `dist 22.4-23.7`, matching the real 22.7 almost
+exactly, while stage 4 runs at 20.0-20.6 and never sees 31% of real games. The
+arm with the CORRECT distance distribution is the one that lost by 24 Elo.
+
+Game length is confounded and cannot carry the argument either: mirror self-play
+drags games out regardless of distance, so stage 5's ~500 turns against a ladder
+mean of 400 says more about self-play than about the boards.
+
+**The untested middle is a 17-30 band, which would cover 92.7%.** `STAGES` is a
+module constant with no CLI override, so testing it needs a flag.
+
+What is certain: stage 4 produced the only checkpoint that ever beat the
+champion, measured in an arena playing the FULL competition distribution
+(`dmin` defaults to 17, unbounded). Truncated training transfers to untruncated
+evaluation, whatever the mechanism.
 
 ### FIRST CHECKPOINT TO BEAT THE CHAMPION: sp16.best, +35.7 Elo (2026-08-06)
 

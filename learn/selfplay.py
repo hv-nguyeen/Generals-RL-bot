@@ -1238,6 +1238,18 @@ def main() -> None:
                          "without letting the earlier distances vanish, which "
                          "is what sp8 lost after each of its two forced ones. "
                          "0.0 reproduces every run before 2026-08-05")
+    ap.add_argument("--dist-tail", type=float, default=0.0,
+                    help="the same idea UPWARD: share of training boards drawn "
+                         "from the final stage with distance beyond this "
+                         "stage's dmax. Stage 4 is (17,24) and the ladder is "
+                         "17+ unbounded -- measured over 600 real games, 69% "
+                         "fall in 17-24 and 31% above, so stage 4 never sees a "
+                         "third of what it is evaluated on. 0.31 reconstructs "
+                         "the real histogram. Before reaching for that, note "
+                         "the two measured dose points: 0.0 produced the only "
+                         "checkpoint that ever beat the champion (+35.7), and "
+                         "stage 5, which IS this distribution, measured about "
+                         "-18. No-op at the final stage, which has no beyond")
     ap.add_argument("--max-turns", type=int, default=rules.TURN_LIMIT)
     ap.add_argument("--probe", type=int, default=0, metavar="ITERS",
                     help="CHEAP HYPOTHESIS TEST, run this before the night. Pins "
@@ -1281,6 +1293,18 @@ def main() -> None:
     if not 0 <= args.start_stage < len(STAGES):
         raise SystemExit(f"--start-stage {args.start_stage} is not a stage "
                          f"(0..{len(STAGES) - 1})")
+    if not 0.0 <= args.dist_tail < 1.0:
+        raise SystemExit(f"--dist-tail {args.dist_tail} must be in [0, 1)")
+    if args.dist_tail + args.stage_replay >= 1.0:
+        # `mix` slices `n - k - kt` and a negative stop silently keeps boards
+        # instead of raising, so the pool would be wrong rather than absent.
+        raise SystemExit(f"--dist-tail {args.dist_tail} + --stage-replay "
+                         f"{args.stage_replay} must be under 1.0")
+    if args.dist_tail and args.backend == "cpu":
+        # `build_jobs` on the cpu path generates boards from a seed rather than
+        # reading the mixed pool, so the flag would be silently ignored there.
+        raise SystemExit("--dist-tail needs --backend gpu or scan; the cpu path "
+                         "generates boards per job and never reads the pool")
     # Fail here, not on the first rollout: a partial last chunk would step past
     # the turn limit, and the turn limit IS the draw rule.
     if args.backend == "scan" and (args.scan_chunk < 1
@@ -1610,11 +1634,18 @@ def main() -> None:
         from tools import pools
 
         if vec["stage"] != stage:
-            host = pools.mix(args.pool_dir, stage, args.stage_replay)
+            host = pools.mix(args.pool_dir, stage, args.stage_replay,
+                             tail=args.dist_tail)
             vec.update(stage=stage, pool=vecroll.device_pool(host))
+            dmax = STAGES[stage][1]
+            far = float((host["dist"] > dmax).mean()) if dmax is not None else 0.0
             print(f"  pool: stage {stage}, {len(host['dist'])} boards, "
                   f"mean dist {host['dist'].mean():.1f}"
-                  f"{f', {args.stage_replay:.0%} replay of stages 0-{stage - 1}' if stage and args.stage_replay else ''}",
+                  f"{f', {args.stage_replay:.0%} replay of stages 0-{stage - 1}' if stage and args.stage_replay else ''}"
+                  # Printed as MEASURED, not as requested: the mean dist and this
+                  # share are the only visible proof the pool is what the flags
+                  # said, and a stage header has lied about its boards before.
+                  f"{f', {far:.0%} tail beyond dist {dmax}' if far else ''}",
                   flush=True)
         if vec["step"] is None:
             vec["step"] = vecroll.make_step(bc.forward)
