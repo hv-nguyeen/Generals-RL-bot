@@ -44,6 +44,30 @@ One detail worth carrying: both sp17 and sp18 ended at `bld 0.01` with `bldA`
 around -3, having stopped building castles entirely. Every checkpoint that
 actually gained ground in this project built MORE.
 
+### SOLVED 2026-08-06: castles only pay past ~17 tiles, and the curriculum unlearns them
+
+Measured across three runs the same night, same checkpoint, only `--start-stage`
+different:
+
+| stage | distance | `bld` | `bldA` |
+|---|---|---|---|
+| 3 | 11-17 | 0.00-0.02 | -0.9 to -3.0 |
+| 4 | 17-24 | 1.16-1.59 | -0.05 to +0.35 |
+| 5 | 17+ | 1.82-2.44 | -0.12 to +0.25 |
+
+Close generals mean army spent on a castle is army not spent attacking, so at
+stage 3 the policy correctly learns castles are bad. **The ladder is 17+, where
+they are good.** sp19 reproduced the sp17/sp18 endpoint -- `bld 0.01`, `bldA -3`
+-- by iteration 77 instead of 1199, and `comp-eval` (measured at dist 17+) fell
+0.886 -> 0.858 while it did.
+
+This explains the unexplained sp17/sp18 signature above, and it is a mechanism
+for why the curriculum degrades competition play rather than just failing to
+improve it. Stage 0 is worse still: 0.886 -> 0.807 in 100 iterations.
+
+**The impasse, stated exactly:** stage 3 trains but teaches the wrong game;
+stage 4+ is the right game but the critic will not fit there.
+
 ## START HERE
 
 **Overnight 2026-08-06: sp19 and sp21.** Both start from `sp9-i600-c24b` (the
