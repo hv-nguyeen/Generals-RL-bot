@@ -131,16 +131,34 @@ unused — because until `--init-critic` landed on 2026-08-05 there was nowhere 
 the output to go. `--init-critic` now accepts both a run's `.resume.npz` and a
 standalone `valuetrain` model.
 
-Tomorrow, on the encoder in force:
+**BUILT AND GATED 2026-08-06.** `field24/` is 3,453 ladder games from the ten
+strongest players, harvested to `/local/data/vng205/val24` as 660,560 positions
+in 11 shards (stride 4, both seats, ~310 MB).
 
 ```bash
-$PY -m learn.valuedata /local/data/vng205/field --out /local/data/vng205/val24 --workers 32
+$PY -m learn.valuedata ~/field24 --out /local/data/vng205/val24 --workers 32
 $PY -m learn.valuetrain --data /local/data/vng205/val24 --out /local/data/vng205/value24.npz --layers 8 --channels 32
-# then --init-critic /local/data/vng205/value24.npz on a normal selfplay run
 ```
 
-Read the same `evar` vs `sc` line. A critic trained where real opponents punish
-should beat the scalar control; if it does, every downstream advantage improves.
+`--layers 8 --channels 32` is not optional: `valuetrain` defaults to
+`DEFAULT_LAYERS = 4`, and a 4-layer critic cannot be loaded by `--init-critic`.
+
+**Result: control 0.721, net 0.759, gain +0.039 — the first ML instrument in this
+project to beat its own control.** Read it with one discount: 0.759 is the max
+over six epochs, chosen on the rows that score the gate, and the last-third
+plateau sits near 0.740. The unselected gain is nearer **+0.02**, which is a pass
+at the threshold rather than a comfortable one.
+
+The first attempt read net 0.753 against control 0.786 and the gate correctly
+refused it. That was the split, not the critic: `valuedata` writes shards in
+source order, so holding out `shards[-1]` held out a *player*, and training loss
+fell to 0.3556 while val accuracy wandered. `--val-frac` now samples within every
+shard. Cost of finding this: ten minutes of GPU, because the control ran before
+training rather than after.
+
+The lesson generalises past this file — **a held-out split that follows the write
+order of the data is a held-out subpopulation.** Every shard writer here groups
+by source.
 
 Sizing: ~380k samples from the existing `field/` at stride 4, both seats, against
 a ~71k-parameter critic. `--stride 2` doubles it for free. Dihedral augmentation
