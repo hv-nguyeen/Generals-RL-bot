@@ -5,6 +5,31 @@ short version: what is true right now, what is running, and what to do next.
 Read this first, then the log for the reasoning behind any line, and
 `docs/CLUSTER.md` for how to install and run anything on the VU box.
 
+## THE RECIPE IS EXHAUSTED — six runs from `sp9-i600`, none beat it
+
+| run | change | result vs i600 |
+|---|---|---|
+| sp13 | 8x64, 3.8x params | -44.8 Elo = zero gain over its own init |
+| sp14 | stage 5 | -21.0 Elo |
+| sp16 | 22ch encoder | abandoned, superseded |
+| sp17 | 24ch encoder, full 1200 iters | **+4.3 [-10.7, +19.4]** |
+| sp18 | 20ch control | never beat its own iteration 0 |
+
+sp17 is the decisive one because it ran to completion with a matched control. Its
+champion column across all 13 comp-evals — ~1950 games — averages **0.51**, and a
+separate 2000-game arena run reads **+4.3 Elo**. Two independent measurements
+agreeing on nothing. Pooled score oscillated 0.545-0.655 around a 0.573 base for
+1200 iterations with no trend.
+
+So the four hidden-army channels did not rescue it, and neither did width, stage,
+or more iterations. **Stop launching self-play runs from the champion.** The two
+things never tried are below: a critic trained on real games, and an opponent in
+a TRAINING seat rather than the eval set.
+
+One detail worth carrying: both sp17 and sp18 ended at `bld 0.01` with `bldA`
+around -3, having stopped building castles entirely. Every checkpoint that
+actually gained ground in this project built MORE.
+
 ## START HERE
 
 Two runs are live and they are a **matched pair with one variable**:
