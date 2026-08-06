@@ -90,6 +90,30 @@ stage 4+ is the right game but the critic will not fit there.
 
 ## START HERE
 
+### comp-eval against v16 is measured at 0.886, where it is nearly blind
+
+comp-eval never enters the gradient -- it only chooses which checkpoint gets
+`<- kept`. But it chooses badly at the operating point every run has used.
+
+Elo resolution per unit score is `173.7 / (s(1-s))`, so where the score sits
+decides what the instrument can see:
+
+| measured at | Elo per 0.01 score | +-1 SE in Elo |
+|---|---|---|
+| 0.886, vs `ours:configs/v16.json` alone | ~17 | **+-60** |
+| 0.757, vs two opponents (sp16) | ~9 | +-26 |
+| 0.500, vs `clone:sp9-i600` | ~7 | +-17 |
+
+sp19's series over 500 iterations reads 0.848 to 0.910 -- about 105 Elo of pure
+noise around a flat mean. **It cannot see the +25 Elo bar this file sets.** That
+is the mechanical reason comp-eval has misread in every direction, and it is not
+fixed by more games: 400 -> 2000 games only halves the SE, while moving the
+operating point from 0.886 to 0.500 improves resolution 3.5x for free.
+
+**Every future run should include `clone:` the reigning champion in `--opp`.** A
+score near 0.5 is where the instrument is sharpest, and it is also the only
+opponent whose strength is the thing we care about beating.
+
 **THERE ARE FOUR GPU NODES, not two.** The MOTD maps them: `1.compute.vu.nl` =
 pcoms008a, `2.` = pcoms008b, `3.` = pcoms009a, `4.` = pcoms009b. Only `/home` is
 shared; every `/local/data` is separate. A run was lost for a day because its log
