@@ -150,6 +150,61 @@ champion, measured in an arena playing the FULL competition distribution
 (`dmin` defaults to 17, unbounded). Truncated training transfers to untruncated
 evaluation, whatever the mechanism.
 
+### Overnight 2026-08-06 into 08-07: four arms, and what to do with them
+
+Deadline is roughly 2026-08-08. Currently rank 29/100 at 1864, climbing.
+
+| run | node | init | the one variable | why |
+|---|---|---|---|---|
+| sp24 | A | `sp16-c24` | none, the control | does iterating from the new champion gain again? |
+| sp26 | B | `sp16-c24` | `--dist-tail 0.15` | the untested middle of the distance dose curve |
+| sp27 | sp16's, C=22 | `sp9-i600-c22`, `--seed 1` | seed only | is +35.7 reproducible, or was it seed luck? |
+| sp29 | old sp24's | `sp16` widened to **8x64** | capacity | the big swing, see below |
+
+**Morning, per node, in this order.**
+
+1. `grep "^iter" runs/nn/spNN.log | tail -n 3` -- is it at `stage 4 (17-24)` still,
+   is `bld` above ~1.0, is there no `[critic warmup]` counter climbing?
+2. `cp runs/nn/spNN.best.npz runs/nn/spNN-peak.npz` BEFORE anything else.
+3. `$PY -m arena.runner --a clone:runs/nn/spNN-peak.npz --b clone:runs/nn/sp16-c24.npz --games 2000 --workers 16`
+   (use `sp9-i600-c22` for sp27, which is C=22.)
+4. Ship anything clearing **+25 Elo over sp16**, then start the next round from it.
+
+**`--stage-cap 400` promotes every arm to stage 5 at iteration 400, and stage 5
+measured -14.9.** sp16 avoided this by accident, running `--stage-cap 1200` with
+`--iters 1200` so it never force-promoted. Treat iterations past 400 as a
+different experiment, and prefer `--stage-cap >= --iters` on future runs.
+
+**Runs peak at iteration 250-350 (8x32) or ~100 (8x64, from sp13).** Everything
+after is decline. `--iters 1200` is mostly waste; 400-600 is the useful window.
+
+### sp29, the capacity swing -- and why the closure it reopens was confounded
+
+`docs/STATE.md` closed capacity on sp13: 8x64, -44.8 Elo, read as zero gain. That
+verdict does not survive:
+
+* `--stage-replay` default 0.25 landed 10:10 on 2026-08-05, `tools/grow.py` at
+  13:08, and the `--init-critic` fix sp13 needed at 20:59 -- so sp13 launched
+  that evening **under the 0.25 default**, and the discovery that 0.25 destroys
+  castle-building came the following afternoon.
+* `build_jobs` draws `rng.integers(0, stage)` over ALL lower stages, so
+  `--start-stage 4` does not escape it.
+* **sp13's arena castle rate was 0.16/game against the champion's 0.69** -- the
+  suppression signature exactly, and its net movement over its own init was
+  -1.5 Elo, indistinguishable from what 8x32 runs under the same bug produced.
+
+So the data cannot separate "capacity is useless" from "the replay bug flattened
+this run like it flattened the others". sp29 tests it properly: 8x64 grown from
+sp16 with `--stage-replay 0`. The widening is play-verified function-preserving
+(720 positions, identical argmax), so sp29 starts AT champion strength and any
+divergence is capacity alone.
+
+Odds are honest, not hopeful: ~12% of clearing +25. Downside is one node-night,
+because the grown init IS the champion.
+
+Only widen, never deepen -- 12-layer plain trunks killed the critic twice (sp5,
+sp11).
+
 ### THE LADDER CONFIRMED IT: 45% -> 65% win rate (2026-08-06)
 
 ```
