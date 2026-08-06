@@ -150,6 +150,27 @@ champion, measured in an arena playing the FULL competition distribution
 (`dmin` defaults to 17, unbounded). Truncated training transfers to untruncated
 evaluation, whatever the mechanism.
 
+### THE LADDER CONFIRMED IT: 45% -> 65% win rate (2026-08-06)
+
+```
+nn10  sp9-i600     1840,  rank 27/94,   45%  over 240 games
+nn11  sp16.best    1864,  rank 29/100,  65%  over 228 games
+```
+
+**+20 points of win rate at n=228 is about 6 sigma** (SE 3.2pp). The first
+unambiguous ladder improvement in this project, and the first time a local
+instrument and the ladder have agreed.
+
+Read the WIN RATE, not the rank. The rating is still converging -- it restarted
+from 1756 after the swap and has climbed 108 points so far; sustaining 65%
+implies roughly 107 Elo above the opponents currently being matched, so it is
+under-rated and should keep rising. Rank moved 27/94 to 29/100 because the field
+grew and rank is dense around 1850, where 24 Elo is worth a couple of places.
+
+Note this is a much bigger effect than the arena's +35.7 measured against
+`sp9-i600`. Different opponent pools, so the two are not directly comparable, but
+for once the local number was the CONSERVATIVE one.
+
 ### FIRST CHECKPOINT TO BEAT THE CHAMPION: sp16.best, +35.7 Elo (2026-08-06)
 
 ```
