@@ -79,14 +79,15 @@ def main() -> None:
     unpacked_mb = sum(p.stat().st_size for p in stage.rglob("*") if p.is_file()) / 1e6
     print(f"{archive}  {size_mb:.2f} MB zipped, {unpacked_mb:.2f} MB unpacked, {files} files")
 
-    # WHICH net is in there. `make package` deletes bot/weights.npz afterwards so
-    # a later build cannot silently ship a stale one -- but the failure that
-    # leaves is the opposite: build twice and the second zip has no net at all
-    # and quietly plays the heuristic. Neither is visible from the file size.
+    # WHICH net is in there. NOTHING removes bot/weights.npz -- not this script
+    # and not the Makefile, whatever README once claimed -- so it survives every
+    # build until someone runs `rm bot/weights.npz` by hand. The failure that
+    # leaves is a later build silently shipping the PREVIOUS net, which is worse
+    # than shipping the heuristic because the zip looks entirely correct.
     #
-    # Print the digest so a submission is identifiable after the fact, and
-    # compare it against the checkpoint you meant to ship:
-    #     md5sum runs/nn/spN.best.npz          (or sha256sum)
+    # The size does not distinguish two checkpoints of the same architecture, so
+    # print the digest. Compare it against the one you meant to ship:
+    #     sha256sum runs/nn/spN.best.npz
     w = stage / "bot" / "weights.npz"
     if w.exists():
         digest = hashlib.sha256(w.read_bytes()).hexdigest()

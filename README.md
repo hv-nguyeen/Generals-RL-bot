@@ -153,9 +153,22 @@ third_party/    the official starter kit, for the differential test
 **The submitted bot** is `bot/policy/net.py` — argmax over masked logits from a
 conv net, wrapped in `bot/policy/guard.py` for win-in-one and deathtouch. That is
 the whole decision procedure. `bot/main.py` ships the net when `bot/weights.npz`
-is present and falls back to the heuristic otherwise, printing to stderr; the
-packaging step deletes that file afterwards so the next build cannot silently
-ship a stale net.
+is present and falls back to the heuristic otherwise, printing to stderr.
+
+**Nothing removes `bot/weights.npz`** — not `tools/package.py`, not the Makefile.
+It survives every build, so a later `make package` silently bundles the PREVIOUS
+net, which is worse than shipping the heuristic because the zip looks correct.
+Delete it yourself once the artifact is safely copied out:
+
+```bash
+cp dist/generals-bot.zip ~/
+rm bot/weights.npz
+```
+
+`tools/package.py` prints the bundled net's size and sha256, or `net: NONE` when
+the zip has no net at all. Check it against the checkpoint you meant to ship with
+`sha256sum runs/nn/spN.best.npz`, and keep the digest with the submission date —
+it is the only way to tell two uploads apart afterwards.
 
 Note the guard's third override, the garrison veto, fires on about 0.2% of turns
 and measures neutral — see docs/STATE.md. Five hand-written overrides have now
