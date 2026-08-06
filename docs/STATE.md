@@ -13,7 +13,21 @@ Read this first, then the log for the reasoning behind any line, and
 | sp14 | stage 5 | -21.0 Elo |
 | sp16 | 22ch encoder | abandoned, superseded |
 | sp17 | 24ch encoder, full 1200 iters | **+4.3 [-10.7, +19.4]** |
-| sp18 | 20ch control | never beat its own iteration 0 |
+| sp18 | 20ch control, died at 563 | **-3.6 [-18.6, +11.3]** |
+
+**Both arms are flat and ~8 Elo apart with overlapping intervals, so the encoder
+change did nothing measurable in either direction.** An earlier reading of pooled
+comp-eval columns (sp17 0.51, sp18 0.463) suggested a ~30 Elo gap and a story
+about the channels preventing degradation; the arena refuted it. Do not revive
+that story without a 2000-game number.
+
+**comp-eval at 150 games/opponent is a shortlist tool, never a verdict.** It has
+now erred in every available direction: under-read sp8 (+59.5 real), under-read
+i500 and i600, over-read sp14 (+0.059 while -21.0 in the arena), and over-read
+the sp17/sp18 gap by ~22 Elo. Its per-opponent SE is ±0.041.
+
+Oddity worth keeping: sp18 builds ZERO castles and is still level with i600,
+which builds 0.55.
 
 sp17 is the decisive one because it ran to completion with a matched control. Its
 champion column across all 13 comp-evals — ~1950 games — averages **0.51**, and a
