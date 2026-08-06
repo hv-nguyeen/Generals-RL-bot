@@ -38,7 +38,34 @@ def forward(p, x):
     return bc.trunk(p, x).mean(axis=(2, 3)) @ p["v_w"] + p["v_b"]
 
 
-def scalar_control(train, xv, yv) -> float:
+def split(shards, frac: float, rng):
+    """A validation sample drawn from every shard, not the last one.
+
+    `valuedata` writes shards in source order, so one player's games land
+    together and holding out `shards[-1]` holds out a *player*. The first run
+    that way had the net at 0.753 against 0.786 for the scalar control while its
+    training loss kept falling -- which is what a distribution shift looks like,
+    not what an uninformative board looks like.
+
+    Style transfer across players is a real question, but it is not the question
+    this gate asks. Sample within each shard so train and val are the same
+    distribution, and the gap measures only what the board adds.
+
+    Returns (xv, yv, held) where `held` maps a shard path to the boolean mask of
+    the rows that went to validation, so training can exclude exactly those.
+    """
+    xs, ys, held = [], [], {}
+    for f in shards:
+        z = np.load(f)
+        n = len(z["y"])
+        m = np.zeros(n, bool)
+        m[rng.choice(n, max(1, int(n * frac)), replace=False)] = True
+        held[f] = m
+        xs.append(z["x"][m]); ys.append(z["y"][m])
+    return (np.concatenate(xs).astype(np.float32), np.concatenate(ys), held)
+
+
+def scalar_control(shards, held, xv, yv) -> float:
     """Held-out accuracy of least squares on the broadcast scalars alone.
 
     The scalars are the clock, the parity and the ten counting channels -- every
@@ -48,18 +75,19 @@ def scalar_control(train, xv, yv) -> float:
     learned nothing a single matrix could not.
 
     This is the same control as `sc` in `learn.selfplay`, and it is here because
-    the critic has lost to it before. Fitted on the training shards, scored on
-    the held-out ones, so it gets no advantage the net does not also get.
+    the critic has lost to it before. Fitted on the training rows, scored on the
+    identical held-out rows the net is scored on, so neither gets an advantage.
     """
     d = features.C - features.CLOCK + 1
     a = np.zeros((d, d), np.float64)
     b = np.zeros(d, np.float64)
-    for f in train:
+    for f in shards:
         z = np.load(f)
-        s = np.c_[z["x"][:, features.CLOCK:, 0, 0].astype(np.float64),
-                  np.ones(len(z["y"]))]
+        keep = ~held[f]
+        s = np.c_[z["x"][keep][:, features.CLOCK:, 0, 0].astype(np.float64),
+                  np.ones(int(keep.sum()))]
         a += s.T @ s
-        b += s.T @ z["y"].astype(np.float64)
+        b += s.T @ z["y"][keep].astype(np.float64)
     w = np.linalg.solve(a + 1e-6 * np.eye(d), b)
     sv = np.c_[xv[:, features.CLOCK:, 0, 0].astype(np.float64), np.ones(len(yv))]
     return float(np.mean((sv @ w > 0.5) == (yv > 0.5)))
@@ -77,6 +105,8 @@ def main() -> None:
     ap.add_argument("--channels", type=int, default=None)
     ap.add_argument("--residual", action="store_true", default=None)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--val-frac", type=float, default=0.02,
+                    help="fraction of every shard held out, sampled within it")
     args = ap.parse_args()
     arch = bc.resolve_arch(None, args.layers, args.channels, args.residual)
 
@@ -87,16 +117,16 @@ def main() -> None:
     shards = sorted(Path(args.data).glob("shard_*.npz"))
     if not shards:
         raise SystemExit(f"no shards in {args.data}")
-    val = np.load(shards[-1])
-    xv, yv = val["x"][:8192].astype(np.float32), val["y"][:8192]
-    train = shards[:-1] or shards
-    print(f"{len(shards)} shards, {len(train)} for training")
+    rng = np.random.default_rng(args.seed)
+    train = shards
+    xv, yv, held = split(shards, args.val_frac, rng)
+    print(f"{len(shards)} shards, {len(yv)} validation rows sampled across all "
+          f"of them ({args.val_frac:.0%})")
 
-    control = scalar_control(train, xv, yv)
+    control = scalar_control(shards, held, xv, yv)
     print(f"scalar control (least squares on {features.C - features.CLOCK} "
           f"broadcast channels): val acc {control:.3f}\n", flush=True)
 
-    rng = np.random.default_rng(args.seed)
     params = init_params(jax.random.PRNGKey(args.seed), arch)
     m = {k: jnp.zeros_like(v) for k, v in params.items()}
     v = {k: jnp.zeros_like(x) for k, x in params.items()}
@@ -124,7 +154,8 @@ def main() -> None:
         started, run, nb = time.time(), 0.0, 0
         for si in rng.permutation(len(train)):
             z = np.load(train[si])
-            xs, ys = z["x"], z["y"]
+            keep = ~held[train[si]]           # never train on a validation row
+            xs, ys = z["x"][keep], z["y"][keep]
             order = rng.permutation(len(ys))
             for i in range(0, len(order) - args.batch + 1, args.batch):
                 sel = order[i:i + args.batch]
