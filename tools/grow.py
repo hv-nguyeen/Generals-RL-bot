@@ -194,14 +194,27 @@ def show(path: str, against: str | None, prefix: str | None) -> None:
     if not against:
         return
     b = _arrays(against, prefix)["conv0_w"]
-    shared = min(w.shape[1], b.shape[1])
-    same = float(np.abs(w[:, :shared] - b[:, :shared]).max())
-    new = float(np.abs(w[:, shared:]).max()) if w.shape[1] > shared else 0.0
-    print(f"  vs {against}\n    shared columns [:{shared}]  max|d| {same:.3g}"
-          f"\n    new columns    [{shared}:]  max|w| {new:.3g}")
-    ok = same == 0.0 and new == 0.0
+    # A widen changes the OUTPUT axis too, so compare the overlapping block on
+    # both axes. Comparing axis 1 alone crashed on an 8x32 -> 8x64 stem.
+    ro, ci = min(w.shape[0], b.shape[0]), min(w.shape[1], b.shape[1])
+    same = float(np.abs(w[:ro, :ci] - b[:ro, :ci]).max())
+    new_in = float(np.abs(w[:ro, ci:]).max()) if w.shape[1] > ci else 0.0
+    print(f"  vs {against}\n    shared block [:{ro}, :{ci}]  max|d| {same:.3g}"
+          f"\n    new input columns [{ci}:]  max|w| {new_in:.3g}")
+    wider = w.shape[0] > b.shape[0]
+    if wider:
+        # net2net widening: the NEW output rows carry random incoming weight and
+        # are cancelled by zeros in the next layer's outgoing weight, so they are
+        # supposed to be nonzero here. The function is preserved by the pair, not
+        # by this array, which is why `grow` play-verifies a widen and this only
+        # reports.
+        print(f"    new output rows [{b.shape[0]}:]  max|w| "
+              f"{float(np.abs(w[b.shape[0]:]).max()):.3g}  (expected nonzero: "
+              f"net2net widening cancels these in the NEXT layer)")
+    ok = same == 0.0 and new_in == 0.0
     print(f"    {'clean function-preserving grow' if ok else 'NOT a clean grow'}"
-          f" -- {'identical on the old channels, new ones zeroed' if ok else 'it has been trained since, or grown wrong'}")
+          f" -- {'identical on the shared block' if ok else 'it has been trained since, or grown wrong'}"
+          f"{', and a widen is play-verified by grow itself' if wider else ''}")
 
 
 def main() -> None:
