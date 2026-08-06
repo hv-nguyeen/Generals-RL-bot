@@ -90,6 +90,37 @@ stage 4+ is the right game but the critic will not fit there.
 
 ## START HERE
 
+### Ladder games are SHORTER than they feel: median 349 turns, mean 400
+
+Measured over 600 harvested games from the ten strongest players:
+
+```
+p10 193   p25 251   p50 349   p75 484   p90 674   p95 819
+40% reach 400 turns, 24% reach 500
+```
+
+Against our self-play at each stage:
+
+| stage | distance | self-play turns | vs the ladder |
+|---|---|---|---|
+| 4 | 17-24 | ~420 | close to the mean of 400 |
+| 5 | 17+ | ~500 | the ladder's 75th percentile |
+
+**`--start-stage 5` is a measured non-starter.** sp25 ran 650 iterations and its
+comp-eval column against the champion averaged 0.474 over 14 evals -- SE of the
+mean 0.0094, so -2.8 sigma, about -18 Elo, with no upward trend. It is not that
+long games are intrinsically unlearnable; stage 5 trains on the wrong quarter of
+the distribution.
+
+Stage 4 is the right target and the +35.7 checkpoint came from it, measured in an
+arena that plays the FULL competition distribution (`dmin` defaults to 17,
+unbounded). Bounded training transfers to unbounded evaluation.
+
+Note self-play games run longer than ladder games at the same distance -- a
+mirror match drags because neither side has an edge, while a real game ends when
+a skill gap resolves. That is why stage 4's ~420 lines up with a ladder mean of
+400 rather than exceeding it.
+
 ### FIRST CHECKPOINT TO BEAT THE CHAMPION: sp16.best, +35.7 Elo (2026-08-06)
 
 ```
