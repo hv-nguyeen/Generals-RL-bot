@@ -90,6 +90,46 @@ stage 4+ is the right game but the critic will not fit there.
 
 ## START HERE
 
+### FIRST CHECKPOINT TO BEAT THE CHAMPION: sp16.best, +35.7 Elo (2026-08-06)
+
+```
+sp16.best vs sp9-i600-c22, 2000 games
+  1077W 51D 872L  score 0.551
+  elo  +35.7  [+20.7, +50.9]   accept H1
+  built/game  A 0.73  B 0.71   first castle turn 162 in 1042/2000
+```
+
+Nine runs from this champion had produced nothing. This one clears the +25 bar
+with the interval entirely above zero. Saved as `runs/nn/sp16-i350-elo36.npz`,
+sha256 `5a834c8b0308953a65d5981ee605328be022408fb84d9b2cfe7a70bbc153e78b`. C=22,
+so it packages on the C=22 node and compares against the C=22 champion.
+
+**MEASURE `.best`, NOT `.live`.** The same run, 450 iterations later:
+
+```
+sp16.live   built/game A 0.00   elo -9.2  [-24.3, +5.8]   accept H0
+```
+
+The peak is transient and the policy loses its castles again after it. Every
+arena verdict recorded earlier on 2026-08-06 -- sp19 -7.1, sp22 -20.0 -- was
+measured on `.live`, so those runs may have had a good checkpoint nobody looked
+at. Re-measure them on `.best` before believing they failed.
+
+**`.best` is also at risk while a run continues.** comp-eval overwrites it
+whenever a later eval scores higher, and at +-0.029 a noise spike can replace a
++35.7 checkpoint with a worse one. Copy it out under a new name the moment a run
+measures well.
+
+The castle correlation now holds across every measured checkpoint:
+
+| checkpoint | `built/game` | Elo |
+|---|---|---|
+| sp16.best | 0.73 | **+35.7** |
+| sp24-peak | 0.59 | +5.7 |
+| sp16.live | 0.00 | -9.2 |
+| sp19.live | 0.00 | -7.1 |
+| sp22.live | 0.00 | -20.0 |
+
 ### THE CAUSE: `--stage-replay` defaults to 0.25, so "stage 4" was never stage 4
 
 `--stage-replay` draws that share of every training batch from **already-cleared
