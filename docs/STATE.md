@@ -90,6 +90,36 @@ stage 4+ is the right game but the critic will not fit there.
 
 ## START HERE
 
+### THE CAUSE: `--stage-replay` defaults to 0.25, so "stage 4" was never stage 4
+
+`--stage-replay` draws that share of every training batch from **already-cleared
+stages**. Default 0.25. So a run launched with `--start-stage 4` still takes a
+quarter of its boards from stages 0-3, including stage 0's 2-6 -- boards where
+castles are correctly worthless. It learns that, and it is right to.
+
+Measured 2026-08-06, five runs, arena at 2000 games against the champion:
+
+| run | `--stage-replay` | `built/game` A vs B | Elo vs `sp9-i600` |
+|---|---|---|---|
+| sp16 | **0** | **0.53 vs 0.62** | **-4.2 [-19.2, +10.9]** |
+| sp19 | 0.25 (default) | 0.00 vs 0.54 | -7.1 [-22.2, +7.9] |
+| sp22 | 0.25 (default) | 0.00 vs 0.57 | -20.0 [-35.1, -5.0] |
+| sp18 | 0.25 (default) | 0.00 vs 0.55 | -3.6 |
+| sp17 | 0.25 (default) | `bld 0.01` at end | +4.3 |
+
+**Every run that kept castles is level with the champion. Every run that lost
+them is at or below it.** sp16 is the only one launched with `--stage-replay 0`,
+and it is the only one that still builds.
+
+This also resolves a discrepancy that looked like a contradiction: sp22's
+in-training `bld` read ~0.3 while sp16's read 0.66, because sp22's figure is an
+average over a board mix that was 25% short games.
+
+**Use `--stage-replay 0` on any run that starts at stage 4 or above.** The flag
+exists for a real reason -- sp8 lost the earlier distances after each forced
+promotion -- but that reason applies to a run climbing the curriculum, not to one
+pinned at competition distance.
+
 ### comp-eval against v16 is measured at 0.886, where it is nearly blind
 
 comp-eval never enters the gradient -- it only chooses which checkpoint gets

@@ -344,7 +344,10 @@ def main() -> None:
     cb = float(np.mean([r["castles"][1 - r["a_seat"]] for r in results]))
     firsts = [r["first_castle"][r["a_seat"]] for r in results]
     firsts = [t for t in firsts if t]
-    when = f", A first builds turn {np.mean(firsts):.0f} in {len(firsts)}/{len(results)} games" if firsts else ""
+    # ACQUIRED, not built. For a policy that builds nothing this is its first
+    # capture, and the old wording ("A first builds") read as a build count that
+    # contradicted `built/game A 0.00` two lines below.
+    when = f", A first castle turn {np.mean(firsts):.0f} in {len(firsts)}/{len(results)} games" if firsts else ""
     print(f"  castles/game  A {ca:.2f}  B {cb:.2f}{when}")
     ba = float(np.mean([r["built"][r["a_seat"]] for r in results]))
     bb = float(np.mean([r["built"][1 - r["a_seat"]] for r in results]))
