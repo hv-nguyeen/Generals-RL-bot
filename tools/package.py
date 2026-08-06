@@ -12,6 +12,7 @@ all.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import shutil
 import zipfile
 from pathlib import Path
@@ -77,6 +78,22 @@ def main() -> None:
     size_mb = archive.stat().st_size / 1e6
     unpacked_mb = sum(p.stat().st_size for p in stage.rglob("*") if p.is_file()) / 1e6
     print(f"{archive}  {size_mb:.2f} MB zipped, {unpacked_mb:.2f} MB unpacked, {files} files")
+
+    # WHICH net is in there. `make package` deletes bot/weights.npz afterwards so
+    # a later build cannot silently ship a stale one -- but the failure that
+    # leaves is the opposite: build twice and the second zip has no net at all
+    # and quietly plays the heuristic. Neither is visible from the file size.
+    #
+    # Print the digest so a submission is identifiable after the fact, and
+    # compare it against the checkpoint you meant to ship:
+    #     md5sum runs/nn/spN.best.npz          (or sha256sum)
+    w = stage / "bot" / "weights.npz"
+    if w.exists():
+        digest = hashlib.sha256(w.read_bytes()).hexdigest()
+        print(f"  net: bot/weights.npz  {w.stat().st_size} bytes  sha256 {digest}")
+    else:
+        print("  net: NONE -- this zip plays the HEURISTIC, not the policy. "
+              "Copy a checkpoint to bot/weights.npz and rebuild.")
     for limit, actual, label in ((50, size_mb, "zip MB"), (512, unpacked_mb, "unpacked MB"),
                                  (10_000, files, "files")):
         flag = "ok" if actual <= limit else "OVER LIMIT"
