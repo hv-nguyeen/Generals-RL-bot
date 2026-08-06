@@ -73,6 +73,18 @@ So: **stage 0 actively damages competition play; stage 3 merely fails to improve
 it while unlearning castles.** The castle result rests on `bld`/`bldA`, which are
 per-iteration means over 256 games and far tighter than comp-eval.
 
+**Refined the same night by sp22, and the first framing was too narrow.** At
+stage 4, where castles do pay, sp22 still went `bld 1.59` at iteration 0 to
+`0.03-0.11` by iteration 74, recovering only to `0.18-0.56` by 125. So it is not
+the curriculum that unlearns castles -- **self-play unlearns them at every
+stage**, and short distances merely finish the job (stage 3 settles at 0.00,
+stage 4 at ~0.3). The champion arrives building 1.59 a game and training cuts it
+3-5x wherever it runs.
+
+That points at the opponent, not the board: in a mirror match both sides skip
+castles together and neither is punished for it, which is the same blind spot as
+the evaluator problem in `ml-log.md`.
+
 **The impasse, stated exactly:** stage 3 trains but teaches the wrong game;
 stage 4+ is the right game but the critic will not fit there.
 
