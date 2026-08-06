@@ -46,18 +46,46 @@ actually gained ground in this project built MORE.
 
 ## START HERE
 
-Two runs are live and they are a **matched pair with one variable**:
+**Overnight 2026-08-06: sp19 and sp21.** Both start from `sp9-i600-c24b` (the
+ladder champion, grown to C=24, verified `0`/`0` by `tools.grow --show` on both
+clusters) and both warm-start the critic from `value24.npz`, which passed the
+gate at +0.039 over its scalar control. The variable is the training
+distribution.
+
+| | cluster | start stage | boards | what it asks |
+|---|---|---|---|---|
+| sp19 | 1 | 0, `--stage-cap 239` | generals 2-6, climbing | does a pretrained critic fix the standard recipe? |
+| sp21 | 2 | 5, no cap | generals 17+, all 1200 iters | does a pretrained critic make the curriculum unnecessary? |
+
+sp17 (+4.3) and sp18 (-3.6) are the controls and need no re-running: same
+champion, same C=24 encoder, cold critic, both flat on 2000 games.
 
 ```bash
-grep "^comp-eval" runs/nn/sp17.log | tail -n 3          # 24 channels
-grep "^comp-eval" /local/data/vng205/c20/generals-bot/runs/nn/sp18.log | tail -n 3   # 20, control
+grep -E "evar|sc " runs/nn/sp19.log | tail -n 20
 ```
 
-Compare the `sp9-i600` column in each. At iteration 100 it read **0.56 for sp17
-and 0.46 for sp18**, from an identical 0.50 start. ~1.7 se, so the arena decides:
-migrate sp18's best to 24 channels with `tools.grow` and run 2000 games.
+**`evar_l - sc_l > 0` has never been true in this project.** sp19 read -0.68 at
+iteration 0 and -0.11 at iteration 1 — closing faster than any previous run, but
+still under the control. What matters is whether it crosses zero and STAYS, not
+whether it touches it once.
 
-Then, in order: the critic pretraining below, and the ladder.
+The bar for either arm, stated so it cannot be rationalised afterwards: **>25 Elo
+over `sp9-i600` on 2000 arena games** (SE ~8, so ~3 sigma). Anything less is not a
+result whatever comp-eval says.
+
+**If both are flat, that closes the critic hypothesis** — one arm with a
+pretrained critic, one with the train/eval distribution mismatch removed as well,
+both flat, is strong evidence to stop pursuing the critic and go back to replay
+forensics.
+
+Why sp21 is worth a GPU-night: `--start-stage 5` was never viable before, and
+`learn/selfplay.py` says why — *"the reason a run cannot begin at the distance its
+policy actually plays is the cold critic, not the policy"*. Every run to date has
+therefore trained mostly on boards the ladder never shows. sp21 is the first that
+trains only on the competition distribution. It is also the higher-variance arm:
+the curriculum exists because terminal-only reward over a ~20-ply credit window is
+sparse on a 400-turn game, and if that crutch is load-bearing sp21 stalls inside a
+hundred iterations.
 
 ## Standing — the first RELIABLE ladder number
 
