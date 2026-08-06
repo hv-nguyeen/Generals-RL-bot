@@ -265,6 +265,43 @@ utilisation but **cannot see PIDs from other containers** — memory in use with
 "No running processes found" means someone else's job, possibly your own in a
 JupyterHub container.
 
+### Killing a run leaves its 60 workers behind — ALWAYS sweep after
+
+`kill` on the selfplay parent does **not** take the `ProcessPoolExecutor`
+children with it. Each orphaned run leaves ~60 `spawn_main` processes running
+for ever, and they keep competing for cores.
+
+On 2026-08-06 six killed runs had accumulated **366 orphans** against 60 cores.
+The live run's iteration time went `23.5s -> 85.0s -> 469.2s`, a 20x slowdown
+with every component inflated together (`roll` 33x, `d2h` 56x). It looks exactly
+like a bug in the training loop and is not one. Memory was fine, so the giveaway
+is `/proc/loadavg` far above the core count.
+
+Orphans reparent to PID 1, which is how you tell them from the live run's own
+workers. Count them:
+
+```bash
+for p in /proc/[0-9]*; do tr '\0' ' ' < $p/cmdline 2>/dev/null | grep -q multiprocessing && [ "$(awk '{print $4}' $p/stat 2>/dev/null)" = "1" ] && echo x; done | wc -l
+```
+
+Kill them — safe while a run is live, since its workers have a live parent:
+
+```bash
+for p in /proc/[0-9]*; do tr '\0' ' ' < $p/cmdline 2>/dev/null | grep -q multiprocessing && [ "$(awk '{print $4}' $p/stat 2>/dev/null)" = "1" ] && kill "${p#/proc/}"; done
+```
+
+`loadavg` is a decaying average and lags minutes behind; judge the fix by the
+iteration time in the log, not by `loadavg`.
+
+### A deleted log is still readable while the writer lives
+
+`rm runs/nn/spN.log` on a running job does not stop it writing — the file is
+unlinked but the descriptor is open. Recover through `/proc`:
+
+```bash
+for p in /proc/[0-9]*; do tr '\0' ' ' < $p/cmdline 2>/dev/null | grep -q "spN" && cp /proc/${p#/proc/}/fd/1 runs/nn/spN-recovered.log; done
+```
+
 Also: `tail -3 file` fails on this shell. Use `tail -n 3`, one file per command.
 
 ## Running a training job
