@@ -167,6 +167,43 @@ def _same_moves(a: str, b: str, games: int, seed0: int) -> tuple[int, float]:
     return n, worst
 
 
+def _arrays(path: str, prefix: str | None):
+    src = np.load(path)
+    if not prefix:
+        return src
+    z = {k[len(prefix) + 2:]: src[k] for k in src.files
+         if k.startswith(prefix + "__")}
+    if not z:
+        raise SystemExit(f"{path} has no {prefix}__* arrays")
+    return z
+
+
+def show(path: str, against: str | None, prefix: str | None) -> None:
+    """What is actually in a checkpoint, and whether a grow preserved it.
+
+    Two identically sized files grown from the same parent are impossible to
+    tell apart by `ls`, and we have had exactly that: sp9-i600-c24.npz and
+    sp9-i600-c24b.npz, same 302,935 bytes, seven minutes apart, no note of which
+    was the good one. A grow is function-preserving only if it copied the old
+    stem columns unchanged and zeroed the new ones, and that is checkable.
+    """
+    z = _arrays(path, prefix)
+    w = z["conv0_w"]
+    print(f"{path}\n  arch {arch_of(z)}\n  stem {tuple(w.shape)}  "
+          f"({w.shape[1]} input channels)")
+    if not against:
+        return
+    b = _arrays(against, prefix)["conv0_w"]
+    shared = min(w.shape[1], b.shape[1])
+    same = float(np.abs(w[:, :shared] - b[:, :shared]).max())
+    new = float(np.abs(w[:, shared:]).max()) if w.shape[1] > shared else 0.0
+    print(f"  vs {against}\n    shared columns [:{shared}]  max|d| {same:.3g}"
+          f"\n    new columns    [{shared}:]  max|w| {new:.3g}")
+    ok = same == 0.0 and new == 0.0
+    print(f"    {'clean function-preserving grow' if ok else 'NOT a clean grow'}"
+          f" -- {'identical on the old channels, new ones zeroed' if ok else 'it has been trained since, or grown wrong'}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -183,10 +220,20 @@ def main() -> None:
                          "`--prefix phi` is what makes --init-critic survive an "
                          "encoder change")
     ap.add_argument("--selfcheck", action="store_true")
+    ap.add_argument("--show", metavar="FILE",
+                    help="report a checkpoint's shape instead of growing it")
+    ap.add_argument("--against", metavar="FILE",
+                    help="with --show, the checkpoint it was supposedly grown "
+                         "from: prints the max difference on the columns they "
+                         "share and the max magnitude of the new ones. A clean "
+                         "function-preserving grow is 0 and 0")
     args = ap.parse_args()
 
     if args.selfcheck:
         selfcheck()
+        return
+    if args.show:
+        show(args.show, args.against, args.prefix)
         return
     if not (args.net and args.out and args.layers and args.channels):
         raise SystemExit("need --net --out --layers --channels (or --selfcheck)")
