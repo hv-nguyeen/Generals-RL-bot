@@ -54,11 +54,11 @@ tune-big:  ## long detached tuning run; resumable, safe to disconnect
 	    > $(OUT).log 2>&1 &
 	@echo "started; tail -f $(OUT).log   (resume after a kill: same command, it checkpoints)"
 
-package:  ## build dist/generals-bot.zip
-	$(PY) -m tools.package --name generals-bot $(if $(CONFIG),--config $(CONFIG),)
+package:  ## build dist/generals-bot.zip. EXPECT=<sha256> fails on the wrong net
+	$(PY) -m tools.package --name generals-bot $(if $(CONFIG),--config $(CONFIG),) $(if $(EXPECT),--expect $(EXPECT),)
 
 submit-test: package  ## build the zip and play it through the real wire protocol
-	$(PY) -m tools.package --name generals-bot $(if $(CONFIG),--config $(CONFIG),) --test 4
+	$(PY) -m tools.package --name generals-bot $(if $(CONFIG),--config $(CONFIG),) $(if $(EXPECT),--expect $(EXPECT),) --test 4
 
 diag:  ## full diagnostic report, paste-able. make diag WORKERS=32 [CONFIG=x.json] [VS=y.json]
 	$(PY) -m tools.diagnose --workers $(WORKERS) \

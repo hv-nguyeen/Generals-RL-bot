@@ -1293,6 +1293,18 @@ def main() -> None:
     if not 0 <= args.start_stage < len(STAGES):
         raise SystemExit(f"--start-stage {args.start_stage} is not a stage "
                          f"(0..{len(STAGES) - 1})")
+    if args.start_stage >= 4 and args.stage_replay > 0.0:
+        # Not fatal -- a curriculum run that CLIMBS to stage 4 wants replay, and
+        # that is what the 0.25 default is for. But a run that STARTS at 4 or
+        # above is pinned at competition distance on purpose, and replay feeds it
+        # short boards where castles correctly do not pay. Eight runs unlearned
+        # castle-building that way before anyone noticed, and castle rate tracks
+        # Elo across every measured checkpoint.
+        print(f"WARNING --start-stage {args.start_stage} with --stage-replay "
+              f"{args.stage_replay}: {args.stage_replay:.0%} of every batch will "
+              f"be SHORT boards from stages below {args.start_stage}. The only "
+              f"checkpoint that ever beat the champion used --stage-replay 0. "
+              f"Pass it explicitly if this is deliberate.", flush=True)
     if not 0.0 <= args.dist_tail < 1.0:
         raise SystemExit(f"--dist-tail {args.dist_tail} must be in [0, 1)")
     if args.dist_tail + args.stage_replay >= 1.0:

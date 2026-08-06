@@ -71,9 +71,15 @@ def main() -> None:
     ap.add_argument("--test", type=int, default=0,
                     help="after packaging, play N games through the real run.sh")
     ap.add_argument("--opponent", default="greedy")
+    ap.add_argument("--expect", default=None, metavar="SHA256",
+                    help="fail unless the bundled bot/weights.npz has this "
+                         "sha256. The one guard against shipping the previous "
+                         "build's net, which survives every build and looks "
+                         "entirely correct in the zip")
     args = ap.parse_args()
 
     stage, archive = build(args.name, args.config)
+    expect = args.expect
     files = sum(1 for p in stage.rglob("*") if p.is_file())
     size_mb = archive.stat().st_size / 1e6
     unpacked_mb = sum(p.stat().st_size for p in stage.rglob("*") if p.is_file()) / 1e6
@@ -89,12 +95,26 @@ def main() -> None:
     # print the digest. Compare it against the one you meant to ship:
     #     sha256sum runs/nn/spN.best.npz
     w = stage / "bot" / "weights.npz"
-    if w.exists():
-        digest = hashlib.sha256(w.read_bytes()).hexdigest()
+    digest = hashlib.sha256(w.read_bytes()).hexdigest() if w.exists() else None
+    if digest:
         print(f"  net: bot/weights.npz  {w.stat().st_size} bytes  sha256 {digest}")
     else:
         print("  net: NONE -- this zip plays the HEURISTIC, not the policy. "
               "Copy a checkpoint to bot/weights.npz and rebuild.")
+    # Printing the digest catches a stale net only if somebody reads it. --expect
+    # makes the build FAIL instead, which is what you want in the one minute
+    # before an upload:
+    #     sha256sum runs/nn/spN.best.npz
+    #     make package EXPECT=<that hash>
+    if expect:
+        if digest != expect:
+            raise SystemExit(
+                f"--expect {expect}\n     got {digest or 'NO NET AT ALL'}\n"
+                f"The zip does NOT contain the checkpoint you meant to ship. "
+                f"bot/weights.npz survives every build, so this is usually a "
+                f"leftover from the previous one -- rm it, copy the right "
+                f"checkpoint in, and rebuild.")
+        print("  net matches --expect")
     for limit, actual, label in ((50, size_mb, "zip MB"), (512, unpacked_mb, "unpacked MB"),
                                  (10_000, files, "files")):
         flag = "ok" if actual <= limit else "OVER LIMIT"

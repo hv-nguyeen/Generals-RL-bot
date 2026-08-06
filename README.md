@@ -218,16 +218,20 @@ them as `bot/config.json`, which `bot/main.py` picks up automatically.
 ## Current standing
 
 **See [`docs/STATE.md`](docs/STATE.md)** — it is updated per result and this
-section would only go stale. As of 2026-08-05: a neural policy on the ladder
-around rank 23 of 90, roughly +137 Elo of arena-measured improvement over the
-checkpoint that read 1849 there.
+section would only go stale. As of 2026-08-06: `sp16.best` on the ladder at 1864,
+rank 29 of 100, **65% over 228 games** against the previous champion's 45% over
+240. That is about 6 sigma and the first ladder-confirmed gain in the project.
+It measured +35.7 Elo [+20.7, +50.9] over 2000 arena games beforehand.
 
 Two things worth knowing before running anything:
 
 **Local numbers disagree with the ladder, repeatedly.** Eleven local instruments
-have, always in the same direction. No single fixed opponent measures general
-strength however strong it is — benchmark against several, and treat a 400-game
-result as a shortlist rather than a verdict. 2000 games costs ~85 seconds.
+did, always in the same direction, before the twelfth finally agreed. No single
+fixed opponent measures general strength however strong it is — benchmark against
+several, always include a clone of the reigning champion (a score near 0.5 is
+where Elo resolution is sharpest; at 0.886 one SE is ±60 Elo), and treat anything
+under 2000 games as a shortlist rather than a verdict. 2000 games costs ~85
+seconds.
 
 **The submission's weights are not in this repo.** They live on the cluster under
 `runs/nn/`, and `bot/weights.npz` is deleted after packaging on purpose. A clean

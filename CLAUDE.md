@@ -26,9 +26,13 @@ reason. The log exists so none of them gets tried a seventh time.
 
 ## Non-negotiables
 
-- **Never claim a change is an improvement without an SPRT run.** The standard
-  error on 60 games is ~80 Elo. `python -m arena.runner --a <new> --b <old>
-  --games 400` and read the verdict line.
+- **Never claim a change is an improvement without a 2000-game arena run against
+  the reigning champion, and the bar is +25 Elo.** SE is ~80 at 60 games, ~35 at
+  400, ~15 at 2000. 2000 games costs ~85 seconds on 32 cores, so 400 buys nothing
+  but a wider interval. `python -m arena.runner --a <new> --b <champion>
+  --games 2000` and read the verdict line — after checking `faults` is 0.
+  **Measure `.best`, never `.live`**: one run read +35.7 on `.best` and -9.2 on
+  `.live`.
 - **`bot/` must stay self-contained and numpy-only.** It is the submission. It
   may not import `sim/`, `arena/`, or `analysis/`.
 - **`sim/engine.py` mirrors the official engine exactly.** If you touch it, run
