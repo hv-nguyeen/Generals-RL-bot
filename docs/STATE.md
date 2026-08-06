@@ -90,6 +90,36 @@ stage 4+ is the right game but the critic will not fit there.
 
 ## START HERE
 
+**THERE ARE FOUR GPU NODES, not two.** The MOTD maps them: `1.compute.vu.nl` =
+pcoms008a, `2.` = pcoms008b, `3.` = pcoms009a, `4.` = pcoms009b. Only `/home` is
+shared; every `/local/data` is separate. A run was lost for a day because its log
+lived on a node nobody had logged into since. `find /local/data/vng205 -maxdepth
+4 -name "sp*.log"` on each node is the way to find them.
+
+**sp16 is on the third node and is the most promising run in the project.**
+C=22, `--start-stage 4`, critic warm-started from sp9's self-play resume,
+`--warm-evar 0.03`, and comp-eval over TWO opponents at 600 games (SE +-0.028),
+which is the only kind of instrument this file trusts.
+
+```
+  0  0.757   [v16 0.87  sp3-c22 0.64]
+ 50  0.768   [v16 0.87  sp3-c22 0.67]
+100  0.777   [v16 0.91  sp3-c22 0.65]
+150  0.807   [v16 0.92  sp3-c22 0.69]   <- kept
+200  0.762   [v16 0.86  sp3-c22 0.66]
+```
+
+Three consecutive rises, +1.7 sigma at the peak, then back to base. No other run
+has risen three evals in a row. It crashed at iteration 202 on a server restart
+and sat idle for hours before being resumed on 2026-08-06 with the SAME command
+plus `--resume` (and `>>` so the log keeps its history).
+
+**Do not extract a C=24 tarball on that node.** Its repo is C=22 and every sp16
+checkpoint is 22-channel; `net.py:181` would refuse them all.
+
+sp16 also confirms the castle result on a second encoder: `bld 0.57-0.89` with
+`bldA` steadily positive at stage 4, against sp19's `bld 0.00` at stage 3.
+
 **Overnight 2026-08-06: sp19 and sp22.** Both start from `sp9-i600-c24b` (the
 ladder champion, grown to C=24, verified `0`/`0` by `tools.grow --show` on both
 clusters). They differ in BOTH stage and critic, so they are not a matched pair
