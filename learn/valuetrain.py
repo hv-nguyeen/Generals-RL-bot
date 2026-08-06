@@ -17,6 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
+from bot import features
 from learn import train as bc
 
 
@@ -35,6 +36,33 @@ def init_params(key, arch: dict | None = None):
 
 def forward(p, x):
     return bc.trunk(p, x).mean(axis=(2, 3)) @ p["v_w"] + p["v_b"]
+
+
+def scalar_control(train, xv, yv) -> float:
+    """Held-out accuracy of least squares on the broadcast scalars alone.
+
+    The scalars are the clock, the parity and the ten counting channels -- every
+    number the encoder hands the net without it having to look at the board. A
+    linear fit on those is the bar the trunk has to clear, because a critic that
+    only ties win probability to "it is turn 300 and I have more land" has
+    learned nothing a single matrix could not.
+
+    This is the same control as `sc` in `learn.selfplay`, and it is here because
+    the critic has lost to it before. Fitted on the training shards, scored on
+    the held-out ones, so it gets no advantage the net does not also get.
+    """
+    d = features.C - features.CLOCK + 1
+    a = np.zeros((d, d), np.float64)
+    b = np.zeros(d, np.float64)
+    for f in train:
+        z = np.load(f)
+        s = np.c_[z["x"][:, features.CLOCK:, 0, 0].astype(np.float64),
+                  np.ones(len(z["y"]))]
+        a += s.T @ s
+        b += s.T @ z["y"].astype(np.float64)
+    w = np.linalg.solve(a + 1e-6 * np.eye(d), b)
+    sv = np.c_[xv[:, features.CLOCK:, 0, 0].astype(np.float64), np.ones(len(yv))]
+    return float(np.mean((sv @ w > 0.5) == (yv > 0.5)))
 
 
 def main() -> None:
@@ -63,6 +91,10 @@ def main() -> None:
     xv, yv = val["x"][:8192].astype(np.float32), val["y"][:8192]
     train = shards[:-1] or shards
     print(f"{len(shards)} shards, {len(train)} for training")
+
+    control = scalar_control(train, xv, yv)
+    print(f"scalar control (least squares on {features.C - features.CLOCK} "
+          f"broadcast channels): val acc {control:.3f}\n", flush=True)
 
     rng = np.random.default_rng(args.seed)
     params = init_params(jax.random.PRNGKey(args.seed), arch)
@@ -113,10 +145,16 @@ def main() -> None:
               f"{time.time() - started:.0f}s{mark}", flush=True)
 
     Path(args.out).with_suffix(".json").write_text(
-        json.dumps({"val_acc": best, **arch}, indent=2))
+        json.dumps({"val_acc": best, "control_acc": control, **arch}, indent=2))
     print(f"\nwrote {args.out} (best val accuracy {best:.3f})")
-    print("Calibrate before trusting it:")
-    print(f"  python -m tools.calibrate --model {args.out}")
+    print(f"scalar control {control:.3f}, net {best:.3f}, "
+          f"gain {best - control:+.3f}")
+    if best - control < 0.02:
+        print("GATE FAILED: the board buys less than 2 points over the scalars.")
+        print("Do not spend a training run on this critic.")
+    else:
+        print("Gate passed. Calibrate before trusting it:")
+        print(f"  python -m tools.calibrate --model {args.out}")
 
 
 if __name__ == "__main__":

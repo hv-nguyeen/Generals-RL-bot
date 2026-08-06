@@ -72,15 +72,35 @@ def _one(job):
             np.asarray(ts, dtype=np.int32))
 
 
+def _sources(src: Path) -> list[Path]:
+    """A harvest dir, or a parent of several.
+
+    `analysis.official` stores one player per directory, each with its own
+    `replays/` and match list. A field harvest of ten players is therefore ten
+    of those under one root, and pointing this at the root should mean all of
+    them rather than nothing.
+    """
+    if (src / "replays").is_dir():
+        return [src]
+    return sorted(d for d in src.iterdir() if (d / "replays").is_dir())
+
+
 def build(src: Path, out: Path, stride: int, drop_last: int,
           workers: int, limit: int) -> None:
     out.mkdir(parents=True, exist_ok=True)
-    meta: dict[str, dict] = {}
-    for m in src.glob("matches*.json"):
-        for row in json.loads(m.read_text()):
-            meta[str(row["id"])] = row
+    dirs = _sources(src)
+    if not dirs:
+        raise SystemExit(f"no replays/ under {src}")
 
-    files = replay_files(src)
+    meta: dict[str, dict] = {}
+    files = []
+    for d in dirs:
+        for m in d.glob("matches*.json"):
+            for row in json.loads(m.read_text()):
+                meta[str(row["id"])] = row
+        files.extend(replay_files(d))
+    if len(dirs) > 1:
+        print(f"{len(dirs)} sources, {len(files)} replays")
     if limit:
         files = files[:limit]
     jobs = []
