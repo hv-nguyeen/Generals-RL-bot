@@ -61,9 +61,17 @@ they are good.** sp19 reproduced the sp17/sp18 endpoint -- `bld 0.01`, `bldA -3`
 -- by iteration 77 instead of 1199, and `comp-eval` (measured at dist 17+) fell
 0.886 -> 0.858 while it did.
 
-This explains the unexplained sp17/sp18 signature above, and it is a mechanism
-for why the curriculum degrades competition play rather than just failing to
-improve it. Stage 0 is worse still: 0.886 -> 0.807 in 100 iterations.
+This explains the unexplained sp17/sp18 signature above.
+
+**Careful with the comp-eval half of it.** SE is +-0.035 at 400 games. Stage 0's
+0.886 -> 0.807 is 2.3 sigma and real. Stage 3's readings over 250 iterations are
+0.858, 0.877, 0.910, 0.881, 0.896 -- every one inside 1 sigma of base, i.e. flat.
+The 0.858 was called a decline here on first sight and it was 0.8 sigma of
+nothing.
+
+So: **stage 0 actively damages competition play; stage 3 merely fails to improve
+it while unlearning castles.** The castle result rests on `bld`/`bldA`, which are
+per-iteration means over 256 games and far tighter than comp-eval.
 
 **The impasse, stated exactly:** stage 3 trains but teaches the wrong game;
 stage 4+ is the right game but the critic will not fit there.
