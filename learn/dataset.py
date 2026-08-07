@@ -57,7 +57,17 @@ def _one(job) -> tuple[np.ndarray, np.ndarray, int] | None:
 def build(src: Path, out: Path, players: set[str] | None, exclude: set[str],
           workers: int, limit: int) -> None:
     out.mkdir(parents=True, exist_ok=True)
-    files = replay_files(src)
+    # `analysis.official` stores one player per directory, each with its own
+    # `replays/`, so a field harvest of ten players is ten of those under one
+    # root and pointing this at the root found nothing. Same fix as
+    # `learn.valuedata._sources`.
+    dirs = ([src] if (src / "replays").is_dir()
+            else sorted(d for d in src.iterdir() if (d / "replays").is_dir()))
+    if not dirs:
+        raise SystemExit(f"no replays/ under {src}")
+    files = [f for d in dirs for f in replay_files(d)]
+    if len(dirs) > 1:
+        print(f"{len(dirs)} sources, {len(files)} replays")
     if limit:
         files = files[:limit]
     jobs = [(f, players, exclude) for f in files]
