@@ -528,6 +528,55 @@ def test_the_trainers_check_themselves():
     vecroll.selfcheck()
 
 
+def test_dihedral_averaging_is_exact_on_an_equivariant_function():
+    """Averaging over the group must return an equivariant function unchanged.
+
+    That is the whole correctness condition for test-time augmentation: if the
+    cell gather, the direction permutation or the action relabel is wrong, a
+    function that genuinely commutes with the group stops surviving the round
+    trip. A net is not equivariant, so it cannot be used as the probe -- this
+    builds one that is.
+    """
+    import numpy as np
+
+    from bot import features, symmetry
+
+    PAD, PER, SPL = features.PAD, features.PER_CELL, features.SPLITS
+
+    def equivariant(x):
+        # logit(cell, dir) = v(cell) - v(neighbour in dir); build = 2*v(cell).
+        # A rigid motion sends (cell, dir) -> (cell', dperm[dir]) and carries v
+        # along, so this commutes with the group exactly.
+        v = x[0]
+        out = np.zeros(features.N_ACTIONS, np.float64)
+        vp = np.pad(v, 1, constant_values=0.0)
+        for d, (dr, dc) in enumerate(symmetry.DIRS):
+            diff = (v - vp[1 + dr:1 + dr + PAD, 1 + dc:1 + dc + PAD]).reshape(-1)
+            for s in range(SPL):
+                out[np.arange(PAD * PAD) * PER + d * SPL + s] = diff * (s + 1)
+        out[np.arange(PAD * PAD) * PER + features.BUILD_OFFSET] = 2.0 * v.reshape(-1)
+        out[-1] = 7.0
+        return out
+
+    rng = np.random.default_rng(0)
+    for h, w in ((21, 21), (15, 15), (18, 21), (9, 12)):
+        x = np.zeros((features.C, PAD, PAD))
+        x[0, :h, :w] = rng.normal(size=(h, w))
+        base = equivariant(x)
+        avg = symmetry.average_logits(x, h, w, equivariant)
+        cells = (np.arange(h)[:, None] * PAD + np.arange(w)[None, :]).reshape(-1)
+        idx = (cells[:, None] * PER + np.arange(PER)[None, :]).reshape(-1)
+        d = float(np.abs(base[idx] - avg[idx]).max())
+        assert d < 1e-9, f"{h}x{w}: round trip off by {d:.2e}"
+
+    # the identity element alone must reproduce the plain forward byte for byte,
+    # so `tta=False` and a one-element group are the same code path
+    x = np.zeros((features.C, PAD, PAD))
+    x[0, :21, :21] = rng.normal(size=(21, 21))
+    assert np.array_equal(symmetry.average_logits(x, 21, 21, equivariant, elements=(0,)),
+                          equivariant(x))
+
+
 def main() -> None:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

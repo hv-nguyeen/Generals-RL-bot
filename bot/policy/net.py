@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from bot import features, rules
+from bot import features, rules, symmetry
 from bot.obs import Obs
 
 # Only the starting point for a fresh `learn/train.py` run. Nothing at inference
@@ -185,31 +185,49 @@ class Net:
         self.pass_w = z["pass_w"].astype(np.float32)
         self.pass_b = float(z["pass_b"])
 
-    def logits(self, obs: Obs) -> np.ndarray:
-        x = _trunk(features.encode(obs), self.layers, self.arch["residual"])
+    def _logits_from(self, enc: np.ndarray) -> np.ndarray:
+        x = _trunk(enc, self.layers, self.arch["residual"])
         move = _conv3x3(x, self.head_w, self.head_b)   # (PER_CELL, H, W)
         # (H, W, PER_CELL) flattened must match features.action_to_index ordering
         flat = np.transpose(move, (1, 2, 0)).reshape(-1)
         pass_logit = float(self.pass_w @ x.mean(axis=(1, 2)) + self.pass_b)
         return np.concatenate([flat, [pass_logit]])
 
+    def logits(self, obs: Obs, tta: bool = False) -> np.ndarray:
+        """Masked-move logits, optionally averaged over the board's symmetries.
+
+        The rules are symmetric under the eight rigid motions of the square, so
+        the same position rotated is the same position. A stack of 3x3 convs is
+        translation-equivariant and nothing else, so it answers each orientation
+        slightly differently; averaging is variance reduction with no training.
+
+        The budget pays for it easily -- one forward is ~1.2 ms against a 150 ms
+        limit -- and this is the only axis of the problem nobody has spent.
+        """
+        enc = features.encode(obs)
+        if not tta:
+            return self._logits_from(enc)
+        return symmetry.average_logits(enc, obs.H, obs.W, self._logits_from)
+
 
 class ClonePolicy:
     """Drop-in agent: pick the highest-scoring legal action."""
 
-    def __init__(self, player_id: int, h: int, w: int, weights: str):
+    def __init__(self, player_id: int, h: int, w: int, weights: str,
+                 tta: bool = False):
         self.net = Net(weights)
         self.H, self.W = h, w
+        self.tta = tta
         self.last_debug: dict = {}
 
     def act(self, obs: Obs, deadline=None):
-        logits = self.net.logits(obs)
+        logits = self.net.logits(obs, tta=self.tta)
         mask = features.legal_mask(obs)
         if not mask.any():
             return rules.PASS_ACTION
         logits = np.where(mask, logits, -np.inf)
         idx = int(np.argmax(logits))
-        self.last_debug = {"mode": "clone", "turn": obs.turn}
+        self.last_debug = {"mode": "clone", "turn": obs.turn, "tta": self.tta}
         return features.index_to_action(idx)
 
 

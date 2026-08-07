@@ -10,6 +10,7 @@ A spec is a string so runs are reproducible from a command line:
     random                   uniform over legal moves
     idle                     always passes
     clone:weights.npz        a behaviour-cloned policy (learn/train.py)
+    tta:weights.npz          the same policy, logits averaged over the 8 symmetries
     guard:weights.npz        the same policy under bot/policy/guard.py's overrides
     snipe:weights.npz        that policy, but a big stack marches at the enemy
                              general — the decapitating opponent our lineage
@@ -384,6 +385,13 @@ def make(spec: str, player_id: int, h: int, w: int, seed: int = 0):
     if name == "clone":
         from bot.policy.net import ClonePolicy
         return ClonePolicy(player_id, h, w, arg)
+    if name == "tta":
+        # `tta:weights.npz` is `clone:` with the same weights, averaging the
+        # logits over the board's dihedral group instead of reading one
+        # orientation. Identical net, ~8x the forward cost against a 125x
+        # budget, so `tta:W vs clone:W` isolates inference compute exactly.
+        from bot.policy.net import ClonePolicy
+        return ClonePolicy(player_id, h, w, arg, tta=True)
     if name == "snipe":
         # `snipe:weights.npz` randomises the commit threshold per game; append
         # `@120` to pin it, which is what a reproducible measurement wants.
