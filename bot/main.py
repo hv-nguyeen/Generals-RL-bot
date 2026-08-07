@@ -50,7 +50,12 @@ def make_agent(cfg: Config, player_id: int, h: int, w: int):
         try:
             from bot.policy.net import ClonePolicy
             from bot.policy.guard import GuardedPolicy
-            agent = ClonePolicy(player_id, h, w, WEIGHTS)
+            # tta: average the logits over the board's dihedral group instead of
+            # reading one orientation. Measured +32.8 Elo [+17.7, +48.0] on 2000
+            # games with the SAME weights on both sides, so it is inference
+            # compute and nothing else. Costs 5.3 ms mean, 14.3 ms worst, against
+            # a 150 ms budget -- the axis this project had never spent.
+            agent = ClonePolicy(player_id, h, w, WEIGHTS, tta=cfg.tta)
             # The net is argmax over masked logits and nothing else. The
             # heuristic's hard-override tier -- win-in-one, deathtouch, the
             # narrow garrison block -- has no counterpart in it, and deathwatch

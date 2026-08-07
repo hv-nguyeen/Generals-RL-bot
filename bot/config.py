@@ -242,6 +242,15 @@ class Config:
     # against the net without repacking.
     use_net: bool = True
 
+    # Average the net's logits over the board's dihedral group instead of
+    # reading one orientation. The rules are symmetric, a stack of 3x3 convs is
+    # not, so this is variance reduction bought with the move budget rather than
+    # with a training run: measured +32.8 Elo [+17.7, +48.0] over 2000 games,
+    # SAME weights on both sides. 5.3 ms mean and 14.3 ms worst against 150 ms.
+    # A bool for the same reason as `use_net` -- switches are chosen, not
+    # searched -- and false restores the single-orientation forward exactly.
+    tta: bool = True
+
     # ------------------------------------------------------------------------
     def save(self, path: str | Path) -> None:
         Path(path).write_text(json.dumps(asdict(self), indent=2) + "\n")
