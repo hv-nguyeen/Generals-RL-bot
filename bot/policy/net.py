@@ -193,7 +193,7 @@ class Net:
         pass_logit = float(self.pass_w @ x.mean(axis=(1, 2)) + self.pass_b)
         return np.concatenate([flat, [pass_logit]])
 
-    def logits(self, obs: Obs, tta: bool = False) -> np.ndarray:
+    def logits(self, obs: Obs, tta: bool = False, full: bool = False) -> np.ndarray:
         """Masked-move logits, optionally averaged over the board's symmetries.
 
         The rules are symmetric under the eight rigid motions of the square, so
@@ -207,17 +207,19 @@ class Net:
         enc = features.encode(obs)
         if not tta:
             return self._logits_from(enc)
-        return symmetry.average_logits(enc, obs.H, obs.W, self._logits_from)
+        els = symmetry.group(obs.H, obs.W, full)
+        return symmetry.average_logits(enc, obs.H, obs.W, self._logits_from, els)
 
 
 class ClonePolicy:
     """Drop-in agent: pick the highest-scoring legal action."""
 
     def __init__(self, player_id: int, h: int, w: int, weights: str,
-                 tta: bool = False):
+                 tta: bool = False, full: bool = False):
         self.net = Net(weights)
         self.H, self.W = h, w
         self.tta = tta
+        self.full = full
         self.last_debug: dict = {}
         # Pay the one-time costs HERE, before the first frame. Construction is
         # outside the per-move budget; the first move is not.
@@ -231,11 +233,11 @@ class ClonePolicy:
         warm = np.zeros((features.C, features.PAD, features.PAD), np.float32)
         self.net._logits_from(warm)
         if tta:
-            for g in symmetry.group(h, w):
+            for g in symmetry.group(h, w, full):
                 symmetry.maps(h, w, g)
 
     def act(self, obs: Obs, deadline=None):
-        logits = self.net.logits(obs, tta=self.tta)
+        logits = self.net.logits(obs, tta=self.tta, full=self.full)
         mask = features.legal_mask(obs)
         if not mask.any():
             return rules.PASS_ACTION

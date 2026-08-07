@@ -12,6 +12,7 @@ A spec is a string so runs are reproducible from a command line:
     clone:weights.npz        a behaviour-cloned policy (learn/train.py)
     tta:weights.npz          the same policy, logits averaged over the 8 symmetries
     ship:weights.npz         EXACTLY what bot/main.py packages: net + tta + guard
+    ship8:weights.npz        the same, with the full 8-element group on any shape
     guard:weights.npz        the same policy under bot/policy/guard.py's overrides
     snipe:weights.npz        that policy, but a big stack marches at the enemy
                              general — the decapitating opponent our lineage
@@ -421,6 +422,16 @@ def make(spec: str, player_id: int, h: int, w: int, seed: int = 0):
         # hidden_ratio left at its default, tta read from the same config field.
         # If this drifts from main.py the spec stops meaning anything.
         return GuardedPolicy(ClonePolicy(player_id, h, w, arg, tta=cfg.tta),
+                             cfg.general_block_radius, cfg.general_block_ratio)
+    if name == "ship8":
+        # `ship:` with the FULL dihedral group on non-square boards too. The
+        # deployed build withholds the four shape-changing elements there, and
+        # boards are 18-21 per side drawn independently, so ~3 in 4 games get
+        # half the averaging. `ship8: vs ship:` on the same weights is the A/B.
+        from bot.policy.guard import GuardedPolicy
+        from bot.policy.net import ClonePolicy
+        cfg = Config()
+        return GuardedPolicy(ClonePolicy(player_id, h, w, arg, tta=cfg.tta, full=True),
                              cfg.general_block_radius, cfg.general_block_ratio)
     if name == "stdio":
         from arena.stdio_agent import StdioAgent

@@ -79,16 +79,35 @@ def maps(h: int, w: int, g: int):
     return srcof, actmap
 
 
-def group(h: int, w: int) -> tuple[int, ...]:
+FULL = (0, 1, 2, 3, 4, 5, 6, 7)
+SHAPE_PRESERVING = (0, 1, 6, 7)
+
+
+def group(h: int, w: int, full: bool = False) -> tuple[int, ...]:
     """The elements worth using on an h x w board.
 
-    All eight are valid -- a quarter turn of a non-square board is still a
-    legal board, just transposed -- but a transposed board is a shape the net
-    never saw in training, and on this encoder every channel is a scalar per
-    cell so the transpose is not free of distribution shift. Square boards get
-    all eight; the rest get the four that preserve the shape.
+    A quarter turn of a non-square board is a TRANSPOSED board, and the original
+    version of this function withheld those out of caution -- "a shape the net
+    never saw in training". That was wrong twice over, and both halves are
+    checkable in the repo:
+
+    * `sim.mapgen.generate` draws h and w INDEPENDENTLY from the same range, so
+      an 18x21 board transposed is a 21x18 board, which occurs with identical
+      probability. The transformed observation is a legal position on a legal
+      board.
+    * `learn.train.augment` already applies all eight elements to non-square
+      boards -- it groups by (h, w) and builds the maps for any g -- so the
+      behaviour-cloned ancestor of this whole lineage trained under the full
+      group.
+
+    Boards are 18-21 per side drawn independently, so only ~1 in 4 is square:
+    withholding half the group cost most of the averaging on most boards.
+
+    Kept behind a flag rather than simply changed, because the +31.2 that is
+    deployed was measured with the four-element form and an A/B has to be able
+    to reproduce it exactly.
     """
-    return (0, 1, 2, 3, 4, 5, 6, 7) if h == w else (0, 1, 6, 7)
+    return FULL if (full or h == w) else SHAPE_PRESERVING
 
 
 def average_logits(x: np.ndarray, h: int, w: int, forward, elements=None) -> np.ndarray:
