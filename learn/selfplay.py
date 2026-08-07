@@ -1238,6 +1238,15 @@ def main() -> None:
                          "without letting the earlier distances vanish, which "
                          "is what sp8 lost after each of its two forced ones. "
                          "0.0 reproduces every run before 2026-08-05")
+    ap.add_argument("--frozen-kill", type=int, default=FROZEN_KILL, metavar="N",
+                    help="consecutive low-evar iterations that END the run, or 0 "
+                         "to never end it. The default exists because a critic "
+                         "that never fits leaves the POLICY FROZEN -- do_policy "
+                         "is `warmed` -- so the run prints [critic warmup] until "
+                         "morning and answers nothing; that cost three runs on "
+                         "2026-08-05. Raise it only to ask whether a critic "
+                         "recovers given longer, and watch that `pg` is still "
+                         "0.0000 the whole time it is climbing")
     ap.add_argument("--dist-tail", type=float, default=0.0,
                     help="the same idea UPWARD: share of training boards drawn "
                          "from the final stage with distance beyond this "
@@ -1873,7 +1882,8 @@ def main() -> None:
         # stopped it: `[critic warmup 234/20]`, pg +0.0000, for 250 iterations
         # until the run was killed by hand. A frozen policy at any stage is the
         # same wasted night.
-        kill2 = (not warmed and it > WARMUP * 10 and low >= FROZEN_KILL)
+        kill2 = (args.frozen_kill > 0 and not warmed
+                 and it > WARMUP * 10 and low >= args.frozen_kill)
 
         # `dlp0` compares the worker's NUMPY logp against the parent's JAX one
         # and is the top kill criterion. Under --backend gpu both sides are the
@@ -1986,7 +1996,8 @@ def main() -> None:
         # The freeze counter is in the tag, not just the fact of it: a frozen
         # policy is a legitimate state for a few iterations and a dead run after
         # FROZEN_KILL, and the line has to say which one you are looking at.
-        tag = f"  [critic warmup {low}/{FROZEN_KILL}]" if not do_policy else ""
+        tag = (f"  [critic warmup {low}/{args.frozen_kill or 'off'}]"
+               if not do_policy else "")
         print(f"iter {it:5d}  stage {stage} ({dmin}{hi})  games {len(g0)}  "
               f"W/D/L {w}/{d}/{len(g0) - w - d}  samp {n // 1000:3d}k  "
               f"turns {turns:.0f}  dist {dist:.1f}  bld {builds / len(g0):.2f}"
