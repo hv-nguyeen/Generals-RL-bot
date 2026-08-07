@@ -27,6 +27,33 @@ field improved too.
 **sp16 was a tail event, not a typical draw.** Three independent re-draws of its
 exact recipe all landed ~30 Elo below it. Do not assume the recipe reproduces.
 
+### CASTLES ARE A SYMPTOM, NOT A CAUSE — corrected 2026-08-07
+
+This file has repeatedly treated castle rate as causal: "every checkpoint that
+actually gained ground built MORE". The correlation is real (0.73 built/game ->
++35.7 Elo, 0.59 -> +5.7, 0.00 -> -7 to -20) but the direction was assumed, never
+tested. It is now tested, and it runs the other way.
+
+`tools/buildbias.py` raises `head_b` at the build slot on a checkpoint's
+INITIALISATION and lets PPO decide. On the BC-lineage 8x64, whose build slot sat
+at -2.03 against a head spread of 0.517 -- four sigma below every other action:
+
+* `--bias 1.5` moved it to -0.53, still the lowest slot. `bld` stayed 0.00-0.02.
+* `--bias 3.0` moved it to +0.97, the HIGHEST bias in the head. `bld` reached
+  only 0.06 and decayed to 0.01 within eight iterations, with `bldA` steady
+  around -1.2.
+
+Two conclusions. **The head bias was never the binding constraint**: a build is
+only legal with 35 army on an owned tile, and a policy that plays a spread
+expansion game rarely has it, so the opportunity mostly does not exist however
+the logit is biased. And **where builds did happen, PPO measured them and drove
+the rate back down** -- castles cost that policy games.
+
+So a strong policy builds castles because it can afford them and knows when.
+Building does not make a policy strong, and forcing builds on one that cannot
+support them just loses. Do not chase the build rate as a target; it is an
+indicator of a policy that is already working.
+
 ### A run killed by KILL 2 can be revived with an EARLIER critic
 
 sp44 (BC 8x64, `--start-stage 2`) climbed the champion column 0.28 -> 0.36 ->
