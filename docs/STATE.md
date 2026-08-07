@@ -1,9 +1,65 @@
-# Where the project is — 2026-08-06
+# Where the project is — 2026-08-07
 
 `docs/ml-log.md` is the full measured history and it is long. This file is the
 short version: what is true right now, what is running, and what to do next.
 Read this first, then the log for the reasoning behind any line, and
 `docs/CLUSTER.md` for how to install and run anything on the VU box.
+
+## FINAL STANDING (competition close, 2026-08-07)
+
+**Deployed: `generals-bot-nn12`** — `sp16-c24` weights + test-time augmentation +
+the guard. Rank **27 of 107** over 200 ladder games, peak Elo 1912.
+
+Started the cycle at rank 27, 1840, 45% over 240 games. The bot is far stronger
+now (sp16 measured +35.7 in the arena and 45% -> 66% on the ladder, 6 sigma; TTA
+added +31.2 on the shipped configuration). The rank did not move because the
+field improved too.
+
+**What is deployed is the best thing measured.** Everything else was tried:
+
+| attempt | result vs `sp16-c24`, 2000-game arena |
+|---|---|
+| sp40/sp41/sp42, re-draws from `sp9-i600` | all ~-30 (sp41 confirmed -31.7) |
+| BC 8x64 clone | -165 |
+| 8x64 grown from sp16 (sp29, sp31) | critic never warmed, KILL 2 |
+| from-scratch 8x64 (sp32) | never learned to play, KILL 2 |
+
+**sp16 was a tail event, not a typical draw.** Three independent re-draws of its
+exact recipe all landed ~30 Elo below it. Do not assume the recipe reproduces.
+
+### The four things worth carrying forward
+
+1. **Inference compute pays and is barely touched.** TTA over the dihedral group
+   is +31.2 for zero training, at 5 ms of a 150 ms budget. That axis had never
+   been spent and is still 96% unspent.
+2. **Measure the ARTIFACT, not the component.** TTA measured +32.8 on a raw
+   `ClonePolicy` and shipped as exactly zero, because the guard re-scores and
+   dropped the flag. The `ship:` arena spec now constructs the agent exactly as
+   `bot/main.py` does. Every deploy failure this cycle was a packaging bug the
+   in-process arena could not see.
+3. **comp-eval only works near a 0.5 score.** At 0.886 one SE is +-60 Elo and it
+   misread in every direction. Moved to a champion clone at ~0.47 it predicted
+   -30 against an arena result of -31.7 -- the first accurate call it made.
+4. **A BC clone from the ten strongest players is far better than the log says.**
+   `ml-log` records BC at 0.175 vs `v16`; 8x64 on 3,664 top-player games with
+   dihedral augmentation reads **0.628**. It also produced the first 8x64 critic
+   that ever fitted (`sp43.resume.npz`, warmed at stage 0). Both are assets for a
+   next cycle, not for a deadline -- the clone is still 165 Elo behind sp16.
+
+### First three things to try next cycle
+
+1. **Temporal channels.** The encoder sees one frame, so it cannot distinguish an
+   advancing stack from a parked one -- and the ladder losses are decapitations
+   by a stack that arrives 7-36 turns after the general empties. A competitor
+   independently reports using 3 look-backs plus EMAs. This needs a BC restart,
+   which is now cheap and produces a strong clone.
+2. **More of the move budget.** Search needs a `bot/`-side transition function and
+   a trustworthy evaluator, and both are logged traps -- but TTA proves the axis
+   pays, and 145 ms a move is still unspent.
+3. **An opponent in a TRAINING seat.** Still never tried. Symmetric self-play is
+   the most-replicated failure here: castles get deleted at every stage because a
+   mirror cancels the signal. `vecroll` stacks both seats through one forward, so
+   this is real surgery, not a flag.
 
 ## THE RECIPE IS EXHAUSTED — six runs from `sp9-i600`, none beat it
 
