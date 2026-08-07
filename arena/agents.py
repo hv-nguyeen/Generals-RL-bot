@@ -12,7 +12,8 @@ A spec is a string so runs are reproducible from a command line:
     clone:weights.npz        a behaviour-cloned policy (learn/train.py)
     tta:weights.npz          the same policy, logits averaged over the 8 symmetries
     ship:weights.npz         EXACTLY what bot/main.py packages: net + tta + guard
-    ship8:weights.npz        the same, with the full 8-element group on any shape
+    ship8:weights.npz        the same, pinned to the full 8-element group
+    ship4:weights.npz        the same, pinned to 4 elements: the pre-tta_full deploy
     ens:a.npz+b.npz          several checkpoints averaged, under TTA (@prob to switch mode)
     shipens:a.npz+b.npz      the same plus the guard: what bot/main.py would package
     guard:weights.npz        the same policy under bot/policy/guard.py's overrides
@@ -423,7 +424,8 @@ def make(spec: str, player_id: int, h: int, w: int, seed: int = 0):
         # Constructed exactly as bot/main.py does it -- same two guard arguments,
         # hidden_ratio left at its default, tta read from the same config field.
         # If this drifts from main.py the spec stops meaning anything.
-        return GuardedPolicy(ClonePolicy(player_id, h, w, arg, tta=cfg.tta),
+        return GuardedPolicy(ClonePolicy(player_id, h, w, arg, tta=cfg.tta,
+                                         full=cfg.tta_full),
                              cfg.general_block_radius, cfg.general_block_ratio)
     if name == "ship8":
         # `ship:` with the FULL dihedral group on non-square boards too. The
@@ -434,6 +436,15 @@ def make(spec: str, player_id: int, h: int, w: int, seed: int = 0):
         from bot.policy.net import ClonePolicy
         cfg = Config()
         return GuardedPolicy(ClonePolicy(player_id, h, w, arg, tta=cfg.tta, full=True),
+                             cfg.general_block_radius, cfg.general_block_ratio)
+    if name == "ship4":
+        # `ship:` PINNED to the four shape-preserving elements, i.e. what was
+        # deployed before tta_full existed. `ship:` now follows the config, so
+        # this is the fixed reference the A/B needs once the default flips.
+        from bot.policy.guard import GuardedPolicy
+        from bot.policy.net import ClonePolicy
+        cfg = Config()
+        return GuardedPolicy(ClonePolicy(player_id, h, w, arg, tta=cfg.tta, full=False),
                              cfg.general_block_radius, cfg.general_block_ratio)
     if name in ("ens", "shipens"):
         # `ens:a.npz+b.npz` averages several checkpoints under the same TTA the

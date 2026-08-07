@@ -251,6 +251,15 @@ class Config:
     # searched -- and false restores the single-orientation forward exactly.
     tta: bool = True
 
+    # Use all EIGHT dihedral elements, including the four that transpose a
+    # non-square board, rather than only the four that preserve its shape.
+    # `mapgen` draws height and width independently from 18-21, so only about one
+    # board in four is square and the rest were getting half the averaging.
+    # Measured +15.5 Elo [+0.4, +30.6] over the four-element form on 2000 games,
+    # same weights. Costs ~10 ms mean against 150, but the worst move observed
+    # was 97 ms -- set false if the sandbox ever reports a fault.
+    tta_full: bool = True
+
     # ------------------------------------------------------------------------
     def save(self, path: str | Path) -> None:
         Path(path).write_text(json.dumps(asdict(self), indent=2) + "\n")
