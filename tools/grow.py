@@ -167,6 +167,33 @@ def _same_moves(a: str, b: str, games: int, seed0: int) -> tuple[int, float]:
     return n, worst
 
 
+def random_init(layers: int, channels: int, seed: int) -> dict:
+    """A fresh policy at an arbitrary size, numpy only.
+
+    `learn.selfplay` requires `--init`, so training a size that has no checkpoint
+    yet needs one built from nothing. This is `learn.train.init_params` reproduced
+    without the jax dependency -- He init, `sqrt(2 / (9 * fan_in))`, zero biases,
+    and the small `pass_w` -- so a net started here is the same distribution the
+    trainer would have produced.
+
+    Plain trunks only. Residual is what `trunk_keys` refuses to migrate and what
+    killed the critic twice at 12 layers.
+    """
+    rng = np.random.default_rng(seed)
+    out, prev = {}, features.C
+    for i in range(layers):
+        scale = np.sqrt(2.0 / (9 * prev))
+        out[f"conv{i}_w"] = (rng.normal(size=(channels, prev, 3, 3)) * scale).astype(np.float32)
+        out[f"conv{i}_b"] = np.zeros((channels,), np.float32)
+        prev = channels
+    out["head_w"] = (rng.normal(size=(features.PER_CELL, prev, 3, 3))
+                     * np.sqrt(2.0 / (9 * prev))).astype(np.float32)
+    out["head_b"] = np.zeros((features.PER_CELL,), np.float32)
+    out["pass_w"] = (rng.normal(size=(prev,)) * 0.01).astype(np.float32)
+    out["pass_b"] = np.zeros((), np.float32)
+    return out
+
+
 def _arrays(path: str, prefix: str | None):
     src = np.load(path)
     if not prefix:
@@ -233,6 +260,13 @@ def main() -> None:
                          "`--prefix phi` is what makes --init-critic survive an "
                          "encoder change")
     ap.add_argument("--selfcheck", action="store_true")
+    ap.add_argument("--random", metavar="LxC",
+                    help="write a FRESH policy at this size instead of growing "
+                         "one, e.g. --random 8x64. learn.selfplay requires "
+                         "--init, so a size with no checkpoint yet needs a seed "
+                         "file. Note ml-log: every attempt that skipped a "
+                         "behaviour-clone init never learned to play at all, so "
+                         "start such a run at stage 0, never higher")
     ap.add_argument("--show", metavar="FILE",
                     help="report a checkpoint's shape instead of growing it")
     ap.add_argument("--against", metavar="FILE",
@@ -247,6 +281,22 @@ def main() -> None:
         return
     if args.show:
         show(args.show, args.against, args.prefix)
+        return
+    if args.random:
+        if not args.out:
+            raise SystemExit("--random needs --out")
+        try:
+            L, C = (int(v) for v in args.random.lower().split("x"))
+        except ValueError:
+            raise SystemExit(f"--random {args.random} must look like 8x64")
+        fresh = random_init(L, C, args.seed)
+        np.savez(args.out, **fresh, **arch_record(fresh))
+        n = sum(v.size for v in fresh.values())
+        print(f"fresh {L}x{C} policy, {n} parameters, {features.C} input "
+              f"channels -> {args.out}")
+        print("UNTRAINED. Start it at --start-stage 0: it cannot play, and every "
+              "attempt in this project that began RL above stage 0 without a "
+              "trained init never learned to play at all (docs/ml-log.md).")
         return
     if not (args.net and args.out and args.layers and args.channels):
         raise SystemExit("need --net --out --layers --channels (or --selfcheck)")
