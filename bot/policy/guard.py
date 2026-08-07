@@ -197,7 +197,13 @@ class GuardedPolicy:
             self.last_debug = {"mode": "passthrough", "turn": obs.turn}
             return act
 
-        logits = np.where(mask, scored.logits(obs), -np.inf)
+        # tta must come from the wrapped policy. This method re-scores instead of
+        # calling `inner.act`, so a flag set on the inner policy reaches nothing
+        # unless it is forwarded here -- and the SUBMISSION always wraps the net
+        # in this class. Measured +32.8 Elo on a raw ClonePolicy and shipped as
+        # exactly zero until this line passed it through.
+        logits = np.where(mask, scored.logits(obs, tta=getattr(self.inner, "tta", False)),
+                          -np.inf)
         gen = _my_general(obs)
         order = np.argsort(-logits)
         for rank, idx in enumerate(order):

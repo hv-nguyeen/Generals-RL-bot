@@ -11,6 +11,7 @@ A spec is a string so runs are reproducible from a command line:
     idle                     always passes
     clone:weights.npz        a behaviour-cloned policy (learn/train.py)
     tta:weights.npz          the same policy, logits averaged over the 8 symmetries
+    ship:weights.npz         EXACTLY what bot/main.py packages: net + tta + guard
     guard:weights.npz        the same policy under bot/policy/guard.py's overrides
     snipe:weights.npz        that policy, but a big stack marches at the enemy
                              general — the decapitating opponent our lineage
@@ -407,6 +408,20 @@ def make(spec: str, player_id: int, h: int, w: int, seed: int = 0):
         return GuardedPolicy(ClonePolicy(player_id, h, w, path),
                              cfg.general_block_radius, cfg.general_block_ratio,
                              float(hr) if hr else 0.0)
+    if name == "ship":
+        # EXACTLY what bot/main.py packages: the net, test-time augmentation,
+        # and the guard on top. Every other spec measures a component; this one
+        # measures the artifact. `tta:` was measured at +32.8 and shipped as zero
+        # because the guard re-scores and dropped the flag -- a component being
+        # right is not the same as the submission being right.
+        from bot.policy.guard import GuardedPolicy
+        from bot.policy.net import ClonePolicy
+        cfg = Config()
+        # Constructed exactly as bot/main.py does it -- same two guard arguments,
+        # hidden_ratio left at its default, tta read from the same config field.
+        # If this drifts from main.py the spec stops meaning anything.
+        return GuardedPolicy(ClonePolicy(player_id, h, w, arg, tta=cfg.tta),
+                             cfg.general_block_radius, cfg.general_block_ratio)
     if name == "stdio":
         from arena.stdio_agent import StdioAgent
         return StdioAgent(arg, player_id, h, w)
