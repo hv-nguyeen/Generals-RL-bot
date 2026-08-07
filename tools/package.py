@@ -23,6 +23,11 @@ RUN_SH = """#!/usr/bin/env bash
 # The sandbox runs this with the submission directory as cwd, but do not rely
 # on that: resolve relative to the script itself.
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
+# One BLAS thread. The match sandbox is single-core, so a thread pool sized to
+# the host is pure overhead -- and on a many-core machine numpy spends real time
+# spinning one up on its first matmul, which lands inside the first move's
+# budget. A move over 150 ms is a forfeit, and a forfeit is a loss.
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 PY="${BOT_PYTHON:-$(command -v python3 || command -v python)}"
 exec "$PY" -u -m bot.main
 """

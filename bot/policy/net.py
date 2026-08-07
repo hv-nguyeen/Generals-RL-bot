@@ -219,6 +219,20 @@ class ClonePolicy:
         self.H, self.W = h, w
         self.tta = tta
         self.last_debug: dict = {}
+        # Pay the one-time costs HERE, before the first frame. Construction is
+        # outside the per-move budget; the first move is not.
+        #
+        # `symmetry.maps` is lru_cached, so without this the first TTA move
+        # builds every cell-gather and action-relabel table for the board -- and
+        # the first forward pays numpy's allocation and BLAS warm-up on top.
+        # Measured through the real wire protocol: 110 ms of a 150 ms limit on
+        # move one, against 5 ms in steady state. That margin is a forfeit on a
+        # slower box, and a forfeit is a loss.
+        warm = np.zeros((features.C, features.PAD, features.PAD), np.float32)
+        self.net._logits_from(warm)
+        if tta:
+            for g in symmetry.group(h, w):
+                symmetry.maps(h, w, g)
 
     def act(self, obs: Obs, deadline=None):
         logits = self.net.logits(obs, tta=self.tta)
