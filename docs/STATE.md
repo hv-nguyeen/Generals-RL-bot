@@ -27,6 +27,23 @@ field improved too.
 **sp16 was a tail event, not a typical draw.** Three independent re-draws of its
 exact recipe all landed ~30 Elo below it. Do not assume the recipe reproduces.
 
+### A run killed by KILL 2 can be revived with an EARLIER critic
+
+sp44 (BC 8x64, `--start-stage 2`) climbed the champion column 0.28 -> 0.36 ->
+0.40 -> 0.43 over 150 iterations -- about +115 Elo, the only sustained
+improvement anything showed this cycle -- then its critic collapsed after the
+promotion to stage 3 and KILL 2 fired at iteration 185.
+
+Restarting from `sp44.best` **with `sp44.resume.npz`** inherited the collapsed
+critic and the counter climbed monotonically 1 -> 9 with no reset, on course to
+die again. Restarting the same policy with **`sp43.resume.npz`** -- the critic
+from the earlier run, which had warmed at stage 0 and carried sp44's whole climb
+-- warmed within 3 iterations.
+
+So the resume file's critic is not always the one to resume with. When KILL 2
+fires, the critic in that run's own resume is by definition the one that failed;
+pair the improved policy with the last critic known to have been healthy.
+
 ### The four things worth carrying forward
 
 1. **Inference compute pays and is barely touched.** TTA over the dihedral group
