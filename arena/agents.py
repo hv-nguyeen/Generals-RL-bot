@@ -13,6 +13,8 @@ A spec is a string so runs are reproducible from a command line:
     tta:weights.npz          the same policy, logits averaged over the 8 symmetries
     ship:weights.npz         EXACTLY what bot/main.py packages: net + tta + guard
     ship8:weights.npz        the same, with the full 8-element group on any shape
+    ens:a.npz+b.npz          several checkpoints averaged, under TTA (@prob to switch mode)
+    shipens:a.npz+b.npz      the same plus the guard: what bot/main.py would package
     guard:weights.npz        the same policy under bot/policy/guard.py's overrides
     snipe:weights.npz        that policy, but a big stack marches at the enemy
                              general — the decapitating opponent our lineage
@@ -433,6 +435,23 @@ def make(spec: str, player_id: int, h: int, w: int, seed: int = 0):
         cfg = Config()
         return GuardedPolicy(ClonePolicy(player_id, h, w, arg, tta=cfg.tta, full=True),
                              cfg.general_block_radius, cfg.general_block_ratio)
+    if name in ("ens", "shipens"):
+        # `ens:a.npz+b.npz` averages several checkpoints under the same TTA the
+        # deployed bot uses. `shipens:` adds the guard, i.e. it is what
+        # bot/main.py would package -- and the shipping number must come from
+        # THAT, because a wrapper the guard cannot re-score through silently
+        # degrades to passthrough. Append `@prob` for probability averaging
+        # instead of logit averaging.
+        from bot.policy.ensemble import EnsemblePolicy
+        spec, _, mode = arg.partition("@")
+        cfg = Config()
+        agent = EnsemblePolicy(player_id, h, w, spec.split("+"), tta=cfg.tta,
+                               full=getattr(cfg, "tta_full", False),
+                               mode=mode or "logit")
+        if name == "ens":
+            return agent
+        from bot.policy.guard import GuardedPolicy
+        return GuardedPolicy(agent, cfg.general_block_radius, cfg.general_block_ratio)
     if name == "stdio":
         from arena.stdio_agent import StdioAgent
         return StdioAgent(arg, player_id, h, w)

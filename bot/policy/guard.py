@@ -202,7 +202,18 @@ class GuardedPolicy:
         # unless it is forwarded here -- and the SUBMISSION always wraps the net
         # in this class. Measured +32.8 Elo on a raw ClonePolicy and shipped as
         # exactly zero until this line passed it through.
-        logits = np.where(mask, scored.logits(obs, tta=getattr(self.inner, "tta", False)),
+        # BOTH flags, forwarded from the wrapped policy. This method re-scores
+        # rather than calling `inner.act`, so anything set on the inner policy
+        # reaches nothing unless it is passed here -- and the SUBMISSION always
+        # wraps the net in this class. `tta` was dropped that way once and
+        # shipped a measured +32.8 as exactly zero; `full` was dropped the same
+        # way immediately after, which would have made the `ship8:` A/B measure
+        # the four-element group on both sides and read ~0 for a change that was
+        # never actually tested. If a new option is added to `Net.logits`, it
+        # must be added here too.
+        logits = np.where(mask, scored.logits(obs,
+                                              tta=getattr(self.inner, "tta", False),
+                                              full=getattr(self.inner, "full", False)),
                           -np.inf)
         gen = _my_general(obs)
         order = np.argsort(-logits)
