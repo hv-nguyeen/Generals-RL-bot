@@ -265,6 +265,27 @@ utilisation but **cannot see PIDs from other containers** — memory in use with
 "No running processes found" means someone else's job, possibly your own in a
 JupyterHub container.
 
+### `pkill`, `hostname` and `timeout` are not on this box
+
+Three standard tools are missing from the container and each has cost a round
+trip. The substitutes:
+
+```bash
+for p in /proc/[0-9]*; do tr '\0' ' ' < $p/cmdline 2>/dev/null | grep -q "learn.selfplay" && kill "${p#/proc/}"; done
+```
+
+```bash
+cat /proc/sys/kernel/hostname
+```
+
+`timeout` has no substitute worth the trouble — use `nohup ... &` and kill it by
+the scan above.
+
+Note the scan matches the PARENT only: `spawn` workers carry a
+`multiprocessing` cmdline with no module name in it, so they survive and
+reparent to PID 1. Always follow with the orphan sweep below, and use `kill -9`
+if a plain `kill` leaves the count unchanged — SIGTERM does not always take.
+
 ### Killing a run leaves its 60 workers behind — ALWAYS sweep after
 
 `kill` on the selfplay parent does **not** take the `ProcessPoolExecutor`

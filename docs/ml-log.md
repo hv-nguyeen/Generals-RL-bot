@@ -3,10 +3,161 @@
 Running log so nothing gets tried twice. Every entry needs a measured number, not
 an impression. If an entry has no number it does not belong here.
 
-Last updated 2026-08-05.
+Last updated 2026-08-08.
 
 **For the current state and what to do next, read `docs/STATE.md`.** This file is
 the full measured history and the reasoning; that one is the short version.
+
+## SOLVED 2026-08-08: self-play does NOT unlearn castles. The critic did.
+
+This file has said since 2026-08-06 that "self-play unlearns castles at every
+stage". That was measured with a critic that prices a castle at **-0.002**, and
+it was the critic's verdict, not the game's. Given a critic that prices them
+correctly, self-play LEARNS to build:
+
+```
+bld 0.60 -> 2.29 over ~23 training iterations, bldA positive throughout
+```
+
+Four things were needed and removing any one refreezes the run. They are listed
+in the order they were discovered, because each only became visible once the
+previous was fixed.
+
+### 1. What a castle is actually worth, by stratum
+
+`tools/cfprobe.py` forks a live game at a legal build, forces the build in one
+branch, re-rolls a control from the same snapshot under common random numbers,
+and plays both to terminal. 3000 games on `sp44.best`, stage 4, 322 s on 60
+cores:
+
+| stratum | n | mean delta | SE | vs 0 |
+|---|---|---|---|---|
+| A -- a build v16's castle block would take | 1794 | **+0.117** | 0.029 | +4.0 sigma |
+| B -- every other build-legal turn-seat | 2967 | **-0.129** | 0.023 | -5.6 sigma |
+
+A - B = 0.246 +- 0.037, **+6.6 sigma**. Castles are not good or bad; they are
+good where a competent player builds them and bad everywhere else, and ~91% of
+build-legal moments are the bad kind. That is why `tools/buildbias` alone failed
+on 2026-08-07 and why the correction "castles are a symptom" was half right.
+
+Nothing in this repo had measured this. Every previous castle number routes
+through the critic -- `vprobe` reads its belief, `bldA` is its GAE advantage,
+the buildbias verdict is an inference from what PPO did next. A forced
+unilateral deviation played to terminal is the one estimate that does not.
+
+### 2. The critic was starved, not broken
+
+`tools/vprobe` on the sp43/sp44 pair, against the rule it pre-registered at
+`tools/vprobe.py:22`:
+
+```
+castle, free          -0.0023 +-0.0014   the asset is not priced
+castle, minus 35 army -0.0051 +-0.0018   a build reads as pure cost
+garrison 25 vs 2      +0.2610 +-0.0388   the critic works fine on other things
+```
+
+True value +0.117, critic's value -0.005. GAE computes a build's advantage as
+V(after) - V(before), so **every build gets a negative advantage automatically**,
+whatever it did. That is `bldA -1.2` explained, and it is the complete mechanism
+behind castles being deleted at every stage.
+
+`STATE.md:1082` records sp9's critic at **+0.28** and concluded "the blind-critic
+diagnosis is dead". That was an 8x32 trained where its own policy built 1.5
+castles a game. **Critic readings do not transfer across lineages** (see also
+547da6e) -- probe the pair you are about to use.
+
+### 3. `--init-critic` was loading every pretrained critic wrong, twice
+
+`learn/valuetrain.py` fits `forward()` under `logaddexp(0, l) - y*l`, so its
+output is a SIGMOID logit. `learn/selfplay.py` reads the same function through
+`tanh(l)` against targets in {-1, 0, +1}. The conversion is
+
+    2*P - 1 = 2*sigma(l) - 1 = tanh(l / 2)
+
+so the head must be **halved** -- a units bug, fixed in `load_critic`. And that
+is only half of it: halving assumes temperature 1, and a BCE fit is
+overconfident. `tools/calibtemp.py` sweeps the head scale and scores each with
+`evar`, the metric the trainer is actually judged by:
+
+| T | evar |
+|---|---|
+| 1.0 (raw) | **-0.054** |
+| 2.0 (the units fix alone) | +0.068 |
+| **4.0** | **+0.117** |
+| 8.0 | +0.104 |
+
+Note the failure is NOT bias: `Var(z - c) == Var(z)`, so a constant offset cannot
+move `evar`. Expanding, `evar = (2*Cov(z,V) - Var(V)) / Var(z)`, so it goes
+negative exactly when `Var(V) > 2*Cov(z,V)` -- a critic swinging harder than its
+correlation earns.
+
+**This plausibly invalidates 547da6e, "value24 does not transfer"** -- 0.759 BCE
+on field positions buying negative evar on self-play returns. The fit may have
+been sound and the scaling threw it away, which would mean the whole
+`learn/valuedata.py` pipeline was retired on the strength of a units bug.
+
+### 4. `--critic-lr 1e-3` memorises the buffer
+
+The default destroys a critic that arrives already fitted. Within one iteration:
+
+| `--critic-lr` | `v` at iter 3 | `evar` at iter 3 | `diff` |
+|---|---|---|---|
+| 1e-3 (default) | 0.154 | **-0.35** | -0.48 |
+| 1e-4 | 0.797 | **+0.06** | -0.10 |
+
+An honest MSE at `evar ~0.1` is ~0.88. Reaching 0.15 means it fitted the buffer,
+and 226k samples are only ~512 independent trajectories -- an 8x64 net can learn
+which board it is on and recall the outcome. Read `v` against `1 - evar`: if `v`
+is far below it, the critic is memorising.
+
+### What did NOT work, so nobody builds it again
+
+**The counterfactual aux losses added nothing over plain `buildbias`.** A
+competitor ("bca") reported that a counterfactual replay buffer plus a
+build-preference loss and a successor-value loss broke their model out of a
+no-build mode. Implemented as `--cf-frac/--cf-pref-weight/--cf-value-weight` in
+`learn/selfplay.py` and measured as a paired run:
+
+* sp72 (both weights 0.05) and sp73 (both 0) recovered `bldA` from -1.15 to ~0
+  **identically**, and sp73 -- without the terms -- reached +0.60/+0.56/+0.58
+  where sp72 reached +0.24/+0.15/+0.27.
+* On sp70, at `bld 0.00`, the terms had nothing to act on at all: sp44 samples
+  `p(build|legal) ~ 0.003`, so `L_pref` can only reweight actions never taken.
+  `tools/buildprior.py` records the same shape on sp46, "50 iterations with
+  `bldA +0.00` on every single one".
+
+Once builds occur, ordinary play teaches the critic what they are worth. The
+machinery is redundant; `tools/buildbias --bias 6.0` plus a correctly loaded
+critic is the whole recipe. The flags remain, defaulted to 0, and
+`docs/design-counterfactual-build.md` records the design and its red team.
+
+Two further corrections from that work, both worth keeping:
+
+* The gate in that design conditioned on stratum A, but the trainer never sees A
+  in isolation -- its coin only fires when both reservoirs are populated, so the
+  realised buffer is ~31% A / 69% B and its mean is **-0.018 +- 0.015**. Gate on
+  the quantity the loss actually multiplies, not on a sub-population.
+* `cfprobe`'s `capt` column is a LOSS rate, not a capture rate: it reads the
+  terminal state, so on a decided game it is true iff the fork seat lost.
+
+### The limiter, and what is still open
+
+An offline critic goes stale as the policy moves. Fitted at `bld 0.6`, it bought
+16 productive iterations; the policy reached `bld 2.0`, the critic went
+off-distribution and refroze. It recovered once after 19 iterations and then did
+not recover in 40. So the loop is **policy iteration**: fit, train ~20, refit.
+
+Also true and unresolved:
+
+* **`comp-eval` at 0.887 cannot see this.** One sigma is +-60 Elo there. It read
+  0.876 -> 0.887 over 50 iterations, 0.3 sigma, while `bld` more than tripled.
+  Use `--opp` with a champion clone so a reading lands near 0.5.
+* **`.best` is therefore close to a lottery** -- the max of ~24 noisy draws is
+  the luckiest, not the strongest. Snapshot on a timer and arena several.
+* **It is all learned in a mirror.** Both seats build, so neither is punished for
+  the tempo. The castle rate may be calibrated against itself and wrong against
+  an aggressor. `STATE.md`'s "opponent in a TRAINING seat" is still never tried
+  and is now the highest-value item.
 
 ## The one-line summary
 

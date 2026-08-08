@@ -1,9 +1,93 @@
-# Where the project is — 2026-08-07
+# Where the project is — 2026-08-08
 
 `docs/ml-log.md` is the full measured history and it is long. This file is the
 short version: what is true right now, what is running, and what to do next.
 Read this first, then the log for the reasoning behind any line, and
 `docs/CLUSTER.md` for how to install and run anything on the VU box.
+
+## THE SPRINT IS OVER, THE MARATHON IS NOT
+
+The competition has two checkpoints. **Sprint closed 2026-08-08**; the
+**Marathon runs to the end of August**, so there are roughly three weeks left and
+the leaderboard is continuous. Everything below about "the deadline" from the
+2026-08-07 revision refers to the Sprint only.
+
+**Deployed: `generals-bot-nn12`** — `sp16-c24` + test-time augmentation + the
+guard. Rank **27 of 107** over 200 ladder games, peak Elo 1912. Still the best
+thing measured; nothing since has beaten it in an arena.
+
+## WHAT CHANGED ON 2026-08-08 — castles, and why the critic was the whole story
+
+**Self-play does not unlearn castles. The critic did.** Read the 2026-08-08
+section of `ml-log.md` in full; the four-line version:
+
+1. A castle is worth **+0.117** where a competent player would build it and
+   **−0.129** everywhere else (n=1794/2967, 6.6 sigma apart) — `tools/cfprobe.py`.
+2. The critic priced one at **−0.002** while reading an undefended general at
+   **+0.261**. Starved, not broken. GAE then hands every build a negative
+   advantage automatically, which is `bldA −1.2`.
+3. `--init-critic` was loading every pretrained critic wrong twice — a units bug
+   (`2σ(l)−1 = tanh(l/2)`, fixed in `load_critic`) and an unfitted temperature
+   (`tools/calibtemp.py`, T=4 here: evar −0.054 → +0.117).
+4. `--critic-lr 1e-3` memorises the buffer. Use 1e-4 and read `v` against
+   `1 − evar`.
+
+With all four: **`bld` 0.60 → 2.29 in ~23 training iterations, `bldA` positive.**
+Stage 5 reaches 1.82–2.44 naturally, so ~2 is competition-normal, not overbuilding.
+
+**The counterfactual machinery was measured and is redundant.** `buildbias` plus
+a correctly loaded critic is the whole recipe. Do not rebuild it; see the log.
+
+## THE OPEN PROBLEM: the critic goes stale as the policy moves
+
+An offline critic fitted at `bld 0.6` bought 16 productive iterations. The policy
+reached `bld 2.0`, the critic went off-distribution and refroze — recovered once
+after 19 iterations, then did not recover in 40. The loop is therefore **policy
+iteration**: fit a critic, train ~20 iterations, refit.
+
+```
+tools/valueselfplay.py   frozen policy -> x/y shards at the stage it will train on
+learn/valuetrain.py      --layers 8 --channels 64 --lr 5e-4 --epochs 12
+tools/calibtemp.py       fit T, write the rescaled critic
+learn/selfplay.py        --init-critic CRITIC_T.npz --critic-lr 1e-4 --warm-evar 0.05 --frozen-kill 0
+```
+
+`--frozen-kill 0` is required: the cycling is expected now, and the default kills
+the run during a normal stale patch.
+
+## Three instruments that are lying to you right now
+
+1. **`comp-eval` at 0.887 has ±60 Elo resolution.** It read 0.876 → 0.887 over 50
+   iterations while `bld` tripled. Pass `--opp ours:configs/v16.json,clone:runs/nn/sp16-c24.npz`
+   so a reading lands near 0.5. Only safe on a FRESH start — on a resume the
+   restored `base_score` is against the old opponent set and the run kills itself.
+2. **`.best` is close to a lottery** while comp-eval is blind: the max of ~24
+   noisy draws is the luckiest checkpoint, not the strongest. Snapshot `.live` on
+   a timer and arena several.
+3. **The arena on a busy node returns 0.500 with faults** — a reproducible wrong
+   answer. `docs/CLUSTER.md:199`. Read the `faults` line first, always.
+
+## What to do next, in order
+
+1. **An opponent in a TRAINING seat.** Still never tried, and now the
+   highest-value item rather than the third. Everything measured on 2026-08-08 was
+   learned in a mirror where both seats build and neither is punished for the
+   tempo, so the castle rate may be calibrated against itself and wrong against an
+   aggressor. `vecroll` stacks both seats through one forward, so this is real
+   surgery, not a flag.
+2. **A critic that tracks a moving policy.** The refit loop works but caps the
+   duty cycle near 50%. More independent games help more than a finer stride —
+   the failure mode is memorising trajectories, and 226k samples are only ~512
+   independent games.
+3. **Temporal channels.** Unchanged from the last revision: the encoder sees one
+   frame and cannot tell an advancing stack from a parked one, and the ladder
+   losses are decapitations 7–36 turns after the general empties.
+4. **Inference compute.** TTA is +31.2 for zero training at 5 ms of a 150 ms
+   budget. Still 96% unspent.
+
+---
+
+# The 2026-08-07 revision follows, unchanged
 
 ## FINAL STANDING (competition close, 2026-08-07)
 
