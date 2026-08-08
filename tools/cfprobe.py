@@ -295,6 +295,17 @@ def main() -> None:
     ap.add_argument("--save", default="", help="optional .npz of the raw rows")
     args = ap.parse_args()
 
+    # Before the pool, not inside it. `_init` runs in every worker, so a missing
+    # or unreadable checkpoint otherwise prints 60 identical tracebacks and ends
+    # in a BrokenProcessPool that names neither the file nor the reason. Loading
+    # it here also fails early on a stale head or stem, which `Net` reports
+    # precisely -- and /local/data is per-node, so "wrong node" is the common
+    # case rather than an exotic one.
+    if not os.path.exists(args.weights):
+        raise SystemExit(f"--weights {args.weights}: no such file. /local/data is "
+                         f"per-node -- the checkpoint may be on another one.")
+    Net(args.weights)
+
     jobs = [(args.seed0 + i, args.dmin, args.dmax) for i in range(args.games)]
     t0 = time.time()
     rows: list[dict] = []
