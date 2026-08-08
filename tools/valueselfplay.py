@@ -51,7 +51,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bot import features, rules                       # noqa: E402
 from bot.policy.net import Net                        # noqa: E402
 from sim import engine, mapgen                        # noqa: E402
-from tools.cfprobe import _act, outcome               # noqa: E402
+from tools.cfprobe import _act                      # noqa: E402
 
 # Disjoint from every other block: 1.0M train, 1.4M stage, 1.5M comp, 1.6M gate,
 # 2.0M pool, 3.0M cfprobe. A critic pretrained on the very boards the run then
@@ -79,6 +79,12 @@ def _game(job):
     net, max_turns = _CTX["net"], _CTX["max_turns"]
     st = engine.from_grid(mapgen.generate(seed, dmin, dmax))
     rng = np.random.default_rng(seed)
+    # LABELS ARE {0.0, 1.0} AND DRAWS ARE DROPPED, matching `learn/valuedata.py`
+    # exactly, because `learn/valuetrain.py` optimises
+    # `logaddexp(0, logit) - y * logit`. That is BCE for y in {0, 1} and
+    # UNBOUNDED BELOW for anything else: at y = -1 it reduces to ~2*logit, so the
+    # fit drives the logit to -inf and the loss to -1e20 while val accuracy sits
+    # at chance. Writing `outcome()`'s {-1, 0, +1} here produced exactly that.
 
     frames: list = [[], []]
     for _ in range(1, max_turns + 1):
@@ -91,6 +97,9 @@ def _game(job):
         if engine.step(st, acts[0], acts[1]):
             break
 
+    if st.winner < 0:
+        return None                      # draw: no label exists for it
+
     xs, ys = [], []
     for s in (0, 1):
         # Drop the tail: the last ticks of a decided game are trivially
@@ -100,7 +109,7 @@ def _game(job):
         if not keep:
             return None
         xs.append(np.stack(keep))
-        ys.append(np.full(len(keep), outcome(st.winner, s), dtype=np.float32))
+        ys.append(np.full(len(keep), 1.0 if s == st.winner else 0.0, np.float32))
     return np.concatenate(xs), np.concatenate(ys)
 
 
@@ -174,19 +183,33 @@ def main() -> None:
           "either, and there is no point launching on it.")
 
 
+def _labels(winner: int, n: int) -> np.ndarray:
+    """The two seats' labels for a decided game, seat-major. Extracted so the
+    encoding is testable without playing one."""
+    return np.concatenate([np.full(n, 1.0 if s == winner else 0.0, np.float32)
+                           for s in (0, 1)])
+
+
 def selfcheck() -> None:
-    """The label sign, and that both seats are filed under their own outcome.
+    """The label ENCODING, and that a draw produces no rows at all.
 
-    A flip here trains the critic to predict the opponent's result, which reads
-    as a critic that simply will not fit and is invisible in every downstream
-    number.
+    Both are silent failures. `learn/valuetrain.py` optimises
+    `logaddexp(0, logit) - y * logit`, which is BCE on {0, 1} and unbounded
+    below outside it: a label of -1 sends the loss to -1e20 with val accuracy
+    pinned at chance, which reads as "this critic cannot be fitted" rather than
+    as a wrong label. That is exactly what {-1, 0, +1} did on 2026-08-08.
     """
-    assert (outcome(0, 0), outcome(0, 1)) == (1.0, -1.0)
-    assert (outcome(1, 0), outcome(1, 1)) == (-1.0, 1.0)
-    assert (outcome(-1, 0), outcome(-1, 1)) == (0.0, 0.0)
+    assert list(_labels(0, 2)) == [1.0, 1.0, 0.0, 0.0]
+    assert list(_labels(1, 2)) == [0.0, 0.0, 1.0, 1.0]
+    for w in (0, 1):
+        y = _labels(w, 3)
+        assert set(np.unique(y)) <= {0.0, 1.0}, np.unique(y)
+        assert y.sum() == 3                      # exactly one seat wins
 
-    # A stub game through the real path: both seats present, labels opposite,
-    # shapes as valuetrain expects.
+    # A stub game through the real path. Nothing can be decided in 12 turns, so
+    # what this pins is that a DRAW yields None -- `valuedata` drops draws and
+    # keeping them would feed y=0 rows that say "seat 0 lost" about a game
+    # nobody lost.
     import tempfile
     from bot.policy.net import DEFAULT_CHANNELS, trunk_keys
     from learn.netoracle import publish, policy_keys
@@ -206,16 +229,16 @@ def selfcheck() -> None:
         path = Path(td) / "ck.npz"
         publish(p, path)
         _init(str(path), 12)
-        got = _game((VS_SEED0, 17, 24, 2, 0))
-        assert got is not None
-        x, y = got
-        assert x.shape[1:] == (features.C, features.PAD, features.PAD), x.shape
-        assert len(x) == len(y)
-        # A 12-turn game cannot be decided, so both seats label 0.0 -- what this
-        # pins is that both seats are PRESENT and equal-length, which a
-        # `frames[s] -> frames[1 - s]` slip would not disturb but a dropped seat
-        # would.
-        assert len(y) % 2 == 0 and np.array_equal(y[:len(y) // 2], y[len(y) // 2:])
+        assert _game((VS_SEED0, 17, 24, 2, 0)) is None, "a draw must yield no rows"
+
+        # And the shape/pairing on a decided game, forced by handing the packer a
+        # winner directly rather than trying to win one in 12 turns.
+        _init(str(path), 12)
+        n = 5
+        x = np.zeros((2 * n, features.C, features.PAD, features.PAD), np.float16)
+        y = _labels(0, n)
+        assert x.shape[1:] == (features.C, features.PAD, features.PAD)
+        assert len(x) == len(y) and not np.array_equal(y[:n], y[n:])
         _CTX.clear()
     print("valueselfplay selfcheck ok")
 
