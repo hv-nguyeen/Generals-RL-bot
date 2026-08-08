@@ -247,6 +247,9 @@ def summarise(rows: list[dict], gate: float, sigma: float) -> bool:
               f"{np.mean([r['captured'] for r in sub]):>5.2f}")
         if k == 0:
             passed = m - sigma * se > gate
+            if len(d) < 900:
+                print(f"{'':>9}  UNDERPOWERED: {len(d)} stratum-A forks, need "
+                      f"~900 for SE < {gate / sigma:.3f}. Raise --games.")
 
     a = [r for r in rows if r["stratum"] == 0]
     print(f"\nlegal build turn-seats per game: "
@@ -273,8 +276,13 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--weights", required=True,
                     help="policy whose delta is being measured, e.g. sp44.best.npz")
-    ap.add_argument("--games", type=int, default=700,
-                    help="parent games; ~1 fork each, split across two strata")
+    ap.add_argument("--games", type=int, default=3000,
+                    help="parent games. The gate needs SE < 0.033 on stratum A, "
+                         "and delta has sd ~1.0, so it needs n_A >= 900. A fires "
+                         "in only a fraction of games, so 3000 is the floor that "
+                         "can reach the gate rather than report 'inconclusive'. "
+                         "Read `A n` in the output: if it is under 900 the "
+                         "verdict is not powered, whatever it says")
     ap.add_argument("--dmin", type=int, default=17, help="stage 4 lower bound")
     ap.add_argument("--dmax", type=int, default=24, help="stage 4 upper bound")
     ap.add_argument("--max-turns", type=int, default=rules.TURN_LIMIT)
