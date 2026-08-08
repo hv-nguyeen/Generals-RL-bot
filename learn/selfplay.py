@@ -858,6 +858,7 @@ def load_critic(path: str, arch: dict, blank: dict) -> dict:
     """
     z = np.load(path)
     got = _unflat("phi", {k: z[k] for k in z.files})
+    standalone = not got
     if not got:
         # A run's `.resume.npz` stores the critic under `phi__*`; `learn.valuetrain`
         # writes a STANDALONE one with bare keys via `train.save`. Both are
@@ -899,7 +900,28 @@ def load_critic(path: str, arch: dict, blank: dict) -> dict:
     for k, v in blank.items():
         if tuple(np.shape(got[k])) != tuple(np.shape(v)):
             raise SystemExit(f"critic {k} is {np.shape(got[k])}, expected {np.shape(v)}")
-    return {k: np.asarray(got[k], np.float32) for k in blank}
+    got = {k: np.asarray(got[k], np.float32) for k in blank}
+    if standalone:
+        # HALVE THE HEAD. `learn/valuetrain.py` fits the SAME `forward` under
+        # `logaddexp(0, l) - y*l`, so its output is a SIGMOID logit: P(win) is
+        # sigma(l). This trainer reads that function through `tanh(l)` against
+        # targets in {-1, 0, +1}. The correct conversion is
+        #     2*P - 1 = 2*sigma(l) - 1 = tanh(l / 2),
+        # so a pretrained critic arrives with logits exactly TWICE too large.
+        #
+        # It is not a small error. At P(win) = 0.84 (`tools/calibrate`'s reading
+        # on 2026-08-08) l is 1.658: the value should be 0.68 and `tanh(1.658)`
+        # is 0.93 -- saturated, where tanh' is ~0.14 and the critic can barely
+        # gradient its way back. This is the most likely mechanism behind
+        # 547da6e, "value24 does not transfer": 0.759 BCE on field positions
+        # buying NEGATIVE evar on self-play returns. The fit may have been fine
+        # and the scaling threw it away.
+        #
+        # Only the standalone path is rescaled. A run's own `.resume.npz` was
+        # trained through this same tanh and is already in these units.
+        got["v_w"] = got["v_w"] * 0.5
+        got["v_b"] = got["v_b"] * 0.5
+    return got
 
 
 # --------------------------------------------------------------------------
@@ -1029,11 +1051,24 @@ def selfcheck() -> None:
         # A STANDALONE critic too: `learn.valuetrain` writes bare keys via
         # `train.save`, and that file is the ladder-grounded value model the
         # whole `valuedata` pipeline exists to produce.
+        # ...and its HEAD IS HALVED on the way in, because `valuetrain` fits the
+        # same `forward` under `logaddexp(0, l) - y*l` -- a SIGMOID logit -- while
+        # this trainer reads it through `tanh(l)` against targets in {-1, 0, +1}.
+        # 2*sigma(l) - 1 == tanh(l/2), so an unscaled load arrives with logits
+        # twice too large: at P(win) 0.84 the value reads 0.93 instead of 0.68,
+        # saturated where tanh' is 0.14 and the critic cannot gradient back.
+        # That is the likely mechanism behind 547da6e, "value24 does not
+        # transfer" -- 0.759 BCE buying NEGATIVE evar. The trunk carries no units
+        # and is untouched.
         _b = Path(_d) / "value.npz"
         np.savez(_b, **{**_phi, **arch_record(_phi)})
         _bare = load_critic(str(_b), _arch, _phi)
         for _k in _phi:
-            assert np.array_equal(_bare[_k], _phi[_k]), f"bare critic {_k}"
+            _want = _phi[_k] * 0.5 if _k in ("v_w", "v_b") else _phi[_k]
+            assert np.allclose(_bare[_k], _want), f"bare critic {_k}"
+        # the identity the rescale rests on, so nobody "simplifies" it back
+        _l = np.array([-3.0, -0.5, 0.0, 1.658, 3.0])
+        assert np.allclose(2.0 / (1.0 + np.exp(-_l)) - 1.0, np.tanh(_l / 2.0))
         assert set(_got) == set(_phi)
         for _k in _phi:
             assert np.array_equal(_got[_k], _phi[_k]), _k
