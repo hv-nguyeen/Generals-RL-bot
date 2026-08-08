@@ -291,6 +291,11 @@ from learn.netoracle import (ADV_CLIP, ANCHOR_HI, ANCHOR_LO, BETA0, BETA_MAX,
                              _log_softmax, adam, clip_grads, gae, policy_keys,
                              policy_loss, publish, tally)
 from sim import engine, mapgen
+# ONE definition of what a counterfactual build IS -- which cell it lands on and
+# which stratum it belongs to -- shared with the probe that gates this run. If
+# the two drifted, `tools/cfprobe`'s verdict would describe a different
+# intervention from the one the trainer performs, and the gate would be theatre.
+from tools import cfprobe
 
 # (dmin, dmax, win rate needed to ENTER this stage). Ranges overlap on purpose:
 # a stage boundary is a shift of the distribution, not a cut. Stage 5 is
@@ -429,7 +434,8 @@ def numpy_forward(params, x: np.ndarray) -> np.ndarray:
     return np.stack(out)
 
 
-def _pack(buf: list, winner: int, turns: int, dist: int) -> list[dict] | None:
+def _pack(buf: list, winner: int, turns: int, dist: int,
+          cf: dict | None = None) -> list[dict] | None:
     """The two seats' trajectories, each with its OWN states and its OWN reward.
 
     Pure, and separate from `_rollout` for one reason: a rollout short enough to
@@ -442,6 +448,14 @@ def _pack(buf: list, winner: int, turns: int, dist: int) -> list[dict] | None:
     None -- for the WHOLE game, never one seat -- when a trajectory came out
     empty, so a half-recorded game cannot leave an unpaired trajectory in the
     buffer and break the zero-sum property the advantage scaling rests on.
+
+    A counterfactual payload rides as EXTRA KEYS on `out[0]`; the list is always
+    length 2. Returning the fork as a third element would pass the ingest block's
+    key check silently, land in `episodes`, be handed a GAE advantage and be
+    TRAINED ON as if it were on-policy -- breaking the zero-sum pairing this
+    function's None-return exists to protect, and inflating `bld`/`bldA`, the
+    very metric the experiment is read by. It would also trip `selfcheck`'s
+    `len(got) == 2`, which is the intended tripwire.
     """
     out = []
     for s in (0, 1):
@@ -453,6 +467,8 @@ def _pack(buf: list, winner: int, turns: int, dist: int) -> list[dict] | None:
                     "x": np.stack(xs), "idx": np.asarray(ids, dtype=np.int32),
                     "mask": np.packbits(np.stack(masks), axis=1),
                     "logp": np.asarray(lps, dtype=np.float32)})
+    if cf:
+        out[0].update(cf)
     return out
 
 
@@ -579,19 +595,102 @@ def promote(stage: int, wr: float, evar: float, over: int,
 _CTX: dict = {}
 
 
-def _init(live: str, specs: tuple, max_turns: int) -> None:
-    _CTX.update(live=live, specs=specs, max_turns=max_turns)
+def _init(live: str, specs: tuple, max_turns: int, cf_frac: float = 0.0) -> None:
+    _CTX.update(live=live, specs=specs, max_turns=max_turns, cf_frac=cf_frac)
 
 
 def _act(net: Net, obs, rng):
-    """(index, mask, log prob) from the masked softmax. `rng` None means argmax."""
+    """(index, mask, log prob, probs) from the masked softmax. `rng` None means
+    argmax.
+
+    `probs` is returned so a counterfactual fork can pick its build cell out of
+    the SAME forward the action came from. Calling `net.logits` a second time
+    would be both wasted work and a second chance for the two to disagree.
+    """
     mask = features.legal_mask(obs)        # PASS is always legal: never empty
     lg = np.where(mask, net.logits(obs), -np.inf)
     lg -= lg.max()
     p = np.exp(lg)
     p /= p.sum()
     idx = int(np.argmax(p)) if rng is None else int(rng.choice(len(p), p=p))
-    return idx, mask, float(np.log(p[idx]))
+    return idx, mask, float(np.log(p[idx])), p
+
+
+def _continue(st, net: Net, seat: int, turn0: int, max_turns: int, forced, rng):
+    """Play `st` to terminal from turn `turn0`.
+
+    Returns (z for `seat`, final state, `seat`'s encoded observation one step
+    after the fork). That third value is the successor state the critic term
+    trains on; taking it here rather than replaying the fork turn a third time
+    keeps one definition of "the board the forced build produced".
+
+    `forced` overrides `seat`'s action on turn `turn0` only, and it is applied
+    AFTER the sample rather than instead of it, so both branches of a fork
+    consume identical draws on the fork turn. That is the whole of what common
+    random numbers can buy here: from t+1 the branches occupy different states
+    and drift apart on their own.
+    """
+    x1 = None
+    for turn in range(turn0, max_turns + 1):
+        acts = [None, None]
+        for s in (0, 1):
+            idx, _, _, _ = _act(net, engine.observe(st, s), rng)
+            acts[s] = features.index_to_action(idx)
+            if turn == turn0 and s == seat and forced is not None:
+                acts[s] = forced
+        over = engine.step(st, acts[0], acts[1])
+        if turn == turn0:
+            x1 = features.encode(engine.observe(st, seat)).astype(np.float16)
+        if over:
+            break
+    return outcome(st.winner, seat), st, x1
+
+
+def _fork(seed: int, res: list, pick, net: Net, max_turns: int) -> dict | None:
+    """Run the counterfactual pair for one game and return its training payload.
+
+    `res` is the two per-stratum reservoirs filled during the parent game. A fair
+    coin picks between them when both are populated -- see `tools/cfprobe` for
+    why neither stratum alone is the right estimand.
+
+    The control is a RE-ROLLED continuation from the fork snapshot, not the
+    parent episode: both branches draw from one seed, so the pair is coupled at
+    the fork instead of being two independent games that happen to share a
+    prefix. The parent episode is untouched and enters PPO exactly as before.
+    """
+    have = [k for k in (0, 1) if res[k] is not None]
+    if not have:
+        return None
+    k = have[0] if len(have) == 1 else int(pick.random() < 0.5)
+    snap, x_fork, mask_fork, turn0, seat, r, c = res[k]
+
+    forced = (rules.BUILD, r, c, 0, 0)
+    # `x1` is the board the forced build produced, seen by the seat that paid for
+    # it. It is the ONLY state the critic term trains on, and the one the critic
+    # has essentially never seen -- at bld 0.2/game post-build states are ~0.1%
+    # of the buffer. Keeping it to s' rather than the whole forced branch is
+    # deliberate: five runs have died of a critic whose evar collapsed, and
+    # off-distribution states are the direct way to cause that.
+    zb, stb, x1 = _continue(snap.copy(), net, seat, turn0, max_turns, forced,
+                            np.random.default_rng([seed, turn0]))
+    zc, _, _ = _continue(snap.copy(), net, seat, turn0, max_turns, None,
+                         np.random.default_rng([seed, turn0]))
+    return {
+        "cf_x_fork": x_fork,
+        "cf_x": x1,
+        "cf_mask": np.packbits(mask_fork[None], axis=1),
+        "cf_idx": np.int32(((r * features.PAD + c) * features.PER_CELL)
+                           + features.BUILD_OFFSET),
+        # Halved to [-1, +1] so a weight of 0.05 means what it says next to a
+        # log_pi of order 1. NOT centred: mean-centring would push half of all
+        # builds up even where builds are uniformly bad, which is exactly the
+        # property `tools/cfprobe` exists to gate.
+        "cf_delta": np.float32((zb - zc) / 2.0),
+        "cf_z": np.float32(zb),
+        "cf_stratum": np.int8(k),
+        "cf_turn": np.int32(turn0),
+        "cf_captured": np.int8(bool(stb.own[1 - seat][r, c])),
+    }
 
 
 def _rollout(job):
@@ -615,7 +714,7 @@ def _rollout(job):
         foe = agents.make(_CTX["specs"][mode - 1], 1 - seat, *grid.shape, seed)
         faults, turns = 0, 0
         for turns in range(1, max_turns + 1):
-            idx, _, _ = _act(net, engine.observe(st, seat), None)
+            idx, _, _, _ = _act(net, engine.observe(st, seat), None)
             acts = [None, None]
             acts[seat] = features.index_to_action(idx)
             try:
@@ -639,14 +738,25 @@ def _rollout(job):
     # whole game exactly.
     rng = np.random.default_rng(seed)
     buf = [([], [], [], []) for _ in range(2)]
+    # Whether this board is forked is a function of its SEED, not of a draw from
+    # `rng`: the parent game then plays identically at any --cf-frac, so a
+    # treatment and a control arm on the same seed differ in the aux weight and
+    # in nothing else. `pick` is a third stream for the same reason -- reservoir
+    # coin flips must not shift the game's own action sampling.
+    do_cf = (_CTX.get("cf_frac", 0.0) > 0.0
+             and np.random.default_rng([seed, 7]).random() < _CTX["cf_frac"])
+    pick = np.random.default_rng([seed, 1])
+    seen, res = [0, 0], [None, None]
     turns = 0
     for turns in range(1, max_turns + 1):
         acts = [None, None]
+        snap = None
         for s in (0, 1):
             obs = engine.observe(st, s)
-            idx, mask, lp = _act(net, obs, rng)
+            idx, mask, lp, probs = _act(net, obs, rng)
             xs, ids, masks, lps = buf[s]
-            xs.append(features.encode(obs).astype(np.float16))
+            enc = features.encode(obs).astype(np.float16)
+            xs.append(enc)
             ids.append(idx)
             masks.append(mask)
             lps.append(lp)
@@ -655,11 +765,31 @@ def _rollout(job):
             # and looks like slow noise; selfcheck pins both the sign (via
             # `outcome`) and the buffer-to-seat filing (via frame 0).
             acts[s] = features.index_to_action(idx)
+            if do_cf:
+                cells = cfprobe.build_cells(mask, obs.H, obs.W)
+                if len(cells):
+                    # One snapshot per turn, shared by both seats: `engine.step`
+                    # has not run yet, so seat 1 sees the board seat 0 saw.
+                    if snap is None:
+                        snap = st.copy()
+                    flat = ((cells[:, 0] * features.PAD + cells[:, 1])
+                            * features.PER_CELL + features.BUILD_OFFSET)
+                    r, c = (int(v) for v in cells[int(np.argmax(probs[flat]))])
+                    mine = obs.owner_grid == rules.OWNER_ME
+                    structs = mine & ((obs.type_grid == rules.T_GENERAL)
+                                      | (obs.type_grid == rules.T_CASTLE))
+                    cost = int(rules.build_cost_grid(structs)[r, c])
+                    k = 0 if cfprobe.stratum_a(obs, r, c, turns, max_turns,
+                                               cost) else 1
+                    seen[k] += 1
+                    if pick.random() < 1.0 / seen[k]:
+                        res[k] = (snap, enc, mask, turns, s, r, c)
         if engine.step(st, acts[0], acts[1]):
             break
 
+    cf = _fork(seed, res, pick, net, max_turns) if do_cf else None
     # Turn limit and mutual capture (engine.step sets winner -1) are both draws.
-    return _pack(buf, st.winner, turns, dist)
+    return _pack(buf, st.winner, turns, dist, cf)
 
 
 # --------------------------------------------------------------------------
@@ -994,7 +1124,7 @@ def selfcheck() -> None:
         ar[0, 0] = 9
         obs = Obs(H=18, W=18, turn=1, my_land=1, my_army=9, opp_land=1, opp_army=1,
                   type_grid=ty, owner_grid=ow, army_grid=ar)
-        i, lm, logp = _act(net, obs, None)
+        i, lm, logp, _ = _act(net, obs, None)
         # from (0,0) with 9 army: down and right, whole or split, plus pass.
         # No build: a general is not a legal build site and 9 < 35 anyway.
         assert lm[features.PASS_INDEX] and lm.sum() == 5, lm.sum()
@@ -1055,6 +1185,52 @@ def selfcheck() -> None:
         for r in got:
             want = features.encode(engine.observe(fresh, r["seat"])).astype(np.float16)
             assert np.array_equal(r["x"][0], want), r["seat"]
+
+        # --- counterfactual forks. Three properties, all of which fail SILENTLY
+        #     in a way the run cannot show you.
+        #
+        #     1. cf_frac 0 must change nothing. The control arm and every run
+        #        that predates this feature depend on it.
+        base = _rollout((seed, 2, 6, 0, 0))
+        assert [set(r) for r in base] == [set(r) for r in got]
+        for a, b in zip(base, got):
+            assert np.array_equal(a["x"], b["x"]) and np.array_equal(a["idx"], b["idx"])
+
+        #     2. The payload rides on out[0] and the list stays length 2. A third
+        #        element would be trained on as if it were on-policy.
+        cf = {"cf_idx": np.int32(5), "cf_delta": np.float32(0.5),
+              "cf_z": np.float32(1.0), "cf_stratum": np.int8(0),
+              "cf_turn": np.int32(9), "cf_captured": np.int8(0),
+              "cf_x": np.zeros((features.C, features.PAD, features.PAD), np.float16),
+              "cf_x_fork": np.zeros((features.C, features.PAD, features.PAD), np.float16),
+              "cf_mask": np.packbits(np.zeros((1, features.N_ACTIONS), bool), axis=1)}
+        stub = [([np.zeros(1)], [0], [np.zeros(features.N_ACTIONS, bool)], [0.0])
+                for _ in range(2)]
+        packed2 = _pack(stub, 0, 3, 4, cf)
+        assert len(packed2) == 2, len(packed2)
+        assert "cf_idx" in packed2[0] and "cf_idx" not in packed2[1]
+        assert [r["seat"] for r in packed2] == [0, 1]
+        # the harvest predicate the trainer uses, and the seat-0 game count it
+        # must NOT disturb
+        assert len([r for r in packed2 if "cf_idx" in r]) == 1
+        assert len([r for r in packed2 if r["seat"] == 0]) == 1
+
+        #     3. A forked game plays the SAME parent game as an unforked one.
+        #        The fork must be a read of the policy, not a perturbation of the
+        #        data PPO trains on -- otherwise treatment and control differ in
+        #        their trajectories too and the pairing is worthless. `do_cf` is
+        #        keyed on the seed and the reservoir draws from its own stream
+        #        precisely so this holds.
+        _init(str(path), (), 3, 1.0)
+        forked = _rollout((seed, 2, 6, 0, 0))
+        assert forked is not None and len(forked) == 2
+        for a, b in zip(forked, base):
+            assert np.array_equal(a["x"], b["x"]), "forking moved the parent game"
+            assert np.array_equal(a["idx"], b["idx"])
+            assert a["z"] == b["z"] and a["turns"] == b["turns"]
+        # A 3-turn stub can never afford 35 army, so there is no fork to take and
+        # the payload must be ABSENT rather than empty or zero-filled.
+        assert "cf_idx" not in forked[0], "a 3-turn game cannot afford a castle"
         _CTX.clear()
 
         # --- resume round-trips: arrays exact, scalars exact, RNG stream intact
@@ -1259,6 +1435,36 @@ def main() -> None:
                          "checkpoint that ever beat the champion (+35.7), and "
                          "stage 5, which IS this distribution, measured about "
                          "-18. No-op at the final stage, which has no beyond")
+    # ---- counterfactual build supervision ---------------------------------
+    # See docs/design-counterfactual-build.md. Gated by `tools/cfprobe`: the
+    # preference term multiplies an UNCENTRED delta, so if E[delta] <= 0 it
+    # pushes the build probability DOWN and the whole thing is a sign flip.
+    # Run the probe before setting these to anything but zero.
+    ap.add_argument("--cf-frac", type=float, default=0.0, metavar="F",
+                    help="share of training games that also run a counterfactual "
+                         "build fork: one legal build opportunity is sampled, the "
+                         "build is FORCED in one branch and not in the other, and "
+                         "both are played to terminal under common random "
+                         "numbers. Data only -- forks never enter the PPO buffer. "
+                         "0 disables the whole mechanism. Requires --backend cpu")
+    ap.add_argument("--cf-pref-weight", type=float, default=0.0, metavar="W",
+                    help="weight on -mean(delta * log_pi(build|s_fork)). Set 0 "
+                         "with a nonzero --cf-frac for the CONTROL arm: forks are "
+                         "still generated and logged, so the arm measures delta "
+                         "on a policy the term never touched")
+    ap.add_argument("--cf-value-weight", type=float, default=0.0, metavar="W",
+                    help="weight on the successor-value term, MSE of the critic "
+                         "against the forced branch's outcome at s' only. Drop it "
+                         "to 0 if `tools/vprobe` says this critic already prices "
+                         "a castle -- that term's premise is that it does not")
+    ap.add_argument("--cf-iters", type=int, default=200, metavar="N",
+                    help="both weights decay linearly to zero over N iterations, "
+                         "after which the run is pure PPO. The term exists to "
+                         "break the policy out of a mode, not to stay forever")
+    ap.add_argument("--cf-buffer", type=int, default=4096, metavar="ROWS")
+    ap.add_argument("--cf-minibatch", type=int, default=256, metavar="ROWS",
+                    help="forks resampled WITH REPLACEMENT per gradient step. "
+                         "Fixed size so XLA does not retrace on a ragged tail")
     ap.add_argument("--max-turns", type=int, default=rules.TURN_LIMIT)
     ap.add_argument("--probe", type=int, default=0, metavar="ITERS",
                     help="CHEAP HYPOTHESIS TEST, run this before the night. Pins "
@@ -1326,6 +1532,39 @@ def main() -> None:
         # reading the mixed pool, so the flag would be silently ignored there.
         raise SystemExit("--dist-tail needs --backend gpu or scan; the cpu path "
                          "generates boards per job and never reads the pool")
+    if not 0.0 <= args.cf_frac <= 1.0:
+        raise SystemExit(f"--cf-frac {args.cf_frac} must be in [0, 1]")
+    if args.cf_frac and args.backend != "cpu":
+        # THE failure this check exists for. Forks are generated in `_rollout`
+        # mode 0, which is the `else` arm of the backend dispatch below; under
+        # gpu/scan the training rollout is `vecroll` and that branch never runs.
+        # The aux buffer would stay empty, both weights would multiply nothing,
+        # and a treatment arm would be byte-identical to its control -- three
+        # weeks producing two copies of the same answer with nothing in the log
+        # saying why. docs/CLUSTER.md's launch line says --backend gpu, so this
+        # is the default mistake, not an exotic one.
+        raise SystemExit("--cf-frac needs --backend cpu: forks are generated in "
+                         "_rollout, which only runs training games on the cpu "
+                         "path. Under gpu/scan the fork buffer stays EMPTY and "
+                         "the treatment arm silently becomes its own control.")
+    if (args.cf_pref_weight or args.cf_value_weight) and not args.cf_frac:
+        raise SystemExit("--cf-pref-weight/--cf-value-weight do nothing without "
+                         "--cf-frac; no forks would be generated to weight.")
+    if args.cf_value_weight and args.value_head != "scalar":
+        # The term is written as MSE against tanh(V), matching `v_step`. Under
+        # hlgauss there is no tanh -- `values_of_hl` is a mean-of-categorical
+        # over `hl_kappa` -- so the same expression would train the critic
+        # against a quantity it does not emit.
+        raise SystemExit(f"--cf-value-weight needs --value-head scalar, not "
+                         f"{args.value_head}: the successor term is MSE against "
+                         f"tanh(V) and the hlgauss head has no tanh.")
+    if args.cf_frac and args.stage_replay:
+        # Stage 3 `bldA` is -0.9 to -3.0 and the design agrees builds are wrong
+        # there, so replayed boards would pool a known-negative stratum into the
+        # measurement. `cf_stage` is asserted below for the same reason.
+        print(f"WARNING: --cf-frac with --stage-replay {args.stage_replay} mixes "
+              f"forks from earlier stages, where builds are correctly negative "
+              f"(stage 3 bldA -0.9 to -3.0). Use --stage-replay 0.", flush=True)
     # Fail here, not on the first rollout: a partial last chunk would step past
     # the turn limit, and the turn limit IS the draw rule.
     if args.backend == "scan" and (args.scan_chunk < 1
@@ -1463,9 +1702,22 @@ def main() -> None:
     opt_p = {k: (jnp.zeros_like(v), jnp.zeros_like(v)) for k, v in theta.items()}
     opt_v = {k: (jnp.zeros_like(v), jnp.zeros_like(v)) for k, v in phi.items()}
 
-    def p_objective(p, beta, x, mask, idx, old_logp, ref_logp, adv):
-        return policy_loss(bc.forward(p, x), mask, idx, old_logp, ref_logp, adv,
-                           beta, xp=jnp)
+    def p_objective(p, beta, x, mask, idx, old_logp, ref_logp, adv,
+                    cf_x, cf_mask, cf_idx, cf_delta, cf_w):
+        loss, aux = policy_loss(bc.forward(p, x), mask, idx, old_logp, ref_logp,
+                                adv, beta, xp=jnp)
+        # The counterfactual preference term. It is a SHAPING term, not an
+        # estimator: the build was forced rather than sampled, so this is
+        # off-policy and biased, and the unbiased correction would divide by
+        # pi(build|s) -- which is ~0.003 and is the entire problem. It survives
+        # only by being small, which is why the weight is 0.05 and decays out.
+        #
+        # delta is uncentred by design, so the SIGN of E[delta] is the sign of
+        # this gradient. `tools/cfprobe` measures that before the run and is a
+        # hard gate: at E[delta] <= 0 this term pushes builds DOWN.
+        lp = _log_softmax(jnp.where(cf_mask, bc.forward(p, cf_x), -1e9), jnp)
+        pref = -jnp.mean(cf_delta * lp[jnp.arange(cf_idx.shape[0]), cf_idx])
+        return loss + cf_w * pref, aux
 
     @jax.jit
     def p_step(p, opt, t, beta, lr, batch):
@@ -1475,9 +1727,16 @@ def main() -> None:
         return p, opt, loss, aux, norm
 
     @jax.jit
-    def v_step(q, opt, t, x, ret):
-        loss, g = jax.value_and_grad(
-            lambda qq: jnp.mean((jnp.tanh(vt.forward(qq, x)) - ret) ** 2))(q)
+    def v_step(q, opt, t, x, ret, cf_x, cf_z, cf_w):
+        def lo(qq):
+            main = jnp.mean((jnp.tanh(vt.forward(qq, x)) - ret) ** 2)
+            # s' ONLY -- the single state the forced build produced, against that
+            # branch's own outcome. The control successor is already in `x`: it
+            # is the next state of a real episode with a real return, so the only
+            # genuinely new data here is the post-build board.
+            succ = jnp.mean((jnp.tanh(vt.forward(qq, cf_x)) - cf_z) ** 2)
+            return main + cf_w * succ
+        loss, g = jax.value_and_grad(lo)(q)
         g, _ = clip_grads(g, 1.0)
         q, opt = adam(q, opt, g, t, args.critic_lr)
         return q, opt, loss
@@ -1505,7 +1764,13 @@ def main() -> None:
         hl_c, hl_t = jnp.asarray(hl_c), jnp.asarray(hl_t)
 
     @jax.jit
-    def v_step_hl(q, opt, t, x, ret):
+    def v_step_hl(q, opt, t, x, ret, cf_x, cf_z, cf_w):
+        # cf_* are accepted and IGNORED: this head has no tanh, so the successor
+        # term's expression does not apply to it. Argument parsing refuses
+        # --cf-value-weight unless --value-head is scalar, so a nonzero weight
+        # cannot reach here silently; taking the arguments keeps ONE call site
+        # in the training loop rather than a branch that could drift.
+        del cf_x, cf_z, cf_w
         # rint, not astype: astype TRUNCATES, so a return of -1e-8 would be
         # labelled a LOSS with nothing crashing and nothing printing.
         tgt = hl_t[jnp.rint(ret + 1.0).astype(jnp.int32)]
@@ -1630,7 +1895,18 @@ def main() -> None:
 
     pool = ProcessPoolExecutor(
         max_workers=args.workers, mp_context=mp.get_context("spawn"),
-        initializer=_init, initargs=(str(live), tuple(specs), args.max_turns))
+        initializer=_init,
+        initargs=(str(live), tuple(specs), args.max_turns, args.cf_frac))
+
+    # The counterfactual ring. Fork rows accumulate across iterations and each
+    # gradient step resamples a fixed minibatch WITH REPLACEMENT from whatever is
+    # in it. Training only on the ~64 forks an iteration produced is the failure
+    # `tools/buildprior` records: 3,711 frames at 320 exposures each into a small
+    # net memorised them and moved p(build) not at all. By iteration 200 this arm
+    # has drawn from ~12,800 distinct forks instead.
+    cf_ring: dict[str, np.ndarray] = {}
+    cf_n, cf_seen = 0, 0          # rows currently valid, rows ever written
+    cf_last: list[dict] = []      # this iteration's forks, for the log line
 
     def play(jobs, weights):
         """Publish, then dispatch. Every sample comes from exactly one snapshot,
@@ -1751,6 +2027,53 @@ def main() -> None:
         if not results:
             print(f"iter {it:5d}  no usable games", flush=True)
             continue
+
+        # Harvest the forks BEFORE the ingest block pops `x` and `mask`. A fork
+        # rides as extra keys on a seat-0 trajectory (see `_pack`), so the test
+        # is a key, not a seat or a list position.
+        cf_last = [r for r in results if "cf_idx" in r]
+        if args.cf_frac:
+            # The A0 abort. An empty harvest means fork generation is not
+            # running -- the backend check should have caught it, but this is the
+            # one that fires on the first iteration rather than after a night of
+            # a treatment arm quietly being its own control.
+            if not cf_last:
+                raise SystemExit(
+                    f"--cf-frac {args.cf_frac} produced NO forks at iteration "
+                    f"{it}. The aux terms would multiply an empty batch and the "
+                    f"arm would be its own control. Check --backend cpu.")
+            for r in cf_last:
+                if not cf_ring:
+                    cf_ring = {
+                        "x": np.empty((args.cf_buffer, features.C, features.PAD,
+                                       features.PAD), np.float16),
+                        "x_fork": np.empty((args.cf_buffer, features.C,
+                                            features.PAD, features.PAD), np.float16),
+                        "mask": np.empty((args.cf_buffer,
+                                          r["cf_mask"].shape[1]), np.uint8),
+                        "idx": np.empty(args.cf_buffer, np.int32),
+                        "delta": np.empty(args.cf_buffer, np.float32),
+                        "z": np.empty(args.cf_buffer, np.float32),
+                    }
+                j = cf_seen % args.cf_buffer
+                cf_ring["x"][j] = r["cf_x"]
+                cf_ring["x_fork"][j] = r["cf_x_fork"]
+                cf_ring["mask"][j] = r["cf_mask"][0]
+                cf_ring["idx"][j] = r["cf_idx"]
+                cf_ring["delta"][j] = r["cf_delta"]
+                cf_ring["z"][j] = r["cf_z"]
+                cf_seen += 1
+            cf_n = min(cf_seen, args.cf_buffer)
+        # Linear decay to zero over --cf-iters. Past it the run is pure PPO, and
+        # every later iteration is directly comparable with a run that never had
+        # the term at all.
+        cf_ramp = max(0.0, 1.0 - it / args.cf_iters) if args.cf_iters else 0.0
+        # jnp scalars, not Python floats: a float is a STATIC argument to a jitted
+        # step, and this one changes every iteration, so it would recompile both
+        # kernels 200 times. `beta` and `lr` get away with it because they only
+        # ever take a handful of distinct values.
+        cf_pw = jnp.float32(args.cf_pref_weight * cf_ramp)
+        cf_vw = jnp.float32(args.cf_value_weight * cf_ramp)
 
         # Preallocate and pop, do NOT concatenate: `x` is 10.6 kB a sample and a
         # concatenate holds the sources and the destination at once. At stage 5
@@ -1917,10 +2240,28 @@ def main() -> None:
                 sel = order[s:s + mb]
                 xb = to_x(xs[sel])
                 nb += 1
+                # ONE call shape whether or not the mechanism is on: with no ring
+                # the aux batch is a single row of the main batch at weight 0.0,
+                # which costs one extra row's forward and removes a second code
+                # path that could drift away from the one under test.
+                if cf_n:
+                    # WITH REPLACEMENT and always --cf-minibatch wide: a batch
+                    # that grew with the ring would retrace XLA on every
+                    # iteration until the ring filled.
+                    csel = rng.integers(0, cf_n, size=args.cf_minibatch)
+                    cf_b = (to_x(cf_ring["x_fork"][csel]),
+                            to_mask(cf_ring["mask"][csel]),
+                            jnp.asarray(cf_ring["idx"][csel]),
+                            jnp.asarray(cf_ring["delta"][csel]))
+                    cf_vb = (to_x(cf_ring["x"][csel]), jnp.asarray(cf_ring["z"][csel]))
+                else:
+                    cf_b = (xb[:1], to_mask(packed[sel[:1]]),
+                            jnp.asarray(idxs[sel[:1]]), jnp.zeros(1, jnp.float32))
+                    cf_vb = (xb[:1], jnp.zeros(1, jnp.float32))
                 if do_policy:
                     batch = (xb, to_mask(packed[sel]), jnp.asarray(idxs[sel]),
                              jnp.asarray(old_logp[sel]), jnp.asarray(ref_logp[sel]),
-                             jnp.asarray(adv[sel]))
+                             jnp.asarray(adv[sel]), *cf_b, cf_pw)
                     t_p += 1
                     theta, opt_p, _, aux, norm = p_step(theta, opt_p, t_p, beta,
                                                         args.lr * lr_scale, batch)
@@ -1931,7 +2272,8 @@ def main() -> None:
                     kl_u, kl_last, kl_a, ent, pg, gn = (
                         kl_sum / nb, ku, ka, en, pgv, float(norm))
                 t_v += 1
-                phi, opt_v, vl = v_step(phi, opt_v, t_v, xb, jnp.asarray(ret[sel]))
+                phi, opt_v, vl = v_step(phi, opt_v, t_v, xb, jnp.asarray(ret[sel]),
+                                        *cf_vb, cf_vw)
                 vloss = float(vl)
                 # Tested on the CURRENT minibatch, not the running mean: each
                 # minibatch moves theta further from the fixed theta_old, so the
@@ -1998,6 +2340,24 @@ def main() -> None:
         # FROZEN_KILL, and the line has to say which one you are looking at.
         tag = (f"  [critic warmup {low}/{args.frozen_kill or 'off'}]"
                if not do_policy else "")
+        # The A3 abort, on the line rather than in a notebook. `cfA` is the
+        # stratum-A mean of the SAME uncentred delta the preference term
+        # multiplies, so its sign is the sign of that gradient: `tools/cfprobe`
+        # measures it on frozen weights before the run, and this is the same
+        # number under training. Strata are never pooled -- B is every other
+        # build-legal moment and is expected to be negative.
+        cfs = ""
+        if args.cf_frac and cf_last:
+            da = [float(r["cf_delta"]) for r in cf_last if int(r["cf_stratum"]) == 0]
+            db = [float(r["cf_delta"]) for r in cf_last if int(r["cf_stratum"]) == 1]
+            cfs = (f"\n            cf {len(cf_last):3d} fork  ring {cf_n:5d}  "
+                   f"cfA {np.mean(da):+.3f}/{len(da):3d}  "
+                   f"cfB {np.mean(db):+.3f}/{len(db):3d}  "
+                   f"w {float(cf_pw):.4f}/{float(cf_vw):.4f}  "
+                   f"capt {np.mean([int(r['cf_captured']) for r in cf_last]):.2f}"
+                   if da and db else
+                   f"\n            cf {len(cf_last):3d} fork  ring {cf_n:5d}  "
+                   f"one stratum only (A {len(da)} B {len(db)})")
         print(f"iter {it:5d}  stage {stage} ({dmin}{hi})  games {len(g0)}  "
               f"W/D/L {w}/{d}/{len(g0) - w - d}  samp {n // 1000:3d}k  "
               f"turns {turns:.0f}  dist {dist:.1f}  bld {builds / len(g0):.2f}"
@@ -2017,7 +2377,8 @@ def main() -> None:
               f"{time.time() - t0:.1f}s (roll {t_roll - t0:.1f}"
               f"{d2h} "
               f"pack {t_pack - t_roll:.1f} ing {t_ing - t_pack:.1f} "
-              f"trn {time.time() - t_ing:.1f})", flush=True)
+              f"trn {time.time() - t_ing:.1f})"
+              f"{cfs}", flush=True)
 
         if kill2:
             print(f"\n  KILL 2: evar under {args.warm_evar} for {low} consecutive "
