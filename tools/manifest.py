@@ -20,8 +20,17 @@ from pathlib import Path
 from bot.config import Config
 
 MANIFEST_SCHEMA_VERSION = 1
-SOURCE_SUFFIXES = {".py", ".json", ".toml", ".md"}
-SOURCE_DIRS = ("bot", "sim", "arena", "analysis", "learn", "tools", "configs")
+SOURCE_SUFFIXES = {
+    ".py", ".json", ".toml", ".md", ".sh", ".yaml", ".yml",
+    ".c", ".h", ".cc", ".cpp", ".hpp", ".rs", ".lock",
+}
+SOURCE_DIRS = (
+    "bot", "sim", "arena", "analysis", "learn", "tools", "configs",
+    # Training imports the vendored official engine directly; evaluation files
+    # and executable scripts determine promotion/release outcomes just as surely
+    # as Python source does.
+    "third_party", "evaluation", "scripts",
+)
 
 
 def sha256(path: str | Path) -> str:

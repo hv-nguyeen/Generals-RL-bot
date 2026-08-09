@@ -10,8 +10,10 @@ encoding and the process lifecycle.
 
 from __future__ import annotations
 
+import select
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -34,22 +36,52 @@ class StdioAgent:
         path = Path(run_sh).resolve()
         self.proc = subprocess.Popen(
             ["bash", str(path)],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1, cwd=str(path.parent),
         )
+        self.stderr_lines: list[str] = []
         self.proc.stdin.write(f"{player_id} {h} {w}\n")
         self.proc.stdin.flush()
 
     def act(self, obs: Obs, deadline=None):
         self.proc.stdin.write(encode_obs(obs))
         self.proc.stdin.flush()
-        line = self.proc.stdout.readline()
+        deadline = deadline if deadline is not None else time.perf_counter() + 10.0
+        line = None
+        fatal = None
+        # readline() ignored the arena deadline and could hang a worker forever.
+        # Wait on stdout while draining stderr so a traceback/fallback cannot be
+        # hidden behind valid PASS actions or fill the child's pipe.
+        while line is None:
+            remaining = max(0.0, deadline - time.perf_counter())
+            if remaining == 0.0:
+                self.proc.kill()
+                raise TimeoutError("stdio agent missed its move deadline")
+            ready, _, _ = select.select(
+                [self.proc.stdout, self.proc.stderr], [], [], remaining)
+            if not ready:
+                self.proc.kill()
+                raise TimeoutError("stdio agent missed its move deadline")
+            if self.proc.stderr in ready:
+                err = self.proc.stderr.readline()
+                if err:
+                    self.stderr_lines.append(err.rstrip())
+                    print(err, end="", file=sys.stderr)
+                    if "Traceback" in err or "FALLING BACK" in err:
+                        fatal = err.rstrip()
+            if self.proc.stdout in ready:
+                line = self.proc.stdout.readline()
         if not line:
             raise RuntimeError("agent closed stdout")
+        if fatal:
+            raise RuntimeError(f"packaged agent reported: {fatal}")
         parts = line.split()
         if len(parts) != 5:
-            return rules.PASS_ACTION
-        return tuple(int(x) for x in parts)
+            raise RuntimeError(f"agent returned {len(parts)} fields, expected 5")
+        try:
+            return tuple(int(x) for x in parts)
+        except ValueError as e:
+            raise RuntimeError(f"agent returned non-integer action: {line.rstrip()}") from e
 
     def close(self) -> None:
         try:
@@ -61,3 +93,8 @@ class StdioAgent:
         except subprocess.TimeoutExpired:
             self.proc.kill()
             self.proc.wait()
+        if self.proc.stderr is not None:
+            rest = self.proc.stderr.read()
+            if rest:
+                self.stderr_lines.extend(rest.splitlines())
+                print(rest, end="", file=sys.stderr)

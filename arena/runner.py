@@ -295,9 +295,12 @@ def main() -> None:
                          "across stage 3 (11-17) and 0.5 four iterations into "
                          "stage 4 (17-24), and nothing could locate the knee")
     ap.add_argument("--dmax", type=int, default=None)
-    ap.add_argument("--elo1", type=float, default=12.0, help="SPRT alternative hypothesis")
+    ap.add_argument("--elo1", type=float, default=12.0,
+                    help="Elo margin for the paired fixed-sample improvement test")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
+    if args.games < 2 or args.games % 2:
+        raise SystemExit("--games must be an even number >= 2 for paired-board inference")
 
     t0 = time.time()
 
@@ -312,13 +315,13 @@ def main() -> None:
         print()
 
     w, d, loss = tally(results)
-    summary = rating.summary(w, d, loss)
-    test = rating.sprt(w, d, loss, 0.0, args.elo1)
+    summary = rating.paired_summary(results)
+    test = rating.paired_test(results, 0.0, args.elo1)
 
     print(f"{args.a}  vs  {args.b}")
     print(f"  {w}W {d}D {loss}L  score {summary['score']:.3f}")
     print(f"  elo  {summary['elo']:+.1f}  [{summary['elo_lo']:+.1f}, {summary['elo_hi']:+.1f}]")
-    print(f"  sprt llr {test['llr']:+.2f}  bounds [{test['lower']:.2f}, {test['upper']:.2f}]"
+    print(f"  paired 95% test over {test['boards']} boards, H1 {args.elo1:+.1f} Elo"
           f"  -> {test['verdict']}")
     slow = max(max(r["max_ms"]) for r in results)
     mean = float(np.mean([r["mean_ms"][r["a_seat"]] for r in results]))
@@ -372,7 +375,8 @@ def main() -> None:
             for r in results:
                 f.write(json.dumps(r) + "\n")
         (out / "summary.json").write_text(json.dumps(
-            {"a": args.a, "b": args.b, **summary, "sprt": test}, indent=2) + "\n")
+            {"schema_version": 2, "a": args.a, "b": args.b, **summary,
+             "paired_test": test}, indent=2) + "\n")
         print(f"  wrote {out}/results.jsonl")
 
 

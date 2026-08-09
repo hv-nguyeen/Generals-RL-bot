@@ -89,9 +89,13 @@ class TemporalMemory:
         self.opp_army_delta[changed & opp] = (
             a[changed & opp] - old_army[changed & opp])
 
+        # A structure token appearing after the first frame cannot be an
+        # initial mountain.  It is an enemy castle whether or not this seat has
+        # previously seen the cell/owner: a castle may be built wholly in fog.
+        # Requiring stale opponent ownership here made exactly that case
+        # invisible to the temporal encoder.
         self.enemy_castles |= ((t == rules.T_STRUCTURE_IN_FOG)
-                               & ~self.known_mountains
-                               & (self.mem_owner == rules.OWNER_OPP))
+                               & ~self.known_mountains)
         self.enemy_castles |= (t == rules.T_CASTLE) & opp
         self.enemy_castles &= ~((t == rules.T_CASTLE) & ~opp)
 

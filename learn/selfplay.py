@@ -290,8 +290,9 @@ from bot.policy.net import Net, arch_of, arch_record
 from learn.league import stderr
 from learn.netoracle import (ADV_CLIP, ANCHOR_HI, ANCHOR_LO, BETA0, BETA_MAX,
                              BETA_MIN, CHUNK, KL_STOP, MAX_REWINDS, WARMUP,
-                             _log_softmax, adam, clip_grads, gae, policy_keys,
-                             policy_loss, publish, tally)
+                             _log_softmax, adam, clip_grads, critic_ready, gae,
+                             policy_keys, policy_loss, publish, readiness_step,
+                             restore_actor_critic, tally)
 from sim import engine, mapgen
 # ONE definition of what a counterfactual build IS -- which cell it lands on and
 # which stratum it belongs to -- shared with the probe that gates this run. If
@@ -2076,7 +2077,8 @@ def main() -> None:
         and impossible to notice: keeping them re-applies the very step that
         caused the collapse.
         """
-        nonlocal rewinds, theta, opt_p, lr_scale, beta
+        nonlocal rewinds, theta, phi, opt_p, opt_v, t_p, t_v
+        nonlocal warmed, low, lr_scale, beta
         rewinds += 1
         print(f"  COLLAPSE {why}; rewinding to iter {best_iter}, halving lr "
               f"(rewind {rewinds}/{MAX_REWINDS})", flush=True)
@@ -2084,9 +2086,12 @@ def main() -> None:
             print("  giving up: the schedule is wrong, not unlucky. "
                   "Lower --lr or raise --warm-evar.", flush=True)
             return True
-        theta = {k: jnp.asarray(v) for k, v in best_theta.items()}
-        opt_p = {k: (jnp.zeros_like(v), jnp.zeros_like(v))
-                 for k, v in theta.items()}
+        theta, phi, opt_p, opt_v, t_p, t_v = restore_actor_critic(
+            best_theta, best_phi, jnp)
+        # The selected policy and critic are a matched snapshot. Resetting the
+        # value optimiser avoids replaying moments learned on the abandoned
+        # actor distribution; readiness is then re-established on fresh games.
+        warmed, low = False, 0
         lr_scale *= 0.5
         beta = min(beta * 2.0, BETA_MAX)
         return False
@@ -2302,11 +2307,10 @@ def main() -> None:
         # gate is STANDING, not a latch: in self-play the critic chases the
         # outcome of a game between two policies that are both moving, so evar
         # can be healthy and then decay, and a permanent latch would not notice.
-        low = 0 if evar >= args.warm_evar else low + 1
-        if not warmed:
-            warmed = it >= WARMUP and evar >= args.warm_evar
-        elif low >= REFREEZE_AFTER:
-            warmed, low = False, 0
+        ready = critic_ready(it, evar, args.warm_evar)
+        warmed, low, refroze = readiness_step(
+            warmed, low, ready, REFREEZE_AFTER)
+        if refroze:
             print(f"  RE-FREEZE evar under {args.warm_evar} for {REFREEZE_AFTER} "
                   f"iterations; policy frozen until the critic recovers", flush=True)
         do_policy = warmed
@@ -2619,6 +2623,10 @@ def main() -> None:
 
             if new_stage != stage:
                 stage, resident, comp_low = new_stage, 0, 0
+                # A stage transition changes the board/episode distribution.
+                # Do not spend up to REFREEZE_AFTER actor updates before the
+                # standing gate notices that the old-stage critic is stale.
+                warmed, low = False, 0
                 # The gate re-anchors to HERE: the question at every stage is
                 # "did it improve on the weights it entered this stage with",
                 # which reads 0.500 on entry by construction and is invariant to

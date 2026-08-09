@@ -245,7 +245,9 @@ def legal_mask(obs: Obs) -> np.ndarray:
                 continue
             base = ((r * PAD + c) * PER_CELL) + d * SPLITS
             m[base] = True
-            if a[r, c] >= 4:
+            # At army 2 split/full both move one and are duplicate actions. At
+            # army 3 they first differ (1 versus 2), so split is legal/useful.
+            if a[r, c] >= 3:
                 m[base + 1] = True
 
     # Builds. Computable from a FOGGED observation with no hidden information,

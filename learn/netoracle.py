@@ -167,8 +167,40 @@ KL_STOP = 0.02       # the clip flattens the gradient, it does not bound the ste
 BETA0, BETA_MIN, BETA_MAX = 0.05, 0.01, 1.0
 ANCHOR_HI, ANCHOR_LO = 1.0, 0.1
 WARMUP = 3           # minimum critic-only iterations; --warm-evar is the real gate
+REFREEZE_AFTER = 5   # consecutive stale-critic buffers before actor updates stop
 MAX_REWINDS = 3      # collapses tolerated before the schedule is declared wrong
 CHUNK = 8192         # ingest forward chunk, no-grad, outside value_and_grad
+
+
+def critic_ready(it: int, evar: float, threshold: float) -> bool:
+    """Whether this buffer permits an actor update.
+
+    A non-positive threshold is the explicitly documented fixed-warmup mode.
+    Otherwise NaN (including an all-draw buffer) is always unready.
+    """
+    return bool(it >= WARMUP and
+                (threshold <= 0.0 or
+                 (np.isfinite(evar) and evar >= threshold)))
+
+
+def readiness_step(warmed: bool, low: int, ready: bool,
+                   refreeze_after: int = REFREEZE_AFTER) -> tuple[bool, int, bool]:
+    """Standing critic gate with hysteresis; returns (warm, low, refroze)."""
+    low = 0 if ready else low + 1
+    if not warmed:
+        return ready, low, False
+    if low >= refreeze_after:
+        return False, 0, True
+    return True, low, False
+
+
+def restore_actor_critic(actor: dict, critic: dict, xp=np):
+    """Restore a matched snapshot with fresh optimiser states and counters."""
+    p = {k: xp.asarray(v) for k, v in actor.items()}
+    q = {k: xp.asarray(v) for k, v in critic.items()}
+    opt_p = {k: (xp.zeros_like(v), xp.zeros_like(v)) for k, v in p.items()}
+    opt_v = {k: (xp.zeros_like(v), xp.zeros_like(v)) for k, v in q.items()}
+    return p, q, opt_p, opt_v, 0, 0
 
 def policy_keys(arch: dict) -> set:
     """Exactly the weights `bot/policy/net.Net` loads, for this architecture.
@@ -489,6 +521,27 @@ def selfcheck() -> None:
     a = gae(1.0, np.zeros(101, dtype=np.float32))
     assert abs(a[0] - 0.95 ** 100) < 1e-6 and a[0] < 0.01, a[0]
 
+    # --- critic readiness is a standing gate, including NaN/all-draw buffers
+    assert not critic_ready(WARMUP - 1, 1.0, 0.10)
+    assert critic_ready(WARMUP, 0.10, 0.10)
+    assert not critic_ready(WARMUP, float("nan"), 0.10)
+    # Explicit compatibility mode: --warm-evar 0 means fixed warmup.
+    assert critic_ready(WARMUP, float("nan"), 0.0)
+    warm, low = True, 0
+    for _ in range(REFREEZE_AFTER - 1):
+        warm, low, refroze = readiness_step(warm, low, False)
+        assert warm and not refroze
+    warm, low, refroze = readiness_step(warm, low, False)
+    assert not warm and low == 0 and refroze
+    warm, low, refroze = readiness_step(warm, low, True)
+    assert warm and low == 0 and not refroze
+    p0, q0 = {"p": np.array([1.0])}, {"q": np.array([2.0])}
+    p, q, op, ov, tp, tv = restore_actor_critic(p0, q0)
+    assert np.array_equal(p["p"], p0["p"])
+    assert np.array_equal(q["q"], q0["q"])
+    assert all(not np.any(x) for pair in (*op.values(), *ov.values()) for x in pair)
+    assert tp == tv == 0
+
     # --- sigma floor survives a point mass, but does not make it a mixture
     c = np.bincount(sample_opponents(np.array([1.0, 0.0, 0.0]), 20_000,
                                      np.random.default_rng(0)), minlength=3) / 20_000
@@ -704,9 +757,11 @@ def main() -> None:
     jax.config.update("jax_default_matmul_precision", "highest")
 
     print("devices:", jax.devices())
-    print(f"archive {len(specs)} members, sigma support "
+    raw_neff = effective(sigma)
+    print(f"archive {len(specs)} members, raw sigma support "
           f"{int((sigma > 0.01).sum())}: "
-          + "  ".join(f"{s}={w:.2f}" for s, w in zip(specs, sigma) if w > 0.01))
+          + "  ".join(f"{s}={w:.2f}" for s, w in zip(specs, sigma) if w > 0.01)
+          + f"  (raw Neff {raw_neff:.2f})")
     # The single number that says whether this is a league or single-opponent
     # PPO, printed before a game is played. Nash on a transitive matrix -- which
     # is what an archive of config variants of one controller is -- is a point
@@ -715,11 +770,13 @@ def main() -> None:
     neff = effective(train_p)
     print(f"training mixture: {neff:.2f} effective opponents over {len(specs)} "
           f"members (floor {args.sigma_floor:.2f})")
+    if raw_neff < 2.0:
+        print("            WARNING raw equilibrium has fewer than two effective "
+              "opponents. The floor diversifies TRAINING only; eval and gate "
+              "still measure the raw point mass.")
     if neff < 2.0:
-        print("            WARNING fewer than two effective opponents. This is "
-              "failure 3 -- frozen-opponent PPO -- and the eval bracket will "
-              "print a single entry, so the farming tripwire cannot fire. Raise "
-              "--sigma-floor or grow the archive before believing the gate.")
+        print("            WARNING training itself has fewer than two effective "
+              "opponents. Raise --sigma-floor or grow the archive.")
 
     raw0 = np.load(args.init)
     # The architecture is the checkpoint's, whatever it is; a flag is only ever
@@ -826,7 +883,8 @@ def main() -> None:
     t_p = t_v = 0
     best_score, best_iter = -1.0, -1
     best_theta = dict(theta_init)
-    warmed = False          # set once the critic explains enough to trust
+    best_phi = {k: np.asarray(v) for k, v in phi.items()}
+    warmed, low = False, 0  # standing gate, not a permanent latch
     base_score = None       # eval 0: the initialisation's own score
     rewinds = 0
     lr_scale = 1.0
@@ -869,10 +927,13 @@ def main() -> None:
 
         adv = np.empty(n, dtype=np.float32)
         ret = np.empty(n, dtype=np.float32)
+        frac = np.empty(n, dtype=np.float32)
         k = 0
         for length, z in episodes:
             adv[k:k + length] = gae(z, vals[k:k + length])
             ret[k:k + length] = z           # MC return; see gae's docstring
+            frac[k:k + length] = (
+                np.arange(length, dtype=np.float32) / max(length - 1, 1))
             k += length
         # SCALE ONLY. Not re-centred: with a correct critic GAE advantages are
         # already zero-mean, and the empirical mean here is a win/loss-imbalance
@@ -884,8 +945,28 @@ def main() -> None:
         # The critic's honest score, measured on THIS buffer before this
         # iteration's updates touch it. `v` (MSE) reads healthy when the critic
         # predicts a constant; this does not.
-        vr = float(ret.var())
-        evar = float(1.0 - ((ret - vals).var() / vr)) if vr > 1e-9 else float("nan")
+        def _evar(mask, prediction=None):
+            r = ret[mask]
+            v = vals[mask] if prediction is None else prediction
+            vr = float(r.var())
+            return (float(1.0 - ((r - v).var() / vr))
+                    if vr > 1e-9 else float("nan"))
+
+        evar = _evar(slice(None))
+        mid = (frac >= 0.2) & (frac < 0.45)
+        early, late = frac < 0.1, frac >= 0.9
+        evar_e, evar_m, evar_l = _evar(early), _evar(mid), _evar(late)
+        scalar_idx = list(range(features.CLOCK, features.BASE_C)) + [
+            features.DELTA_MY_ARMY, features.DELTA_OPP_ARMY,
+            features.DELTA_LAND_ADV]
+        scalars = np.c_[xs[:, scalar_idx, 0, 0].astype(np.float32),
+                        np.ones(n, np.float32)]
+
+        def _scalar_evar(mask):
+            a, r = scalars[mask], ret[mask]
+            return _evar(mask, a @ np.linalg.lstsq(a, r, rcond=None)[0])
+
+        sc_m, sc_l = _scalar_evar(mid), _scalar_evar(late)
 
         # Warm up on the CRITIC'S SCORE, not on a fixed iteration count. The
         # 1500-iteration run released the policy after 3 iterations with evar
@@ -895,7 +976,12 @@ def main() -> None:
         # collapse spends the behaviour-clone warm start, so what recovers
         # afterwards is PPO-from-scratch, which is the attempt that plateaued at
         # 0.15. Wait until the critic explains something.
-        warmed = warmed or (it >= WARMUP and evar >= args.warm_evar)
+        ready = critic_ready(it, evar, args.warm_evar)
+        warmed, low, refroze = readiness_step(warmed, low, ready)
+        if refroze:
+            print(f"  RE-FREEZE evar under {args.warm_evar} for "
+                  f"{REFREEZE_AFTER} iterations; policy frozen until the "
+                  "critic recovers", flush=True)
         do_policy = warmed
         dlp0 = float("nan")
         kl_u = kl_last = kl_a = ent = pg = gn = vloss = 0.0
@@ -954,7 +1040,9 @@ def main() -> None:
         print(f"iter {it:4d}  games {len(results)}  W/D/L {w}/{d}/"
               f"{len(results) - w - d}  samp {n // 1000:3d}k  turns {turns:.0f}  "
               f"train-wr {wr:.2f}{tag}\n"
-              f"          pg {pg:+.4f}  v {vloss:.3f}  evar {evar:+.2f}  "
+              f"          pg {pg:+.4f}  v {vloss:.3f}  evar {evar:+.2f} "
+              f"(e{evar_e:+.2f} m{evar_m:+.2f} l{evar_l:+.2f} "
+              f"sc m{sc_m:+.2f} l{sc_l:+.2f})  "
               f"dlp0 {dlp0:.1e}  klU {kl_u:.3f}/{kl_last:.3f}  klA {kl_a:.3f}  "
               f"beta {beta:.3f}  ent {ent:.2f}  gn {gn:.2f}  mb {nb}  "
               f"{time.time() - t0:.0f}s", flush=True)
@@ -968,6 +1056,7 @@ def main() -> None:
             mark = ""
             if score > best_score:
                 best_score, best_iter, best_theta = score, it, cur
+                best_phi = {k: np.asarray(v) for k, v in phi.items()}
                 # The selected checkpoint on disk, every time it changes: this
                 # run is ~1 h and had nothing but `.live.npz` (the CURRENT net,
                 # not the best one) to show for a kill at iteration 199.
@@ -996,9 +1085,12 @@ def main() -> None:
                     print("  giving up: the schedule is wrong, not unlucky. "
                           "Lower --lr or raise --warm-evar.", flush=True)
                     break
-                theta = {k: jnp.asarray(v) for k, v in best_theta.items()}
-                opt_p = {k: (jnp.zeros_like(v), jnp.zeros_like(v))
-                         for k, v in theta.items()}
+                theta, phi, opt_p, opt_v, t_p, t_v = restore_actor_critic(
+                    best_theta, best_phi, jnp)
+                # Restore a policy-compatible critic and invalidate readiness.
+                # Optimiser moments from the abandoned actor distribution must
+                # not be replayed into the selected snapshot.
+                warmed, low = False, 0
                 lr_scale *= 0.5
                 beta = min(beta * 2.0, BETA_MAX)
 
@@ -1023,6 +1115,11 @@ def main() -> None:
     # becomes the next generation's --init, so it is the LAST file that should
     # ship without the architecture record.
     publish(best_theta, out)
+    critic_out = out.with_suffix(".critic.npz")
+    critic_tmp = critic_out.with_suffix(".tmp.npz")
+    np.savez(critic_tmp, **{f"phi__{k}": np.asarray(v)
+                           for k, v in best_phi.items()})
+    os.replace(critic_tmp, critic_out)
     publish(theta, out.with_suffix(".last.npz"))
     out.with_suffix(".json").write_text(json.dumps(
         {"accepted": accepted, "score": round(score, 4),
@@ -1036,9 +1133,11 @@ def main() -> None:
           f"vs init {init_score:.3f}, needs +{margin:.3f} -> "
           f"{'ACCEPTED' if accepted else 'REJECTED'}")
     print(f"  per opponent {per}")
-    print(f"wrote {out}  ({time.time() - started:.0f}s)")
+    print(f"wrote {out} with matched critic {critic_out}  "
+          f"({time.time() - started:.0f}s)")
     from tools import manifest
-    inputs = [args.init, args.league, out, out.with_suffix(".last.npz")]
+    inputs = [args.init, args.league, out, critic_out,
+              out.with_suffix(".last.npz")]
     if args.init_critic:
         inputs.append(args.init_critic)
     manifest.write(out.with_suffix(".manifest.json"), command=sys.argv,

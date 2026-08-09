@@ -222,6 +222,82 @@ def test_temporal_enemy_history_survives_recapture():
     assert mem.ever_enemy[1, 1], "EVER_ENEMY must encode history, not current owner"
 
 
+def test_temporal_new_structure_in_fog_does_not_need_stale_owner():
+    """A castle built on a never-seen cell is observable only as a new SIF."""
+    from bot.memory import TemporalMemory
+    from bot.obs import Obs
+
+    h = w = 3
+    ty = np.full((h, w), rules.T_FOG, np.int8)
+    owner = np.zeros((h, w), np.int8)
+    army = np.zeros((h, w), np.int32)
+    mem = TemporalMemory(h, w)
+    mem.update(Obs(h, w, 1, 1, 1, 1, 1, ty, owner, army))
+    assert not mem.ever_seen[1, 1]
+    assert mem.mem_owner[1, 1] == rules.OWNER_NEUTRAL
+
+    ty = ty.copy()
+    ty[1, 1] = rules.T_STRUCTURE_IN_FOG
+    mem.update(Obs(h, w, 2, 1, 1, 1, 1, ty, owner, army))
+    assert mem.enemy_castles[1, 1]
+
+
+def test_temporal_first_frame_structure_is_mountain_and_update_is_idempotent():
+    from bot.memory import TemporalMemory
+    from bot.obs import Obs
+
+    h = w = 3
+    ty = np.full((h, w), rules.T_FOG, np.int8)
+    ty[1, 1] = rules.T_STRUCTURE_IN_FOG
+    z8 = np.zeros((h, w), np.int8)
+    z32 = np.zeros((h, w), np.int32)
+    obs = Obs(h, w, 7, 1, 1, 1, 1, ty, z8, z32)
+    mem = TemporalMemory(h, w)
+    mem.update(obs)
+    assert mem.known_mountains[1, 1]
+    assert not mem.enemy_castles[1, 1]
+    before = {k: v.copy() for k, v in mem.__dict__.items()
+              if isinstance(v, np.ndarray)}
+    mem.update(obs)
+    assert all(np.array_equal(before[k], getattr(mem, k)) for k in before)
+
+
+def test_jax_temporal_new_structure_in_fog_does_not_need_stale_owner():
+    try:
+        import jax.numpy as jnp
+    except ImportError:
+        return
+    from types import SimpleNamespace
+
+    from bot import features
+    from learn import rlenv
+
+    n = features.PAD
+    zero = jnp.zeros((n, n), dtype=jnp.bool_)
+
+    def frame(turn, structures):
+        return SimpleNamespace(
+            fog_cells=~structures,
+            structures_in_fog=structures,
+            mountains=zero,
+            owned_cells=zero,
+            opponent_cells=zero,
+            castles=zero,
+            armies=jnp.zeros((n, n), dtype=jnp.int32),
+            timestep=jnp.asarray(turn, dtype=jnp.int32),
+            owned_army_count=jnp.asarray(1, dtype=jnp.int32),
+            opponent_army_count=jnp.asarray(1, dtype=jnp.int32),
+            owned_land_count=jnp.asarray(1, dtype=jnp.int32),
+            opponent_land_count=jnp.asarray(1, dtype=jnp.int32),
+        )
+
+    mem = {k: v[0] for k, v in rlenv.empty_memory_jax(1).items()}
+    mem = rlenv.update_memory_jax(mem, frame(1, zero))
+    structures = zero.at[1, 1].set(True)
+    mem = rlenv.update_memory_jax(mem, frame(2, structures))
+    assert bool(np.asarray(mem["enemy_castles"])[1, 1])
+
+
 def test_temporal_memory_copy_is_independent():
     from bot.memory import TemporalMemory
 
@@ -234,6 +310,129 @@ def test_temporal_memory_copy_is_independent():
     assert mem.mem_army[1, 2] == 17
     assert not mem.ever_seen[0, 0]
     assert copied.H == mem.H and copied.W == mem.W
+
+
+def test_paired_rating_uses_board_clusters():
+    from arena import rating
+
+    def rows(pair_outcomes):
+        out = []
+        for seed, (a, b) in enumerate(pair_outcomes):
+            out.extend(({"seed": seed, "a_seat": 0, "a_result": a},
+                        {"seed": seed, "a_seat": 1, "a_result": b}))
+        return out
+
+    # Same raw 50/50 W/L. Correlated boards vary between 1 and 0; anti-correlated
+    # boards are exactly 0.5 after the seat swap and therefore have no board
+    # difficulty variance.
+    positive = rows([("win", "win")] * 50 + [("loss", "loss")] * 50)
+    negative = rows([("win", "loss")] * 100)
+    p, n = rating.paired_summary(positive), rating.paired_summary(negative)
+    assert p["score"] == n["score"] == 0.5
+    assert p["boards"] == n["boards"] == 100
+    assert p["pair_stderr"] > 0.04
+    assert n["pair_stderr"] == 0.0
+    assert p["elo_hi"] - p["elo_lo"] > n["elo_hi"] - n["elo_lo"]
+
+
+def test_paired_rating_rejects_malformed_pairs():
+    from arena import rating
+
+    bad = [{"seed": 1, "a_seat": 0, "a_result": "win"},
+           {"seed": 2, "a_seat": 1, "a_result": "loss"}]
+    try:
+        rating.paired_summary(bad)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("different seeds were accepted as a board pair")
+
+
+def test_army_three_has_a_distinct_legal_split_action():
+    from bot import features
+
+    grid = _blank(3, 3)
+    st = engine.from_grid(grid)
+    st.armies[0, 0] = 3
+    obs = engine.observe(st, 0)
+    mask = features.legal_mask(obs)
+    full = features.action_to_index((rules.MOVE, 0, 0, 1, 0))
+    split = features.action_to_index((rules.MOVE, 0, 0, 1, 1))
+    assert mask[full] and mask[split]
+    valid_full, _, _, amount_full = engine._move_params(
+        st, 0, (rules.MOVE, 0, 0, 1, 0))
+    valid_split, _, _, amount_split = engine._move_params(
+        st, 0, (rules.MOVE, 0, 0, 1, 1))
+    assert valid_full and valid_split
+    assert (amount_full, amount_split) == (2, 1)
+
+
+def test_smoke_evaluation_can_never_approve_promotion():
+    from tools.evaluate import approval_status
+
+    approved, exit_ok = approval_status(True, True, smoke=True)
+    assert not approved and exit_ok
+    approved, exit_ok = approval_status(True, True, smoke=False)
+    assert approved and exit_ok
+
+
+def test_neural_package_identity_is_fail_closed():
+    from tools.package import validate_identity
+
+    for args in ((None, None, False, False),
+                 ("abc", None, False, False),
+                 ("abc", "def", False, False)):
+        try:
+            validate_identity(*args)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"unsafe package identity was accepted: {args}")
+    validate_identity("abc", "abc")
+    validate_identity(None, None, allow_heuristic=True)
+
+
+def test_stdio_agent_honours_deadline_and_reports_fallback():
+    import tempfile
+    import time
+    from pathlib import Path
+
+    from arena.stdio_agent import StdioAgent
+    from bot.obs import Obs
+
+    z8 = np.zeros((1, 1), np.int8)
+    z32 = np.zeros((1, 1), np.int32)
+    obs = Obs(1, 1, 1, 1, 1, 1, 1, z8, z8, z32)
+    with tempfile.TemporaryDirectory() as td:
+        run = Path(td) / "run.sh"
+        run.write_text("#!/usr/bin/env bash\nsleep 10\n")
+        agent = StdioAgent(str(run), 0, 1, 1)
+        try:
+            agent.act(obs, time.perf_counter() + 0.05)
+        except TimeoutError:
+            pass
+        else:
+            raise AssertionError("hung stdio child ignored its deadline")
+        finally:
+            agent.close()
+
+        run.write_text(
+            "#!/usr/bin/env bash\n"
+            "read handshake\n"
+            "while read frame; do\n"
+            "  read type; read owner; read army\n"
+            "  echo 'policy: FALLING BACK to heuristic' >&2\n"
+            "  echo '1 0 0 0 0'\n"
+            "done\n")
+        agent = StdioAgent(str(run), 0, 1, 1)
+        try:
+            agent.act(obs, time.perf_counter() + 1.0)
+        except RuntimeError as e:
+            assert "FALLING BACK" in str(e)
+        else:
+            raise AssertionError("stdio fallback was hidden as a valid action")
+        finally:
+            agent.close()
 
 
 def test_room_field_matches_a_direct_count():

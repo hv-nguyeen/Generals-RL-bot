@@ -79,9 +79,10 @@ def update_memory_jax(memory, obs):
     delta = obs.armies.astype(jnp.int32) - memory["mem_army"]
     my_army_delta = jnp.where(changed & mine, delta, 0)
     opp_army_delta = jnp.where(changed & opp, delta, 0)
+    # Match TemporalMemory: a post-initial structure token that is not a known
+    # mountain is an enemy castle even if the cell was never previously seen.
     enemy_castles = (memory["enemy_castles"]
-                     | (obs.structures_in_fog & ~known_mountains
-                        & (memory["mem_owner"] == 2))
+                     | (obs.structures_in_fog & ~known_mountains)
                      | (obs.castles & opp))
     enemy_castles &= ~(obs.castles & ~opp)
     mem_owner = jnp.where(visible, owner, memory["mem_owner"])
@@ -287,7 +288,8 @@ def legal_mask_jax(obs):
     import jax.numpy as jnp
 
     movable = obs.owned_cells & (obs.armies >= 2)
-    splittable = obs.owned_cells & (obs.armies >= 4)
+    # Split first differs from full at army 3: floor(3/2)=1 versus 3-1=2.
+    splittable = obs.owned_cells & (obs.armies >= 3)
     passable = ~obs.mountains & ~obs.structures_in_fog
 
     def shifted(mask, dr, dc):

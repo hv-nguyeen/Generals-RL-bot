@@ -60,8 +60,9 @@ open runs/<timestamp>/greedy/report.html
 python -m tools.tune --out runs/tune1 --iters 20 --pop 12 --games 40 \
     --opponents ours,greedy --workers 60
 
-# 5. ship
-make submit-test           # builds dist/generals-bot.zip AND plays it over stdio
+# 5. ship the exact intended neural checkpoint
+EXPECT=$(sha256sum bot/weights.npz | awk '{print $1}')
+make submit-test EXPECT="$EXPECT"  # builds, extracts, and plays the ZIP over stdio
 
 # 6. promote a neural checkpoint (all buckets + hashes + runtime/fault gates)
 python -m tools.evaluate --candidate runs/new.npz --reference runs/champ.npz \
@@ -170,10 +171,12 @@ cp dist/generals-bot.zip ~/
 rm bot/weights.npz
 ```
 
-`tools/package.py` prints the bundled net's size and sha256, or `net: NONE` when
-the zip has no net at all. Check it against the checkpoint you meant to ship with
-`sha256sum runs/nn/spN.best.npz`, and keep the digest with the submission date —
-it is the only way to tell two uploads apart afterwards.
+`tools/package.py` requires the intended checkpoint digest and refuses to
+publish a neural ZIP without a loadable network. Check it with `sha256sum
+runs/nn/spN.best.npz`, pass that value through `EXPECT`, and keep the digest with
+the submission date—it is the only way to tell two uploads apart afterwards.
+An intentional heuristic-only artifact requires the explicit
+`ALLOW_HEURISTIC=1` opt-out.
 
 Note the guard's third override, the garrison veto, fires on about 0.2% of turns
 and measures neutral — see docs/STATE.md. Five hand-written overrides have now
@@ -208,7 +211,8 @@ its chase defence, mutual-capture draw, fog radius) and the belief inferences.
 ## Submitting
 
 ```bash
-make submit-test
+EXPECT=$(sha256sum bot/weights.npz | awk '{print $1}')
+make submit-test EXPECT="$EXPECT"
 ```
 
 Writes `dist/generals-bot.zip` (a directory with `run.sh` at its root, which is
@@ -217,8 +221,9 @@ file limits, then plays it through the real wire protocol as a subprocess so the
 artifact that gets uploaded is the artifact that was measured. Upload it from
 your dashboard.
 
-To ship tuned weights: `make submit-test CONFIG=runs/tune1/best.json` bundles
-them as `bot/config.json`, which `bot/main.py` picks up automatically.
+To ship an intentional heuristic config, use `make submit-test
+CONFIG=runs/tune1/best.json ALLOW_HEURISTIC=1`. Neural releases must keep the
+digest-pinned command above.
 
 ## Current standing
 

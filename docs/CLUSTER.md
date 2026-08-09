@@ -363,7 +363,9 @@ cp runs/nn/CHECKPOINT.npz bot/weights.npz
 ```
 
 ```bash
-$PY -m tools.package --name generals-bot-nnN --config configs/v13.json --test 4
+SHA=$(sha256sum bot/weights.npz | awk '{print $1}')
+$PY -m tools.package --name generals-bot-nnN --config configs/v13.json \
+  --expect "$SHA" --test 4
 ```
 
 Confirm it prints `policy: net {...}` and not the heuristic fallback, and that

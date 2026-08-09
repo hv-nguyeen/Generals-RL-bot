@@ -39,6 +39,84 @@ def summary(wins: int, draws: int, losses: int) -> dict:
     }
 
 
+def pair_scores(rows: list[dict]) -> list[float]:
+    """One independent board score from each swapped-seat game pair.
+
+    The runner emits adjacent rows with the same seed and opposite A seats.
+    Treating those two correlated games as independent produces invalid
+    intervals in either direction, depending on the board/seat correlation.
+    """
+    if len(rows) % 2:
+        raise ValueError("paired evaluation needs an even number of rows")
+    value = {"win": 1.0, "draw": 0.5, "loss": 0.0}
+    out = []
+    for i in range(0, len(rows), 2):
+        a, b = rows[i], rows[i + 1]
+        if a.get("seed") != b.get("seed"):
+            raise ValueError(f"rows {i}/{i + 1} do not share a board seed")
+        if {a.get("a_seat"), b.get("a_seat")} != {0, 1}:
+            raise ValueError(f"rows {i}/{i + 1} are not opposite A seats")
+        try:
+            out.append((value[a["a_result"]] + value[b["a_result"]]) / 2.0)
+        except KeyError as e:
+            raise ValueError(f"row has invalid a_result: {e}") from e
+    return out
+
+
+def paired_summary(rows: list[dict]) -> dict:
+    """W/D/L point estimate with uncertainty clustered by board pair."""
+    wins = sum(r.get("a_result") == "win" for r in rows)
+    draws = sum(r.get("a_result") == "draw" for r in rows)
+    losses = len(rows) - wins - draws
+    base = summary(wins, draws, losses)
+    scores = pair_scores(rows)
+    boards = len(scores)
+    if not boards:
+        return {**base, "boards": 0, "pair_stderr": float("inf")}
+    score = sum(scores) / boards
+    if abs(score - base["score"]) > 1e-12:
+        raise AssertionError("paired and per-game score estimates disagree")
+    if boards < 2:
+        stderr = float("inf")
+        radius = 1.0
+        lo_score, hi_score = 1e-9, 1.0 - 1e-9
+    else:
+        var = sum((x - score) ** 2 for x in scores) / (boards - 1)
+        stderr = math.sqrt(max(var, 0.0) / boards)
+        # Empirical Bernstein interval for independent values in [0, 1]. Unlike
+        # a plain cluster-normal interval it does not claim zero uncertainty
+        # after a finite all-win sweep or perfectly anti-correlated WL pairs.
+        log_term = math.log(3.0 / 0.05)
+        radius = (math.sqrt(2.0 * max(var, 0.0) * log_term / boards)
+                  + 3.0 * log_term / boards)
+        lo_score = min(max(score - radius, 1e-9), 1.0 - 1e-9)
+        hi_score = min(max(score + radius, 1e-9), 1.0 - 1e-9)
+    lo, hi = score_to_elo(lo_score), score_to_elo(hi_score)
+    return {**base, "boards": boards, "elo_lo": lo, "elo_hi": hi,
+            "err": (hi - lo) / 2.0, "pair_stderr": stderr,
+            "score_radius": radius,
+            "interval": "95% empirical Bernstein over board pairs"}
+
+
+def paired_test(rows: list[dict], elo0: float = 0.0, elo1: float = 12.0) -> dict:
+    """Fixed-sample 95% decision using the board-clustered interval.
+
+    This deliberately is not called an SPRT: the existing LLR assumes
+    independent games, while evaluation uses fixed paired boards.
+    """
+    s = paired_summary(rows)
+    lo, hi = elo_to_score(s["elo_lo"]), elo_to_score(s["elo_hi"])
+    verdict = "continue"
+    if lo >= elo_to_score(elo1):
+        verdict = "accept H1 (A is better)"
+    elif hi <= elo_to_score(elo0):
+        verdict = "accept H0 (no improvement)"
+    return {"method": "paired fixed-sample 95% empirical Bernstein CI",
+            "verdict": verdict,
+            "elo0": elo0, "elo1": elo1, "boards": s["boards"],
+            "score_lo": lo, "score_hi": hi}
+
+
 def llr(wins: int, draws: int, losses: int, elo0: float, elo1: float) -> float:
     """Log-likelihood ratio for H1(elo1) against H0(elo0), 3-outcome model."""
     n = wins + draws + losses

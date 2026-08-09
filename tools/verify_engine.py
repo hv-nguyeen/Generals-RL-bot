@@ -444,6 +444,7 @@ def check_memory_encoders(boards: int = 4, turns: int = 240,
             theirs, _ = step(theirs, jnp.asarray([a0, a1], dtype=jnp.int32))
     assert activity > 0.0, "temporal change planes never activated"
     required = [features.MEM_OPP, features.MEM_ARMY_OPP, features.EVER_ENEMY,
+                features.ENEMY_CASTLE,
                 features.OPP_GAINED, features.OPP_ARMY_DELTA,
                 features.DELTA_OPP_ARMY, features.DELTA_LAND_ADV]
     missing = [ch for ch in required if plane_peak[ch - features.BASE_C] == 0]

@@ -598,7 +598,13 @@ def net_oracle(args, out: Path, ckpt: Path, maps: str | None, it: int) -> tuple[
               f"oracle for iteration {it}", flush=True)
         return npz, {"accepted": False, "score": float("nan"),
                      "init_score": float("nan")}
-    return npz, json.loads(npz.with_suffix(".json").read_text())
+    gate = json.loads(npz.with_suffix(".json").read_text())
+    critic = npz.with_suffix(".critic.npz")
+    if gate.get("accepted") and not critic.is_file():
+        print(f"  neural oracle claimed acceptance but its matched critic is "
+              f"missing: {critic}; rejecting it", flush=True)
+        gate["accepted"] = False
+    return npz, gate
 
 
 def save_state(path: Path, state: dict) -> None:
@@ -932,6 +938,10 @@ def main() -> None:
                          "the default still sends 85%% of its games to one bot, "
                          "which is frozen-opponent PPO; netoracle prints the "
                          "effective opponent count at startup")
+    ap.add_argument("--nn-no-fallback", action="store_true",
+                    help="if a neural oracle is rejected, do not spend this "
+                         "iteration on the config CEM fallback; use for a pure "
+                         "neural pilot whose hypothesis excludes config tuning")
     ap.add_argument("--group", default="commit", choices=sorted(GROUPS),
                     help="which knobs the oracle searches (see GROUPS)")
     ap.add_argument("--params", default=None, help="explicit comma-separated knob list")
@@ -957,6 +967,10 @@ def main() -> None:
     if args.oracle != "config":
         if not args.nn_init:
             raise SystemExit(f"--oracle {args.oracle} needs --nn-init <policy.npz>")
+        if not args.nn_init_critic:
+            raise SystemExit(f"--oracle {args.oracle} needs --nn-init-critic "
+                             "matching --nn-init; policy-only continuation is "
+                             "not a safe PPO warm start")
         if not Path(args.nn_init).exists():
             raise SystemExit(f"--nn-init not found: {args.nn_init}")
         if args.nn_init_critic and not Path(args.nn_init_critic).exists():
@@ -982,7 +996,7 @@ def main() -> None:
         "oracle", "group", "params", "gens", "pop", "elite", "spread",
         "floor", "base", "seed", "nn_init", "nn_init_critic", "nn_iters",
         "nn_games", "nn_epochs", "nn_minibatch", "nn_lr",
-        "nn_critic_lr", "nn_warm_evar", "nn_sigma_floor")}
+        "nn_critic_lr", "nn_warm_evar", "nn_sigma_floor", "nn_no_fallback")}
 
     if args.resume:
         if not ckpt.exists():
@@ -1055,7 +1069,8 @@ def main() -> None:
                 # runoff read only `name` and `spec`. The name still starts with
                 # "oracle", which is what report's falsify line tests.
                 state["archive"].append({"name": f"oracle-nn-{it}",
-                                         "spec": f"clone:{npz}", "config": None})
+                                         "spec": f"clone:{npz}", "config": None,
+                                         "critic": str(npz.with_suffix('.critic.npz'))})
                 save_state(ckpt, state)      # member and weights land together
                 print(f"  oracle-nn-{it} accepted: {gate['score']:.3f} vs its own "
                       f"initialisation {gate['init_score']:.3f} on gate boards")
@@ -1064,10 +1079,12 @@ def main() -> None:
                       f"init {gate['init_score']:.3f}); PPO did not beat the policy it "
                       f"started from, so it is not a best response")
 
-        # `net` falls back to the CEM oracle when the net is rejected: an
-        # iteration that appends nothing leaves sigma unchanged and the next
-        # iteration repeats it.
-        if args.oracle == "both" or (args.oracle == "config") or not accepted:
+        # `net` normally falls back to CEM when rejected. A hypothesis-isolation
+        # pilot may disable that explicitly so config tuning cannot masquerade
+        # as evidence for the neural opponent-training experiment.
+        run_config = (args.oracle in ("config", "both")
+                      or (not accepted and not args.nn_no_fallback))
+        if run_config:
             if state["pending"] is None:
                 state["pending"] = {}
                 save_state(ckpt, state)
@@ -1084,6 +1101,8 @@ def main() -> None:
             print(f"  {name} search score {score:.3f} -- a selection statistic, not a "
                   f"measurement; the matrix re-plays it on held-out boards next")
             state["archive"].append({"name": name, "spec": "", "config": asdict(cand)})
+        elif not accepted:
+            print("  config fallback disabled; this iteration appends no member")
         materialise(state["archive"], out / "archive")
         state["iter"] = it + 1
         state["pending"] = None
