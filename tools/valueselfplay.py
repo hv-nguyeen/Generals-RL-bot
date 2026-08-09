@@ -49,6 +49,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bot import features, rules                       # noqa: E402
+from bot.memory import TemporalMemory                 # noqa: E402
 from bot.policy.net import Net                        # noqa: E402
 from sim import engine, mapgen                        # noqa: E402
 from tools.cfprobe import _act                      # noqa: E402
@@ -79,28 +80,24 @@ def _game(job):
     net, max_turns = _CTX["net"], _CTX["max_turns"]
     st = engine.from_grid(mapgen.generate(seed, dmin, dmax))
     rng = np.random.default_rng(seed)
-    # LABELS ARE {0.0, 1.0} AND DRAWS ARE DROPPED, matching `learn/valuedata.py`
-    # exactly, because `learn/valuetrain.py` optimises
-    # `logaddexp(0, logit) - y * logit`. That is BCE for y in {0, 1} and
-    # UNBOUNDED BELOW for anything else: at y = -1 it reduces to ~2*logit, so the
-    # fit drives the logit to -inf and the loss to -1e20 while val accuracy sits
-    # at chance. Writing `outcome()`'s {-1, 0, +1} here produced exactly that.
+    # Direct value labels {-1, 0, +1}, including draws. `learn.valuetrain`
+    # optimises a bounded tanh value with Huber loss in the same units used by
+    # PPO, so standalone critics transfer without a hidden logit conversion.
 
     frames: list = [[], []]
+    memories = [TemporalMemory(*st.armies.shape) for _ in range(2)]
     for _ in range(1, max_turns + 1):
         acts = [None, None]
         for s in (0, 1):
             obs = engine.observe(st, s)
-            idx, _, _ = _act(net, obs, rng)
-            frames[s].append(features.encode(obs).astype(np.float16))
+            memories[s].update(obs)
+            idx, _, _ = _act(net, obs, rng, memories[s])
+            frames[s].append(features.encode(obs, memories[s]).astype(np.float16))
             acts[s] = features.index_to_action(idx)
         if engine.step(st, acts[0], acts[1]):
             break
 
-    if st.winner < 0:
-        return None                      # draw: no label exists for it
-
-    xs, ys = [], []
+    xs, ys, game_ids, seats, turns = [], [], [], [], []
     for s in (0, 1):
         # Drop the tail: the last ticks of a decided game are trivially
         # predictable and would inflate every evar reading downstream without
@@ -109,8 +106,14 @@ def _game(job):
         if not keep:
             return None
         xs.append(np.stack(keep))
-        ys.append(np.full(len(keep), 1.0 if s == st.winner else 0.0, np.float32))
-    return np.concatenate(xs), np.concatenate(ys)
+        target = 0.0 if st.winner < 0 else (1.0 if s == st.winner else -1.0)
+        ys.append(np.full(len(keep), target, np.float32))
+        game_ids.append(np.full(len(keep), seed, np.int64))
+        seats.append(np.full(len(keep), s, np.int8))
+        n0 = max(len(frames[s]) - drop_last, 0)
+        turns.append(np.arange(0, n0, stride, dtype=np.int32)[:len(keep)])
+    return (np.concatenate(xs), np.concatenate(ys), np.concatenate(game_ids),
+            np.concatenate(seats), np.concatenate(turns))
 
 
 def main() -> None:
@@ -121,12 +124,18 @@ def main() -> None:
     ap.add_argument("--games", type=int, default=3000)
     ap.add_argument("--dmin", type=int, default=17, help="stage 4 lower bound")
     ap.add_argument("--dmax", type=int, default=24, help="stage 4 upper bound")
+    ap.add_argument("--competition-distance", action="store_true",
+                    help="use the exact competition distribution (17+ with no "
+                         "upper bound), overriding --dmin/--dmax")
     ap.add_argument("--stride", type=int, default=4, help="keep every Nth tick")
     ap.add_argument("--drop-last", type=int, default=25)
     ap.add_argument("--max-turns", type=int, default=rules.TURN_LIMIT)
     ap.add_argument("--workers", type=int, default=os.cpu_count())
     ap.add_argument("--seed0", type=int, default=VS_SEED0)
     args = ap.parse_args()
+
+    if args.competition_distance:
+        args.dmin, args.dmax = rules.MIN_GENERALS_DISTANCE, None
 
     # Before the pool: `_init` runs in every worker, so a bad path otherwise
     # prints 60 tracebacks and dies in a BrokenProcessPool naming neither.
@@ -140,17 +149,20 @@ def main() -> None:
     jobs = [(args.seed0 + i, args.dmin, args.dmax, args.stride, args.drop_last)
             for i in range(args.games)]
 
-    xs, ys, shard, kept, buffered, games = [], [], 0, 0, 0, 0
+    xs, ys, game_ids, seats, turns = [], [], [], [], []
+    shard = kept = buffered = games = 0
 
     def flush():
-        nonlocal xs, ys, shard, kept, buffered
+        nonlocal xs, ys, game_ids, seats, turns, shard, kept, buffered
         if not xs:
             return
         np.savez_compressed(out / f"shard_{shard:04d}.npz",
-                            x=np.concatenate(xs), y=np.concatenate(ys))
+                            x=np.concatenate(xs), y=np.concatenate(ys),
+                            game=np.concatenate(game_ids),
+                            seat=np.concatenate(seats), t=np.concatenate(turns))
         kept += buffered
         shard += 1
-        xs, ys, buffered = [], [], 0
+        xs, ys, game_ids, seats, turns, buffered = [], [], [], [], [], 0
 
     with ProcessPoolExecutor(max_workers=args.workers,
                              mp_context=mp.get_context("spawn"),
@@ -159,9 +171,10 @@ def main() -> None:
         for res in pool.map(_game, jobs, chunksize=1):
             games += 1
             if res is not None:
-                x, y = res
+                x, y, game, seat, turn = res
                 xs.append(x)
                 ys.append(y)
+                game_ids.append(game); seats.append(seat); turns.append(turn)
                 buffered += len(y)
                 if buffered >= SHARD:
                     flush()
@@ -170,11 +183,14 @@ def main() -> None:
                       flush=True)
     flush()
 
+    from tools.manifest import artifact, file_set
+    shards = sorted(out.glob("shard_*.npz"))
     (out / "meta.json").write_text(json.dumps(
         {"positions": kept, "games": games, "stride": args.stride,
          "drop_last": args.drop_last, "channels": features.C,
-         "pad": features.PAD, "weights": args.weights,
-         "dmin": args.dmin, "dmax": args.dmax}, indent=2))
+         "pad": features.PAD, "weights": artifact(args.weights),
+         "dmin": args.dmin, "dmax": args.dmax, "seed0": args.seed0,
+         "shards": file_set(shards, out)}, indent=2))
     print(f"\n{kept} positions from {games} games -> {out}")
     print(f"next: python -m learn.valuetrain --data {out} --out CRITIC.npz "
           f"--layers 8 --channels 64")
@@ -184,37 +200,30 @@ def main() -> None:
 
 
 def _labels(winner: int, n: int) -> np.ndarray:
-    """The two seats' labels for a decided game, seat-major. Extracted so the
-    encoding is testable without playing one."""
-    return np.concatenate([np.full(n, 1.0 if s == winner else 0.0, np.float32)
-                           for s in (0, 1)])
+    """Direct value targets in seat-major order; ``winner=-1`` is a draw."""
+    return np.concatenate([
+        np.full(n, 0.0 if winner < 0 else (1.0 if s == winner else -1.0),
+                np.float32) for s in (0, 1)])
 
 
 def selfcheck() -> None:
-    """The label ENCODING, and that a draw produces no rows at all.
-
-    Both are silent failures. `learn/valuetrain.py` optimises
-    `logaddexp(0, logit) - y * logit`, which is BCE on {0, 1} and unbounded
-    below outside it: a label of -1 sends the loss to -1e20 with val accuracy
-    pinned at chance, which reads as "this critic cannot be fitted" rather than
-    as a wrong label. That is exactly what {-1, 0, +1} did on 2026-08-08.
-    """
-    assert list(_labels(0, 2)) == [1.0, 1.0, 0.0, 0.0]
-    assert list(_labels(1, 2)) == [0.0, 0.0, 1.0, 1.0]
+    """Pin direct {-1,0,+1} labels, pairing, and retained draws."""
+    assert list(_labels(0, 2)) == [1.0, 1.0, -1.0, -1.0]
+    assert list(_labels(1, 2)) == [-1.0, -1.0, 1.0, 1.0]
+    assert list(_labels(-1, 2)) == [0.0, 0.0, 0.0, 0.0]
     for w in (0, 1):
         y = _labels(w, 3)
-        assert set(np.unique(y)) <= {0.0, 1.0}, np.unique(y)
-        assert y.sum() == 3                      # exactly one seat wins
+        assert set(np.unique(y)) <= {-1.0, 1.0}, np.unique(y)
+        assert y.sum() == 0                      # zero-sum across seats
 
     # A stub game through the real path. Nothing can be decided in 12 turns, so
-    # what this pins is that a DRAW yields None -- `valuedata` drops draws and
-    # keeping them would feed y=0 rows that say "seat 0 lost" about a game
-    # nobody lost.
+    # this pins that a draw remains in the data with value 0 for both seats.
     import tempfile
     from bot.policy.net import DEFAULT_CHANNELS, trunk_keys
     from learn.netoracle import publish, policy_keys
     rng = np.random.default_rng(0)
-    arch = {"layers": 2, "channels": DEFAULT_CHANNELS, "residual": False}
+    arch = {"layers": 2, "channels": DEFAULT_CHANNELS, "residual": False,
+            "context": False}
     p, prev = {}, features.C
     for name in trunk_keys(arch["layers"], arch["residual"]):
         p[f"{name}_w"] = (rng.normal(size=(arch["channels"], prev, 3, 3)) * 0.1).astype("f4")
@@ -229,7 +238,8 @@ def selfcheck() -> None:
         path = Path(td) / "ck.npz"
         publish(p, path)
         _init(str(path), 12)
-        assert _game((VS_SEED0, 17, 24, 2, 0)) is None, "a draw must yield no rows"
+        draw = _game((VS_SEED0, 17, 24, 2, 0))
+        assert draw is not None and np.all(draw[1] == 0), "a draw must target value 0"
 
         # And the shape/pairing on a decided game, forced by handing the packer a
         # winner directly rather than trying to win one in 12 turns.

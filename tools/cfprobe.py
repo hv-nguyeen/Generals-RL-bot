@@ -75,12 +75,12 @@ def outcome(winner: int, seat: int) -> float:
     return 0.0 if winner < 0 else (1.0 if winner == seat else -1.0)
 
 
-def _act(net: Net, obs, rng):
+def _act(net: Net, obs, rng, memory=None):
     """(index, mask, logits) from the masked softmax, sampled. Mirrors
     `learn.selfplay._act`, but also returns the logits: the build cell is chosen
     from the same forward the action came from rather than a second one."""
     mask = features.legal_mask(obs)
-    raw = net.logits(obs)
+    raw = net.logits(obs, memory=memory)
     lg = np.where(mask, raw, -np.inf)
     lg -= lg.max()
     p = np.exp(lg)

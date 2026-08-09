@@ -6,24 +6,32 @@ GROUPS ?= opening,castle,combat
 OPPONENTS ?= ours,hunter
 GAMES ?= 200
 
-.PHONY: help setup test verify bench gauntlet report tune tune-big diag diag-quick package submit-test profile clean
+.PHONY: help setup setup-cpu test verify bench gauntlet report tune tune-big diag diag-quick package submit-test profile clean
 
 help:
 	@grep -E '^[a-z-]+:.*?##' $(MAKEFILE_LIST) | sed 's/:.*##/\t/' | column -t -s "$$(printf '\t')"
 
 setup:  ## create the venv and install deps (uv if present, else stdlib venv)
 	@if command -v uv >/dev/null 2>&1; then \
-	  uv venv --python 3.12 .venv && uv pip install --python $(PY) numpy; \
+	  uv venv --python 3.12 .venv && uv pip install --python $(PY) -e .; \
 	else \
-	  python3 -m venv .venv && $(PY) -m pip install -q --upgrade pip && $(PY) -m pip install -q numpy; \
+	  python3 -m venv .venv && $(PY) -m pip install -q --upgrade pip && $(PY) -m pip install -q -e .; \
 	fi
 	@$(PY) -c "import sys,numpy;print('python',sys.version.split()[0],'numpy',numpy.__version__)"
-	@echo "optional, for 'make verify':  $(PY) -m pip install 'jax[cpu]'"
+
+setup-cpu: setup  ## install the CPU JAX stack for local training and verification
+	@if command -v uv >/dev/null 2>&1; then \
+	  uv pip install --python $(PY) -e '.[verify]'; \
+	else \
+	  $(PY) -m pip install -q -e '.[verify]'; \
+	fi
+	@$(PY) -c "import jax;print('jax',jax.__version__,jax.devices())"
 
 test:  ## rule and belief tests
 	$(PY) -m tests.test_all
 
-verify:  ## differential test against the official JAX engine
+verify:  ## official-engine differential + stateless/temporal encoder parity
+	$(PY) -m tools.migrate_configs --check configs/*.json
 	$(PY) -m tools.verify_engine --games 40 --max-turns 200 --encoders
 	$(PY) -m tests.test_all
 

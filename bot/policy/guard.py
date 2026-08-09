@@ -211,10 +211,13 @@ class GuardedPolicy:
         # the four-element group on both sides and read ~0 for a change that was
         # never actually tested. If a new option is added to `Net.logits`, it
         # must be added here too.
-        logits = np.where(mask, scored.logits(obs,
-                                              tta=getattr(self.inner, "tta", False),
-                                              full=getattr(self.inner, "full", False)),
-                          -np.inf)
+        if hasattr(self.inner, "score_logits"):
+            raw_logits = self.inner.score_logits(obs)
+        else:
+            raw_logits = scored.logits(obs,
+                                       tta=getattr(self.inner, "tta", False),
+                                       full=getattr(self.inner, "full", False))
+        logits = np.where(mask, raw_logits, -np.inf)
         gen = _my_general(obs)
         order = np.argsort(-logits)
         for rank, idx in enumerate(order):

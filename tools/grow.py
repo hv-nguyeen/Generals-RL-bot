@@ -51,11 +51,15 @@ from bot.policy.net import arch_of, arch_record, trunk_keys
 INIT_SCALE = 0.5
 
 
-def grow(z, layers: int, channels: int, seed: int = 0) -> dict:
+def grow(z, layers: int, channels: int, seed: int = 0,
+         context: bool | None = None) -> dict:
     arch = arch_of(z)
     if arch["residual"]:
         raise SystemExit("residual trunks pair into blocks; grow plain ones only")
     L, C = arch["layers"], arch["channels"]
+    target_context = arch["context"] if context is None else bool(context)
+    if arch["context"] and not target_context:
+        raise SystemExit("removing a trained context mixer is not function-preserving")
     if layers < L or channels < C:
         raise SystemExit(f"{L}x{C} cannot grow to {layers}x{channels}; both must not shrink")
 
@@ -95,6 +99,16 @@ def grow(z, layers: int, channels: int, seed: int = 0) -> dict:
         out[f"conv{j}_w"] = w
         out[f"conv{j}_b"] = np.zeros((channels,), np.float32)
 
+    if target_context:
+        # Adding the mixer at zero is exactly the old local trunk. If the source
+        # already had one, widen its per-channel scales just like a bias vector.
+        for key in ("context_global", "context_region"):
+            v = (np.asarray(z[key], np.float32) if arch["context"]
+                 else np.zeros((C,), np.float32))
+            nv = np.zeros((channels,), np.float32)
+            nv[:len(v)] = v
+            out[key] = nv
+
     # A CRITIC has the same trunk and a scalar head -- `v_w`/`v_b`, no `head_w`,
     # no `pass_w`. Reading those unconditionally meant `--init-critic` could not
     # cross an encoder change at all: the policy migrated, the critic raised
@@ -116,8 +130,18 @@ def grow(z, layers: int, channels: int, seed: int = 0) -> dict:
 
     if "v_w" in files:
         vw = np.asarray(z["v_w"], np.float32)
-        nvw = np.zeros((channels,) + vw.shape[1:], np.float32)
-        nvw[:vw.shape[0]] = vw
+        # Value heads concatenate a fixed number of channel-sized pooling
+        # blocks. Preserve every block when widening the trunk; treating the
+        # first dimension as a single block would silently discard regional
+        # features after the first one.
+        if vw.shape[0] % cout:
+            raise SystemExit(f"v_w first dimension {vw.shape[0]} is not a "
+                             f"multiple of source channels {cout}")
+        blocks = vw.shape[0] // cout
+        old = vw.reshape((blocks, cout) + vw.shape[1:])
+        grown = np.zeros((blocks, channels) + vw.shape[1:], np.float32)
+        grown[:, :cout] = old
+        nvw = grown.reshape((blocks * channels,) + vw.shape[1:])
         out["v_w"], out["v_b"] = nvw, np.asarray(z["v_b"], np.float32)
 
     if not ({"head_w", "v_w"} & files):
@@ -132,7 +156,7 @@ def grow(z, layers: int, channels: int, seed: int = 0) -> dict:
     stale = set(arch_record(out))
     for k in files:
         if (k not in out and k not in stale
-                and not k.startswith(("conv", "head", "pass", "v_"))):
+                and not k.startswith(("conv", "head", "pass", "v_", "context_"))):
             out[k] = z[k]
     out.update(arch_record(out))
     return out
@@ -253,6 +277,8 @@ def main() -> None:
     ap.add_argument("--channels", type=int)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--verify-games", type=int, default=12)
+    ap.add_argument("--context", action="store_true",
+                    help="add the global/regional mixer at zero (function-preserving)")
     ap.add_argument("--prefix", default=None, metavar="phi",
                     help="migrate the arrays under this prefix instead of the "
                          "whole file, and write them back under it. The critic "
@@ -307,7 +333,8 @@ def main() -> None:
     if args.prefix and not z:
         raise SystemExit(f"{args.net} has no {args.prefix}__* arrays")
     before = arch_of(z)
-    grown = grow(z, args.layers, args.channels, args.seed)
+    grown = grow(z, args.layers, args.channels, args.seed,
+                 True if args.context else None)
     tmp = Path(args.out)
     if args.prefix:
         # Written back under the prefix so `--init-critic` can read it, and
@@ -371,13 +398,22 @@ def selfcheck() -> None:
 
     import tempfile
     with tempfile.TemporaryDirectory() as d:
-        a, b = Path(d) / "a.npz", Path(d) / "b.npz"
+        a, b, c = Path(d) / "a.npz", Path(d) / "b.npz", Path(d) / "c.npz"
         np.savez(a, **p)
         np.savez(b, **grow(np.load(a), L + 2, C * 2))
         got = arch_of(np.load(b))
         assert (got["layers"], got["channels"]) == (L + 2, C * 2), got
         n, worst = _same_moves(str(a), str(b), 3, 12_345)
         assert worst < 1e-3, f"logit gap {worst:.2e} is too large to be round-off"
+
+        # Adding global/regional context at zero is also exactly the parent.
+        # This is the migration path used before a temporal/context fine-tune.
+        contextual = grow(np.load(a), L, C, context=True)
+        assert np.count_nonzero(contextual["context_global"]) == 0
+        assert np.count_nonzero(contextual["context_region"]) == 0
+        np.savez(c, **contextual)
+        nc, wc = _same_moves(str(a), str(c), 3, 22_345)
+        assert wc < 1e-6, f"zero context changed the parent by {wc:.2e}"
 
         # The new capacity must be TRAINABLE, not just harmless. Outgoing zero
         # with incoming zero is also function-preserving and is dead weight.
@@ -388,7 +424,8 @@ def selfcheck() -> None:
         idl = grow(np.load(a), L + 1, C)[f"conv{L}_w"]
         assert np.array_equal(idl[np.arange(C), np.arange(C), 1, 1], np.ones(C))
         assert idl.sum() == C, "identity layer has weight off the centre tap"
-    print(f"grow selfcheck OK ({n} positions identical, gap {worst:.2e})")
+    print(f"grow selfcheck OK ({n + nc} positions identical, max gap "
+          f"{max(worst, wc):.2e})")
 
 
 if __name__ == "__main__":

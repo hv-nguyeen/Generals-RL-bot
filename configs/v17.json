@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "expand": {
     "cap_neutral": 10.0,
     "reveal": 3.0,
@@ -128,5 +129,8 @@
   "thrust_home_safe": 0,
   "deathtouch_prep_turn": 730,
   "deathtouch_guard_turn": 770,
-  "time_budget_ms": 110.0
+  "time_budget_ms": 110.0,
+  "use_net": true,
+  "tta": true,
+  "tta_full": true
 }

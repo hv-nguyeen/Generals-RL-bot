@@ -15,6 +15,9 @@ import json
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 
+CONFIG_SCHEMA_VERSION = 1
+RETIRED_CONFIG_KEYS = {"general_reserve"}
+
 # Behaviour modes. The mode picks which distance field drives `progress` and
 # which weight block scores moves.
 EXPAND = "expand"
@@ -261,25 +264,76 @@ class Config:
     tta_full: bool = True
 
     # ------------------------------------------------------------------------
+    def to_dict(self) -> dict:
+        return {"schema_version": CONFIG_SCHEMA_VERSION, **asdict(self)}
+
     def save(self, path: str | Path) -> None:
-        Path(path).write_text(json.dumps(asdict(self), indent=2) + "\n")
+        Path(path).write_text(json.dumps(self.to_dict(), indent=2) + "\n")
 
     @classmethod
     def load(cls, path: str | Path) -> "Config":
-        return cls.from_dict(json.loads(Path(path).read_text()))
+        """Load a fully materialized, versioned config.
+
+        Training and evaluation must never inherit whatever defaults happen to
+        exist in a later checkout. Legacy partial files have an explicit
+        migration path instead of silently changing meaning here.
+        """
+        return cls.from_dict(json.loads(Path(path).read_text()), strict=True)
 
     @classmethod
-    def from_dict(cls, d: dict) -> "Config":
+    def from_dict(cls, d: dict, *, strict: bool = False) -> "Config":
+        if not isinstance(d, dict):
+            raise ValueError("config must be a JSON object")
+        d = dict(d)
+        version = d.pop("schema_version", None)
+        expected = {f.name for f in fields(cls)}
+        unknown = set(d) - expected
+        missing = expected - set(d)
+        if unknown:
+            raise ValueError(f"unknown config fields: {sorted(unknown)}")
+        if strict:
+            if version != CONFIG_SCHEMA_VERSION:
+                raise ValueError(f"config schema_version is {version!r}; expected "
+                                 f"{CONFIG_SCHEMA_VERSION}. Run "
+                                 "`python -m tools.migrate_configs <files>`.")
+            if missing:
+                raise ValueError(f"config is incomplete, missing {sorted(missing)}")
         cfg = cls()
         for f in fields(cls):
             if f.name not in d:
                 continue
             cur = getattr(cfg, f.name)
             if is_dataclass(cur):
-                setattr(cfg, f.name, type(cur)(**d[f.name]))
+                raw = d[f.name]
+                if not isinstance(raw, dict):
+                    raise ValueError(f"{f.name} must be an object")
+                names = {sub.name for sub in fields(cur)}
+                extra, absent = set(raw) - names, names - set(raw)
+                if extra or (strict and absent):
+                    raise ValueError(f"{f.name} fields: unknown={sorted(extra)}, "
+                                     f"missing={sorted(absent)}")
+                values = {sub.name: _typed(getattr(cur, sub.name), raw[sub.name],
+                                           f"{f.name}.{sub.name}")
+                          for sub in fields(cur) if sub.name in raw}
+                setattr(cfg, f.name, type(cur)(**values))
             else:
-                setattr(cfg, f.name, type(cur)(d[f.name]))
+                setattr(cfg, f.name, _typed(cur, d[f.name], f.name))
         return cfg
+
+    @classmethod
+    def migrate_legacy(cls, d: dict) -> "Config":
+        """Materialize a pre-schema config with today's explicit defaults.
+
+        Only known retired keys are discarded. Typos remain fatal so migration
+        cannot bless an accidental no-op knob.
+        """
+        if not isinstance(d, dict):
+            raise ValueError("config must be a JSON object")
+        raw = dict(d)
+        raw.pop("schema_version", None)
+        for key in RETIRED_CONFIG_KEYS:
+            raw.pop(key, None)
+        return cls.from_dict(raw, strict=False)
 
     # ---- flat vector view, for the parameter search ------------------------
     def flatten(self) -> tuple[list[str], list[float]]:
@@ -307,3 +361,20 @@ class Config:
                 cur = getattr(cfg, name)
                 setattr(cfg, name, type(cur)(round(v) if isinstance(cur, int) else v))
         return cfg
+
+
+def _typed(current, value, name: str):
+    """Validate JSON scalar types without Python's dangerous bool coercions."""
+    if isinstance(current, bool):
+        if not isinstance(value, bool):
+            raise ValueError(f"{name} must be boolean, got {value!r}")
+        return value
+    if isinstance(current, int):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{name} must be integer, got {value!r}")
+        return int(value)
+    if isinstance(current, float):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name} must be numeric, got {value!r}")
+        return float(value)
+    raise TypeError(f"unsupported config field {name}: {type(current).__name__}")

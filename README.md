@@ -9,8 +9,9 @@ arena and analysis tooling to make it better.
 opponent (`ours:configs/v16.json`), but it has been retired as a submission: it
 peaked around 1737 Elo and the net is ~130 above it.
 
-**Read [`docs/STATE.md`](docs/STATE.md) first.** It is the current standing, what
-is running, what to do next, and the measured non-starters; this README is the
+**Read [`docs/TOP3-V2-HANDOFF.md`](docs/TOP3-V2-HANDOFF.md) first.** It is the
+current implementation, gates, exact training sequence, and verification handoff.
+[`docs/STATE.md`](docs/STATE.md) remains the measured history. This README is the
 map of the tooling. [`docs/CLUSTER.md`](docs/CLUSTER.md) is how to run anything on
 the VU box. [`docs/ml-log.md`](docs/ml-log.md) is the full measured history.
 
@@ -19,7 +20,7 @@ Design and rules analysis: [`docs/superpowers/specs/2026-08-03-generals-bot-desi
 ## Quick start
 
 ```bash
-make setup      # venv + numpy (uses uv)
+make setup-cpu  # venv + package + numpy + CPU JAX (uses uv)
 make test       # rule and belief tests
 make verify     # simulator vs the official JAX engine, step for step
 make bench      # 40 games vs the greedy baseline
@@ -61,11 +62,15 @@ python -m tools.tune --out runs/tune1 --iters 20 --pop 12 --games 40 \
 
 # 5. ship
 make submit-test           # builds dist/generals-bot.zip AND plays it over stdio
+
+# 6. promote a neural checkpoint (all buckets + hashes + runtime/fault gates)
+python -m tools.evaluate --candidate runs/new.npz --reference runs/champ.npz \
+  --out runs/eval/new-vs-champ --workers 12
 ```
 
 `arena/runner.py` plays in-process against a numpy mirror of the competition
-engine, so 300 games take about 30 seconds on a laptop. Every seed is played
-twice with the colours swapped.
+engine. Every seed is played twice with the colours swapped. The promotion suite
+uses 2000 games per bucket; use `--games` only for a smoke test.
 
 The report classifies every loss (`early_rush`, `out_expanded`, `out_gathered`,
 `blundered`, `timeout`, `draw`), names the config knob each cause points at, and
@@ -79,9 +84,9 @@ mapping, the environment exports and why each exists, the missing tools and thei
 replacements, and a failure-symptom table. What follows is only what the rest of
 this README would otherwise imply and get wrong.
 
-`make setup` installs **numpy only**, because `bot/` is numpy-only by design. The
-training stack (jax + CUDA, ~5.5 GB) is not in it; CLUSTER.md has the pinned
-install and the node-to-node fallback for a box with no outbound network.
+`make setup` installs the package and numpy; `make setup-cpu` adds CPU JAX for
+local verification. The cluster needs its pinned CUDA JAX instead; CLUSTER.md
+has that install and the node-to-node fallback for a box with no network.
 
 Two facts that cost hours to rediscover:
 
@@ -129,20 +134,20 @@ Read out of the engine source, not the rules page:
 
 ```
 bot/            the submission. numpy only, self-contained
-  policy/net.py   THE BOT: conv net, argmax over masked logits
+  policy/net.py   THE BOT: local conv trunk + global/regional context
   policy/guard.py win-in-one and deathtouch overrides on top of the net
   policy/        controller (the heuristic fallback), analysis, castle siting
-  features.py   board -> 24 channels; the ONE encoder, shared with training
-  belief.py     terrain, fog memory, enemy-castle detection, general prior.
-                Used by the heuristic; the net does NOT see these maps
-  config.py     every tunable in one dataclass; flattens to a vector for tuning
+  features.py   board -> 40 channels; one-frame + temporal, shared with training
+  memory.py     observation-only temporal state used by net inference and data
+  belief.py     richer heuristic memory and enemy-general prior
+  config.py     versioned, fully materialized knobs; strict on file load
 sim/            exact numpy mirror of the competition transition + map generator
 learn/          the training stack (jax). selfplay is the one that produced the
                 shipped policy; train/ is behaviour cloning, exploit/ an exploiter
 arena/          parallel headless matches, agent registry, Elo + SPRT, stdio agent
 analysis/       replays, per-game stats, loss classifier, HTML viewer and report
-tools/          grow (migrate a checkpoint), vprobe (ask the critic), package,
-                verify_engine, sweep, tune (CEM), profile_turn
+tools/          grow, evaluate + manifests, vprobe, package, verify_engine,
+                sweep, tune (CEM), profile_turn
 third_party/    the official starter kit, for the differential test
 ```
 
@@ -217,11 +222,10 @@ them as `bot/config.json`, which `bot/main.py` picks up automatically.
 
 ## Current standing
 
-**See [`docs/STATE.md`](docs/STATE.md)** — it is updated per result and this
-section would only go stale. As of 2026-08-06: `sp16.best` on the ladder at 1864,
-rank 29 of 100, **65% over 228 games** against the previous champion's 45% over
-240. That is about 6 sigma and the first ladder-confirmed gain in the project.
-It measured +35.7 Elo [+20.7, +50.9] over 2000 arena games beforehand.
+As of 2026-08-08, the live leaderboard reports H.V.Nguyen at rank 29, Elo 1902,
+137W/96L/1D. The top three are ResBot 3212, Kubic 3121, and bca 3034. This is a
+large measured gap; the v2 changes create a credible training and promotion
+pipeline, not a guarantee that one run closes it. See the handoff for the gates.
 
 Two things worth knowing before running anything:
 

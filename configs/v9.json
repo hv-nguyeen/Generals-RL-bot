@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "expand": {
     "cap_neutral": 10.0,
     "reveal": 3.0,
@@ -87,6 +88,8 @@
   "first_expand_turn": 30,
   "lock_enabled": false,
   "lock_radius": 6,
+  "general_block_radius": 3,
+  "general_block_ratio": 0.5,
   "castle_enabled": true,
   "castle_min_turn": 45,
   "castle_max_turn": 900,
@@ -103,12 +106,15 @@
   "guard_radius": 3,
   "garrison_cap": 60,
   "garrison_from_turn": 40,
+  "corridor_defence": true,
+  "corridor_max_dist": 8,
   "attack_margin": 1.25,
   "attack_margin_unsure": 2.0,
   "probe_turn": 170,
   "located_candidates": 4,
   "attack_defense_frac": 0.2,
   "attack_trust_sight": true,
+  "attack_discount_committed": true,
   "gather_start_turn": 60,
   "gather_army_ratio": 1.05,
   "expand_floor": 3,
@@ -123,5 +129,8 @@
   "thrust_home_safe": 0,
   "deathtouch_prep_turn": 730,
   "deathtouch_guard_turn": 770,
-  "time_budget_ms": 110.0
+  "time_budget_ms": 110.0,
+  "use_net": true,
+  "tta": true,
+  "tta_full": true
 }

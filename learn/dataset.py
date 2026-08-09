@@ -23,9 +23,30 @@ import numpy as np
 from analysis.actions import _states_from, infer
 from analysis.official import read_replay, replay_files
 from bot import features
+from bot.memory import TemporalMemory
 from sim import engine
+from tools.manifest import file_set
 
 SHARD = 40_000
+
+
+def prepare_output(out: Path) -> int:
+    """Remove artifacts from an earlier complete or partial dataset build.
+
+    Writers restart at shard_0000 while readers glob every shard. Without this,
+    rebuilding a shorter dataset silently trains on old union new while the new
+    meta.json attests only to new. Call only after validating the input source.
+    """
+    out.mkdir(parents=True, exist_ok=True)
+    stale = sorted(out.glob("shard_*.npz"))
+    for path in stale:
+        path.unlink()
+    meta = out / "meta.json"
+    if meta.exists():
+        meta.unlink()
+    if stale:
+        print(f"removed {len(stale)} stale shards from {out}")
+    return len(stale)
 
 
 def _one(job) -> tuple[np.ndarray, np.ndarray, int] | None:
@@ -39,15 +60,21 @@ def _one(job) -> tuple[np.ndarray, np.ndarray, int] | None:
         return None
     acts, _ = infer(rep)
     states, _ = _states_from(rep)
+    memories = {seat: TemporalMemory(*states[0].armies.shape) for seat in seats}
     xs, ys = [], []
     seen = 0
     for t, pair in enumerate(acts):
+        obs_by_seat = {}
+        for seat in seats:
+            obs = engine.observe(states[t], seat)
+            memories[seat].update(obs)
+            obs_by_seat[seat] = obs
         seen += len(seats)
         if pair is None:
             continue
         for seat in seats:
-            obs = engine.observe(states[t], seat)
-            xs.append(features.encode(obs))
+            obs = obs_by_seat[seat]
+            xs.append(features.encode(obs, memories[seat]))
             ys.append(features.action_to_index(pair[seat]))
     if not xs:
         return None
@@ -56,7 +83,6 @@ def _one(job) -> tuple[np.ndarray, np.ndarray, int] | None:
 
 def build(src: Path, out: Path, players: set[str] | None, exclude: set[str],
           workers: int, limit: int) -> None:
-    out.mkdir(parents=True, exist_ok=True)
     # `analysis.official` stores one player per directory, each with its own
     # `replays/`, so a field harvest of ten players is ten of those under one
     # root and pointing this at the root found nothing. Same fix as
@@ -70,7 +96,10 @@ def build(src: Path, out: Path, players: set[str] | None, exclude: set[str],
         print(f"{len(dirs)} sources, {len(files)} replays")
     if limit:
         files = files[:limit]
+    if not files:
+        raise SystemExit(f"no replay files under {src}")
     jobs = [(f, players, exclude) for f in files]
+    prepare_output(out)
 
     xs: list[np.ndarray] = []
     ys: list[np.ndarray] = []
@@ -104,7 +133,10 @@ def build(src: Path, out: Path, players: set[str] | None, exclude: set[str],
 
     meta = {"examples": kept, "games": games, "ticks_seen": seen,
             "channels": features.C, "pad": features.PAD,
-            "n_actions": features.N_ACTIONS}
+            "n_actions": features.N_ACTIONS,
+            "included_players": sorted(players) if players is not None else None,
+            "excluded_players": sorted(exclude),
+            "source_replays": file_set(files, src)}
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
     print(f"\n{kept} examples from {games} games -> {out}")
     print(f"  recovery {100.0 * kept / max(seen, 1):.1f}% of player-ticks")
@@ -117,12 +149,29 @@ def main() -> None:
     ap.add_argument("--out", default="/local/data/vng205/bc")
     ap.add_argument("--players", default=None,
                     help="comma-separated; default = everyone except ourselves")
+    ap.add_argument("--leaderboard", type=Path, default=None,
+                    help="leaderboard.json written by analysis.official harvest --top")
+    ap.add_argument("--top", type=int, default=10,
+                    help="with --leaderboard, clone only the top N user players")
+    ap.add_argument("--min-elo", type=int, default=None,
+                    help="with --leaderboard, additionally require this Elo")
     ap.add_argument("--exclude", default="H.V.Nguyen,Expander (baseline),Hunter (baseline)")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--workers", type=int, default=8)
     args = ap.parse_args()
 
+    if args.players and args.leaderboard:
+        raise SystemExit("use either --players or --leaderboard, not both")
     players = set(p.strip() for p in args.players.split(",")) if args.players else None
+    if args.leaderboard:
+        board = json.loads(args.leaderboard.read_text())
+        rows = board.get("leaderboard", board)
+        rows = [r for r in rows if r.get("kind") == "user"
+                and (args.min_elo is None or int(r.get("elo", 0)) >= args.min_elo)]
+        players = {r["label"] for r in rows[:args.top]}
+        if not players:
+            raise SystemExit("leaderboard filters selected no players")
+        print("expert seats: " + ", ".join(sorted(players)))
     exclude = set(p.strip() for p in args.exclude.split(",") if p.strip())
     build(Path(args.src), Path(args.out), players, exclude, args.workers, args.limit)
 

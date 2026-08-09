@@ -1,7 +1,8 @@
 """Fit the critic's temperature, because accuracy and evar punish different things.
 
-`learn/valuetrain.py` selects on ACCURACY. `learn/selfplay.py` reads the critic
-through `tanh` and is judged by `evar`, which is a squared-error score. A model
+`learn/valuetrain.py` selects on held-out explained variance and calibration.
+`learn/selfplay.py` reads the critic through `tanh` and is also judged by
+`evar`. A model
 can win the first and lose the second by being overconfident: right 64% of the
 time while saying 0.9, it scores 0.638 accuracy and NEGATIVE explained variance,
 because each of the 36% it gets wrong costs (V - z)^2 close to 3.6.
@@ -12,11 +13,9 @@ run it was loaded into opened at `evar -0.11` and fell to -0.38 -- worse than a
 predictor that cannot see the board, from the very first iteration, before any
 online training had touched it.
 
-`load_critic` already divides the head by 2, converting valuetrain's sigmoid
-logit into the tanh argument the trainer wants: 2*sigma(l) - 1 == tanh(l/2)
-exactly. That conversion is right and it is not enough. It fixes the UNITS and
-assumes a temperature of 1; an overconfident fit needs T > 1 on top, and the
-only way to know T is to measure it.
+Schema-2 critics already use direct {-1,0,+1} targets and transfer without a
+unit conversion. Legacy sigmoid critics are still supported and retain the
+historical factor-of-two conversion.
 
 So: sweep T on held-out data, score with the metric the run is actually judged
 by, and write the rescaled critic. The head is linear, so dividing `v_w`/`v_b`
@@ -32,6 +31,7 @@ temperature is not the problem and the fit itself is too weak to use.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -56,7 +56,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True, help="critic from learn.valuetrain")
-    ap.add_argument("--data", required=True, help="shard dir it was fitted on")
+    ap.add_argument("--data", action="append", required=True,
+                    help="shard directory used for fitting; repeat in training order")
     ap.add_argument("--out", default="", help="write the rescaled critic here")
     ap.add_argument("--rows", type=int, default=40_000,
                     help="held-out rows sampled across ALL shards")
@@ -77,35 +78,65 @@ def main() -> None:
     p = {k: jnp.asarray(v) for k, v in raw.items() if k not in arch_record(raw)}
     print(f"critic {arch_of(raw)} from {args.model}")
 
-    # Sampled WITHIN every shard, not the last shard: `valuedata` writes shards
-    # in source order, so holding out the tail holds out a source. Same reason
-    # `valuetrain.split` exists.
+    schema = int(raw.get("value_schema", 1))
+    sidecar = Path(args.model).with_suffix(".json")
+    model_meta = json.loads(sidecar.read_text()) if sidecar.is_file() else {}
+    val_keys = {(int(v["source"]), int(v["game"]))
+                for v in model_meta.get("validation_game_keys", [])}
+    # Compatibility with schema-2 files produced before multi-source support.
+    val_keys.update((0, int(v)) for v in model_meta.get("validation_game_ids", []))
+    if schema >= 2 and not val_keys:
+        raise SystemExit("schema-2 calibration requires validation_game_keys in the "
+                         "model sidecar; retrain with the current valuetrain")
+
+    # Schema 2 uses the exact complete-game holdout that selected the model.
+    # Legacy files predate game IDs and retain the old sampled fallback.
     rng = np.random.default_rng(args.seed)
-    shards = sorted(Path(args.data).glob("shard_*.npz"))
+    data_dirs = [Path(p) for p in args.data]
+    expected_sources = model_meta.get("data_sources")
+    actual_sources = [str(p.resolve()) for p in data_dirs]
+    if schema >= 2 and expected_sources and expected_sources != actual_sources:
+        raise SystemExit("--data sources or order differ from the critic sidecar: "
+                         f"expected {expected_sources}, got {actual_sources}")
+    shards = [(si, f) for si, d in enumerate(data_dirs)
+              for f in sorted(d.glob("shard_*.npz"))]
     if not shards:
-        raise SystemExit(f"no shard_*.npz in {args.data}")
-    xs, ys = [], []
+        raise SystemExit("no shard_*.npz in " + ", ".join(map(str, data_dirs)))
+    xs, ys, gs = [], [], []
     per = max(args.rows // len(shards), 1)
-    for f in shards:
+    for source, f in shards:
         d = np.load(f)
         n = len(d["y"])
-        m = rng.choice(n, size=min(per, n), replace=False)
+        if schema >= 2:
+            wanted = [game for src, game in val_keys if src == source]
+            candidates = np.flatnonzero(np.isin(d["game"], wanted))
+            if not len(candidates):
+                continue
+            m = rng.choice(candidates, size=min(per, len(candidates)), replace=False)
+        else:
+            m = rng.choice(n, size=min(per, n), replace=False)
         xs.append(d["x"][m])
         ys.append(d["y"][m])
+        if schema >= 2:
+            # Metrics must not merge equal raw ids from different sources.
+            gs.append(np.asarray([(source << 56) | int(g) for g in d["game"][m]],
+                                 np.int64))
+    if not xs:
+        raise SystemExit("no rows matched the model's validation games")
     x = np.concatenate(xs)
     y = np.concatenate(ys)
-    print(f"{len(shards)} shards, {len(y)} held-out rows, win rate {y.mean():.3f}")
+    print(f"{len(shards)} shards, {len(y)} held-out rows, mean target {y.mean():+.3f}")
 
     logit = np.concatenate([
         np.asarray(jax.jit(vt.forward)(p, jnp.asarray(x[i:i + 4096], jnp.float32)))
         for i in range(0, len(x), 4096)]).astype(np.float64).ravel()
-    # valuetrain's label is {0, 1}; the trainer's return is {-1, +1}. Same event.
-    zt = 2.0 * y.astype(np.float64) - 1.0
+    zt = (y.astype(np.float64) if schema >= 2
+          else 2.0 * y.astype(np.float64) - 1.0)
 
     print(f"\nlogit mean {logit.mean():+.3f} sd {logit.std():.3f}   "
           f"mean P(win) {float((1/(1+np.exp(-logit))).mean()):.3f}")
     print(f"\n{'T':>6} {'mean V':>8} {'sd V':>7} {'evar':>8}   "
-          f"(load_critic applies T=2 today)")
+          f"(raw direct-value temperature for schema 2)")
     best, best_t = -1e9, 1.0
     for t in (0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0):
         v = np.tanh(logit / t)
@@ -116,9 +147,15 @@ def main() -> None:
             mark = "  <-"
         print(f"{t:>6.1f} {v.mean():>+8.3f} {v.std():>7.3f} {e:>+8.4f}{mark}")
 
-    at2 = evar(zt, np.tanh(logit / 2.0))
+    load_t = 1.0 if schema >= 2 else 2.0
+    at_load = evar(zt, np.tanh(logit / load_t))
     print(f"\nbest T {best_t:.1f} -> evar {best:+.4f}   "
-          f"(T=2, what load_critic does now: {at2:+.4f})")
+          f"(loader T={load_t:g}: {at_load:+.4f})")
+    calibrated_metrics = None
+    if schema >= 2:
+        calibrated_metrics = vt.metrics(zt, np.tanh(logit / best_t), np.concatenate(gs))
+        print(f"calibrated game-balanced evar {calibrated_metrics['evar']:+.4f}, "
+              f"ece {calibrated_metrics['ece']:.4f}")
     if best <= 0.0:
         print("\nNO TEMPERATURE HELPS. evar is <= 0 at every T, so the fit itself "
               "carries too little signal for this trainer -- more data or a "
@@ -131,14 +168,27 @@ def main() -> None:
 
     if args.out:
         # The head is linear in the trunk features, so scaling it IS the
-        # temperature. `load_critic` will then halve it again, so pre-multiply by
-        # 2 to land on exactly best_t overall rather than 2*best_t.
+        # temperature. Legacy models are halved by load_critic; schema-2 models
+        # are already in direct-value units and receive no hidden scaling.
         out = {k: np.asarray(z0[k]) for k in z0.files}
-        out["v_w"] = np.asarray(out["v_w"], np.float32) * (2.0 / best_t)
-        out["v_b"] = np.asarray(out["v_b"], np.float32) * (2.0 / best_t)
+        scale = load_t / best_t
+        out["v_w"] = np.asarray(out["v_w"], np.float32) * scale
+        out["v_b"] = np.asarray(out["v_b"], np.float32) * scale
         np.savez(args.out, **out)
-        print(f"\nwrote {args.out} (head scaled by {2.0 / best_t:.4f}; "
-              f"load_critic's own halving then lands it at T={best_t:.1f})")
+        if model_meta:
+            model_meta["temperature"] = best_t
+            model_meta["temperature_evar"] = best
+            if calibrated_metrics is not None:
+                model_meta["metrics"] = calibrated_metrics
+                control = model_meta.get("control", {})
+                model_meta["gate_passed"] = bool(
+                    calibrated_metrics["target_var"] > 0.05
+                    and calibrated_metrics["decided_frac"] > 0.1
+                    and calibrated_metrics["evar"] - float(control.get("evar", 1e9)) >= 0.02
+                    and calibrated_metrics["ece"] <= 0.15)
+            Path(args.out).with_suffix(".json").write_text(
+                json.dumps(model_meta, indent=2) + "\n")
+        print(f"\nwrote {args.out} (head scaled by {scale:.4f}, T={best_t:.1f})")
     raise SystemExit(0)
 
 

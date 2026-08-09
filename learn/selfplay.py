@@ -276,6 +276,7 @@ import json
 import math
 import multiprocessing as mp
 import os
+import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -284,6 +285,7 @@ import numpy as np
 
 from arena import agents
 from bot import features, rules
+from bot.memory import TemporalMemory
 from bot.policy.net import Net, arch_of, arch_record
 from learn.league import stderr
 from learn.netoracle import (ADV_CLIP, ANCHOR_HI, ANCHOR_LO, BETA0, BETA_MAX,
@@ -424,9 +426,14 @@ def numpy_forward(params, x: np.ndarray) -> np.ndarray:
     hb = np.asarray(params["head_b"], np.float32)
     pw = np.asarray(params["pass_w"], np.float32)
     pb = float(params["pass_b"])
+    cg = (np.asarray(params["context_global"], np.float32)
+          if arch["context"] else None)
+    cr = (np.asarray(params["context_region"], np.float32)
+          if arch["context"] else None)
     out = []
     for row in np.asarray(x, dtype=np.float32):
         h = npnet._trunk(row, layers, arch["residual"])
+        h = npnet._context_mix(h, row[features.VALID], cg, cr)
         move = npnet._conv3x3(h, hw, hb)
         pass_logit = float(pw @ h.mean(axis=(1, 2)) + pb)
         out.append(np.concatenate(
@@ -599,7 +606,7 @@ def _init(live: str, specs: tuple, max_turns: int, cf_frac: float = 0.0) -> None
     _CTX.update(live=live, specs=specs, max_turns=max_turns, cf_frac=cf_frac)
 
 
-def _act(net: Net, obs, rng):
+def _act(net: Net, obs, rng, memory: TemporalMemory | None = None):
     """(index, mask, log prob, probs) from the masked softmax. `rng` None means
     argmax.
 
@@ -607,8 +614,10 @@ def _act(net: Net, obs, rng):
     the SAME forward the action came from. Calling `net.logits` a second time
     would be both wasted work and a second chance for the two to disagree.
     """
+    if memory is not None:
+        memory.update(obs)
     mask = features.legal_mask(obs)        # PASS is always legal: never empty
-    lg = np.where(mask, net.logits(obs), -np.inf)
+    lg = np.where(mask, net.logits(obs, memory=memory), -np.inf)
     lg -= lg.max()
     p = np.exp(lg)
     p /= p.sum()
@@ -616,7 +625,8 @@ def _act(net: Net, obs, rng):
     return idx, mask, float(np.log(p[idx])), p
 
 
-def _continue(st, net: Net, seat: int, turn0: int, max_turns: int, forced, rng):
+def _continue(st, net: Net, seat: int, turn0: int, max_turns: int, forced, rng,
+              memories: list[TemporalMemory]):
     """Play `st` to terminal from turn `turn0`.
 
     Returns (z for `seat`, final state, `seat`'s encoded observation one step
@@ -631,16 +641,19 @@ def _continue(st, net: Net, seat: int, turn0: int, max_turns: int, forced, rng):
     and drift apart on their own.
     """
     x1 = None
+    memories = [m.copy() for m in memories]
     for turn in range(turn0, max_turns + 1):
         acts = [None, None]
         for s in (0, 1):
-            idx, _, _, _ = _act(net, engine.observe(st, s), rng)
+            idx, _, _, _ = _act(net, engine.observe(st, s), rng, memories[s])
             acts[s] = features.index_to_action(idx)
             if turn == turn0 and s == seat and forced is not None:
                 acts[s] = forced
         over = engine.step(st, acts[0], acts[1])
         if turn == turn0:
-            x1 = features.encode(engine.observe(st, seat)).astype(np.float16)
+            obs1 = engine.observe(st, seat)
+            memories[seat].update(obs1)
+            x1 = features.encode(obs1, memories[seat]).astype(np.float16)
         if over:
             break
     return outcome(st.winner, seat), st, x1
@@ -662,7 +675,7 @@ def _fork(seed: int, res: list, pick, net: Net, max_turns: int) -> dict | None:
     if not have:
         return None
     k = have[0] if len(have) == 1 else int(pick.random() < 0.5)
-    snap, x_fork, mask_fork, turn0, seat, r, c = res[k]
+    snap, memory_snap, x_fork, mask_fork, turn0, seat, r, c = res[k]
 
     forced = (rules.BUILD, r, c, 0, 0)
     # `x1` is the board the forced build produced, seen by the seat that paid for
@@ -672,9 +685,9 @@ def _fork(seed: int, res: list, pick, net: Net, max_turns: int) -> dict | None:
     # deliberate: five runs have died of a critic whose evar collapsed, and
     # off-distribution states are the direct way to cause that.
     zb, stb, x1 = _continue(snap.copy(), net, seat, turn0, max_turns, forced,
-                            np.random.default_rng([seed, turn0]))
+                            np.random.default_rng([seed, turn0]), memory_snap)
     zc, _, _ = _continue(snap.copy(), net, seat, turn0, max_turns, None,
-                         np.random.default_rng([seed, turn0]))
+                         np.random.default_rng([seed, turn0]), memory_snap)
     return {
         "cf_x_fork": x_fork,
         "cf_x": x1,
@@ -709,12 +722,14 @@ def _rollout(job):
     st = engine.from_grid(grid)
     net = Net(_CTX["live"])
     max_turns = _CTX["max_turns"]
+    memories = [TemporalMemory(*grid.shape) for _ in range(2)]
 
     if mode:
         foe = agents.make(_CTX["specs"][mode - 1], 1 - seat, *grid.shape, seed)
         faults, turns = 0, 0
         for turns in range(1, max_turns + 1):
-            idx, _, _, _ = _act(net, engine.observe(st, seat), None)
+            idx, _, _, _ = _act(net, engine.observe(st, seat), None,
+                                 memories[seat])
             acts = [None, None]
             acts[seat] = features.index_to_action(idx)
             try:
@@ -751,11 +766,12 @@ def _rollout(job):
     for turns in range(1, max_turns + 1):
         acts = [None, None]
         snap = None
+        memory_snap = [m.copy() for m in memories] if do_cf else None
         for s in (0, 1):
             obs = engine.observe(st, s)
-            idx, mask, lp, probs = _act(net, obs, rng)
+            idx, mask, lp, probs = _act(net, obs, rng, memories[s])
             xs, ids, masks, lps = buf[s]
-            enc = features.encode(obs).astype(np.float16)
+            enc = features.encode(obs, memories[s]).astype(np.float16)
             xs.append(enc)
             ids.append(idx)
             masks.append(mask)
@@ -783,7 +799,7 @@ def _rollout(job):
                                                cost) else 1
                     seen[k] += 1
                     if pick.random() < 1.0 / seen[k]:
-                        res[k] = (snap, enc, mask, turns, s, r, c)
+                        res[k] = (snap, memory_snap, enc, mask, turns, s, r, c)
         if engine.step(st, acts[0], acts[1]):
             break
 
@@ -819,6 +835,7 @@ def load_resume(path: Path) -> dict | None:
     if not path.exists():
         return None
     z = np.load(path)
+    value_schema = int(z["value_schema"]) if "value_schema" in z.files else 1
     if "__scalars__" not in z.files:
         return None                       # a pre-single-file checkpoint
     return {"arrays": {k: z[k] for k in z.files if k != "__scalars__"},
@@ -857,6 +874,7 @@ def load_critic(path: str, arch: dict, blank: dict) -> dict:
     raises here rather than producing quiet nonsense 200 iterations in.
     """
     z = np.load(path)
+    value_schema = int(z["value_schema"]) if "value_schema" in z.files else 1
     got = _unflat("phi", {k: z[k] for k in z.files})
     standalone = not got
     if not got:
@@ -873,6 +891,15 @@ def load_critic(path: str, arch: dict, blank: dict) -> dict:
         got = {k: z[k] for k in z.files}
     if not got:
         raise SystemExit(f"{path} is empty")
+    if standalone and value_schema >= 2:
+        sidecar = Path(path).with_suffix(".json")
+        if not sidecar.is_file():
+            raise SystemExit(f"schema-2 critic {path} is missing its validation "
+                             f"sidecar {sidecar}")
+        meta = json.loads(sidecar.read_text())
+        if meta.get("gate_passed") is not True:
+            raise SystemExit(f"schema-2 critic {path} did not pass its held-out "
+                             "board-signal and calibration gate")
     try:
         a = arch_of(got)
     except ValueError as e:
@@ -880,7 +907,7 @@ def load_critic(path: str, arch: dict, blank: dict) -> dict:
             f"{path} has no critic in it ({e}). Expected either a run's "
             f".resume.npz (critic under phi__*) or a standalone value model "
             f"from `learn.valuetrain` (bare conv*/v_w keys).") from e
-    for k in ("layers", "channels", "residual"):
+    for k in ("layers", "channels", "residual", "context"):
         if a[k] != arch[k]:
             raise SystemExit(
                 f"critic in {path} is {a['layers']}x{a['channels']} "
@@ -892,7 +919,18 @@ def load_critic(path: str, arch: dict, blank: dict) -> dict:
     # loudly. `tools.grow` writes them into everything it produces, so a migrated
     # critic arrives with three keys the freshly built one does not have, and an
     # exact key match rejected it.
-    got = {k: v for k, v in got.items() if k not in arch_record(got)}
+    metadata = set(arch_record(got)) | {"value_schema", "value_pool"}
+    got = {k: v for k, v in got.items() if k not in metadata}
+    # Migrate the historical mean-only head into the v2 pooled head. The first
+    # block of ``valuetrain.pooled`` is the same global mean, so zero-filling the
+    # remaining max/regional weights preserves the function exactly.
+    if ("v_w" in got and "v_w" in blank
+            and np.shape(got["v_w"]) != np.shape(blank["v_w"])
+            and np.ndim(got["v_w"]) == np.ndim(blank["v_w"]) == 1
+            and len(blank["v_w"]) > len(got["v_w"])):
+        migrated = np.zeros_like(blank["v_w"], dtype=np.float32)
+        migrated[:len(got["v_w"])] = got["v_w"]
+        got["v_w"] = migrated
     if set(got) != set(blank):
         missing = sorted(set(blank) - set(got)) or None
         extra = sorted(set(got) - set(blank)) or None
@@ -901,7 +939,7 @@ def load_critic(path: str, arch: dict, blank: dict) -> dict:
         if tuple(np.shape(got[k])) != tuple(np.shape(v)):
             raise SystemExit(f"critic {k} is {np.shape(got[k])}, expected {np.shape(v)}")
     got = {k: np.asarray(got[k], np.float32) for k in blank}
-    if standalone:
+    if standalone and value_schema < 2:
         # HALVE THE HEAD. `learn/valuetrain.py` fits the SAME `forward` under
         # `logaddexp(0, l) - y*l`, so its output is a SIGMOID logit: P(win) is
         # sigma(l). This trainer reads that function through `tanh(l)` against
@@ -1132,7 +1170,8 @@ def selfcheck() -> None:
 
     # --- a checkpoint round-trips into the loader the SUBMISSION uses, with
     #     exactly the keys bot/policy/net.py requires
-    arch = {"layers": 4, "channels": DEFAULT_CHANNELS, "residual": False}
+    arch = {"layers": 4, "channels": DEFAULT_CHANNELS, "residual": False,
+            "context": False}
     p, prev = {}, features.C
     for name in trunk_keys(arch["layers"], arch["residual"]):
         p[f"{name}_w"] = (rng.normal(size=(arch["channels"], prev, 3, 3)) * 0.1).astype("f4")
@@ -1190,6 +1229,8 @@ def selfcheck() -> None:
             assert r["x"].shape == (3, features.C, features.PAD, features.PAD)
             assert r["logp"].shape == (3,) and np.all(r["logp"] <= 0.0)
             assert 2 <= r["dist"] <= 6
+            assert np.any(r["x"][:, features.BASE_C:] != 0), (
+                "self-play rollout zeroed every temporal plane")
         # --- the CPU rollout can now BUILD, which is the point of phase 1 and
         #     needs no GPU: `_rollout` routes index_to_action(idx) straight into
         #     engine.step, and a build index has to survive that trip. Under the
@@ -1217,8 +1258,11 @@ def selfcheck() -> None:
         # survives every other assertion in this block: both buffers still exist
         # and still differ, they are merely swapped.
         fresh = engine.from_grid(mapgen.generate(seed, 2, 6))
+        fresh_memory = [TemporalMemory(*fresh.armies.shape) for _ in range(2)]
         for r in got:
-            want = features.encode(engine.observe(fresh, r["seat"])).astype(np.float16)
+            obs0 = engine.observe(fresh, r["seat"])
+            fresh_memory[r["seat"]].update(obs0)
+            want = features.encode(obs0, fresh_memory[r["seat"]]).astype(np.float16)
             assert np.array_equal(r["x"][0], want), r["seat"]
 
         # --- counterfactual forks. Three properties, all of which fail SILENTLY
@@ -1378,7 +1422,10 @@ def main() -> None:
                          "iterations 3-5. Then (A-B)/A is the update's share")
     ap.add_argument("--minibatch", type=int, default=4096)
     ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--critic-lr", type=float, default=1e-3)
+    ap.add_argument("--critic-lr", type=float, default=1e-4,
+                    help="critic Adam step. 1e-3 memorised the on-policy buffer "
+                         "in measured full-distance runs; 1e-4 is the safe "
+                         "transfer default")
     ap.add_argument("--value-head", choices=("scalar", "hlgauss"), default="scalar",
                     help="scalar is tanh+MSE and is THE DEFAULT. hlgauss is a "
                          "distributional head; with our 3-atom return support it "
@@ -1462,8 +1509,8 @@ def main() -> None:
                     help="the same idea UPWARD: share of training boards drawn "
                          "from the final stage with distance beyond this "
                          "stage's dmax. Stage 4 is (17,24) and the ladder is "
-                         "17+ unbounded -- measured over 600 real games, 69% "
-                         "fall in 17-24 and 31% above, so stage 4 never sees a "
+                         "17+ unbounded -- measured over 600 real games, 69%% "
+                         "fall in 17-24 and 31%% above, so stage 4 never sees a "
                          "third of what it is evaluated on. 0.31 reconstructs "
                          "the real histogram. Before reaching for that, note "
                          "the two measured dose points: 0.0 produced the only "
@@ -1503,11 +1550,11 @@ def main() -> None:
     ap.add_argument("--max-turns", type=int, default=rules.TURN_LIMIT)
     ap.add_argument("--probe", type=int, default=0, metavar="ITERS",
                     help="CHEAP HYPOTHESIS TEST, run this before the night. Pins "
-                         "stage 0, disables promotion, runs ITERS iterations and "
-                         "prints whether the critic ever explained --warm-evar of "
-                         "the return at distance 2-6. That is the whole claim: if "
-                         "it fails, reward density was never the problem and the "
-                         "overnight run answers nothing. ~10 min at 60 workers")
+                         "--start-stage, disables promotion, runs ITERS "
+                         "iterations and prints whether the critic ever reaches "
+                         "--warm-evar on that distance distribution. Use stage "
+                         "0 to test reward density or stage 5 to test a critic's "
+                         "full-competition transfer. ~10 min at 60 workers")
     ap.add_argument("--backend", choices=("cpu", "gpu", "scan"), default="cpu",
                     help="rollout backend for TRAINING games only. cpu is the "
                          "process pool and stays the default until the gpu path "
@@ -1607,8 +1654,8 @@ def main() -> None:
         raise SystemExit(f"--scan-chunk {args.scan_chunk} must be a positive "
                          f"divisor of --max-turns {args.max_turns}")
     if args.probe:
-        # Everything the probe does is subtraction: no promotion (so stage 0 is
-        # pinned without a second code path), no comp-eval past the iteration-0
+        # Everything the probe does is subtraction: no promotion (so the chosen
+        # --start-stage is pinned without a second code path), no comp-eval past the iteration-0
         # baseline, no 800-game final gate.
         args.iters = args.probe
         args.stage_eval_every = args.comp_eval_every = args.probe + 1
@@ -1685,12 +1732,20 @@ def main() -> None:
     jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
     print("devices:", jax.devices())
 
-    z0 = np.load(args.init)
+    raw0 = np.load(args.init)
     arch = bc.resolve_arch(args.init, None, None, None)
     keys = policy_keys(arch)
-    missing = keys - set(z0.files)
+    missing = keys - set(raw0.files)
     if missing:
         raise SystemExit(f"{args.init} is not a policy checkpoint, missing {sorted(missing)}")
+    z0 = {k: np.asarray(raw0[k]) for k in keys}
+    if z0["conv0_w"].shape[1] == features.BASE_C and features.C > features.BASE_C:
+        old = z0["conv0_w"]
+        stem = np.zeros((old.shape[0], features.C, 3, 3), np.float32)
+        stem[:, :features.BASE_C] = old
+        z0["conv0_w"] = stem
+        print(f"policy input migration: {features.BASE_C} -> {features.C} channels "
+              "with zero temporal columns (function-preserving)")
     ch = arch["channels"]
     want = {"conv0_w": (ch, features.C, 3, 3),
             "head_w": (features.PER_CELL, ch, 3, 3)}
@@ -1719,11 +1774,13 @@ def main() -> None:
         # SAME KEYS, wider. `arch_of` run-length-scans conv*/res* only, so
         # reshaping v_w is invisible to it; `opt_v`, `_flat("phi", ...)` and the
         # resume are comprehensions over phi.items() and need no change; and
-        # `vt.forward` -- (B, ch) @ (ch, m) + (m,) -- returns (B, m) logits with
+        # `vt.forward` -- (B, ch * VALUE_POOL) @ (ch * VALUE_POOL, m) + (m,)
+        # -- returns (B, m) logits with
         # no edit at all, so valuetrain.main() and tools/calibrate keep the
         # scalar head they were written against.
         phi["v_w"] = jax.random.normal(jax.random.fold_in(
-            jax.random.PRNGKey(args.seed), 8), (ch, args.hl_bins)) * 0.01
+            jax.random.PRNGKey(args.seed), 8),
+            (ch * vt.VALUE_POOL, args.hl_bins)) * 0.01
         phi["v_b"] = jnp.zeros((args.hl_bins,))
     if args.init_critic:
         # AFTER the hlgauss reshape, so the shape check compares against the head
@@ -1876,6 +1933,11 @@ def main() -> None:
     warmed, low, rewinds = False, 0, 0
     best_score, best_iter = -1.0, -1
     best_theta = dict(theta_init)
+    # The critic selected on the SAME comp-eval as best_theta. A run's ordinary
+    # resume carries the latest phi, which may be dozens of updates newer than
+    # the policy written to --out; exporting that pair as if it matched made the
+    # next run's warm start an uncontrolled distribution shift.
+    best_phi = {k: np.asarray(v) for k, v in phi.items()}
     stage_theta = dict(theta_init)   # what stage_ref currently holds
     base_score = None
     comp_low = 0
@@ -1893,7 +1955,9 @@ def main() -> None:
         phi = {k: jnp.asarray(v) for k, v in _unflat("phi", a).items()}
         # A --value-head mismatch here is a shape error deep inside a jitted
         # v_step, hours after the preemption this resume exists to survive.
-        want_v = ((ch, args.hl_bins) if args.value_head == "hlgauss" else (ch,))
+        want_v = ((ch * vt.VALUE_POOL, args.hl_bins)
+                  if args.value_head == "hlgauss"
+                  else (ch * vt.VALUE_POOL,))
         if phi["v_w"].shape != want_v:
             raise SystemExit(f"--resume: this checkpoint's critic head is "
                              f"{tuple(phi['v_w'].shape)} but --value-head "
@@ -1903,6 +1967,16 @@ def main() -> None:
         opt_v = {k: (jnp.asarray(v), jnp.asarray(_unflat("optv_v", a)[k]))
                  for k, v in _unflat("optv_m", a).items()}
         best_theta = _unflat("best", a)
+        stored_best_phi = _unflat("bestphi", a)
+        if stored_best_phi:
+            best_phi = stored_best_phi
+        else:
+            # Backward compatibility for old runs. The final transfer probe is
+            # still mandatory, so this approximation cannot silently enter a
+            # league; new checkpoints always carry bestphi.
+            best_phi = {k: np.asarray(v) for k, v in phi.items()}
+            print("WARNING resume predates matched best-critic storage; using "
+                  "its latest critic and requiring the transfer probe", flush=True)
         # Restore the promotion gate's opponent too: without it the gate silently
         # re-anchors to wherever the policy happened to be at the restart, which
         # makes every post-preemption promotion decision incomparable with the
@@ -2021,9 +2095,11 @@ def main() -> None:
           f"({per_opp} games each, progress), "
           "stage-eval this policy's own stage-entry weights (promotion only)")
     if args.probe:
-        print(f"PROBE: stage 0 only, {args.iters} iterations, no promotion, no "
-              f"gate. The question is whether evar reaches {args.warm_evar:.2f} "
-              "at distance 2-6.", flush=True)
+        pdmin, pdmax, _ = STAGES[stage]
+        distance_label = "+" if pdmax is None else f"-{pdmax}"
+        print(f"PROBE: stage {stage} only, {args.iters} iterations, no promotion, "
+              f"no gate. The question is whether evar reaches "
+              f"{args.warm_evar:.2f} at distance {pdmin}{distance_label}.", flush=True)
     started = time.time()
     evar_max = float("-inf")
 
@@ -2186,8 +2262,9 @@ def main() -> None:
             return float(1.0 - ((r - v).var() / rv)) if rv > 1e-9 else float("nan")
 
         # The ceiling-free control: least squares on ALL the broadcast scalar
-        # planes, which are constant over the grid, so `features.CLOCK:` at any
-        # cell is the whole feature vector. A predictor with no board at all, fit
+        # planes, which are constant over the grid. The temporal suffix also
+        # contains spatial planes, so the scalar indices are explicit. A
+        # predictor with no board at all, fit
         # on the same subset, facing the same martingale ceiling. `evar_l - sc_l
         # <= 0` says the critic extracts nothing the clock does not already give;
         # both low and equal says the state does not contain it and no value loss
@@ -2201,7 +2278,11 @@ def main() -> None:
         # draw, and every sc number printed after the migration was a different
         # instrument under the old name. Anchored to the first scalar channel
         # instead of counted back from the end, so it survives the next one.
-        sc = np.c_[xs[:, features.CLOCK:, 0, 0].astype(np.float32), np.ones(n, np.float32)]
+        scalar_idx = list(range(features.CLOCK, features.BASE_C)) + [
+            features.DELTA_MY_ARMY, features.DELTA_OPP_ARMY,
+            features.DELTA_LAND_ADV]
+        sc = np.c_[xs[:, scalar_idx, 0, 0].astype(np.float32),
+                   np.ones(n, np.float32)]
 
         def _evar_scalars(m):
             a, r = sc[m], ret[m]
@@ -2461,6 +2542,7 @@ def main() -> None:
             mark = ""
             if score > best_score:
                 best_score, best_iter, best_theta = score, it, cur
+                best_phi = {k: np.asarray(v) for k, v in phi.items()}
                 publish(cur, out.with_suffix(".best.npz"))
                 mark = "  <- kept"
             if base_score is None:
@@ -2563,6 +2645,7 @@ def main() -> None:
                          **_flat("optv_m", {k: np.asarray(v[0]) for k, v in opt_v.items()}),
                          **_flat("optv_v", {k: np.asarray(v[1]) for k, v in opt_v.items()}),
                          **_flat("best", best_theta),
+                         **_flat("bestphi", best_phi),
                          **_flat("stageref", stage_theta),
                          **_flat("init", theta_init)},
                         {"it": it, "stage": stage, "over": over,
@@ -2577,18 +2660,18 @@ def main() -> None:
     if args.probe:
         pool.shutdown()
         ok = evar_max >= args.warm_evar
-        print(f"\nPROBE over {args.iters} iterations at stage 0 "
-              f"({STAGES[0][0]}-{STAGES[0][1]}): best evar {evar_max:+.3f}, "
+        pdmin, pdmax, _ = STAGES[stage]
+        distance_label = "+" if pdmax is None else f"-{pdmax}"
+        print(f"\nPROBE over {args.iters} iterations at stage {stage} "
+              f"(distance {pdmin}{distance_label}): best evar {evar_max:+.3f}, "
               f"needs {args.warm_evar:+.3f}")
-        print("VERDICT: " + ("the outcome IS predictable from the state at short "
-                             "generals distance, so the critic has something to "
-                             "fit and the overnight run is worth its night."
+        print("VERDICT: " + ("the critic DOES explain the on-policy return at "
+                             "this distance, so the overnight run has cleared "
+                             "its value-transfer precondition."
                              if ok else
-                             "the critic explains nothing even at distance 2-6. "
-                             "Reward density was NEVER the problem -- the "
-                             "curriculum cannot fix this and the overnight run "
-                             "would answer nothing. Record it in docs/ml-log.md "
-                             "and go and look for a different cause."))
+                             "the critic does not explain the on-policy return at "
+                             "this distance. Do not launch the overnight run; "
+                             "refit or change the critic and repeat this probe."))
         print(f"({time.time() - started:.0f}s)")
         return
 
@@ -2609,6 +2692,13 @@ def main() -> None:
     margin = 2 * stderr(min(len(r_a), len(r_b))) * 2 ** 0.5
     accepted = bool(score - init_score > margin)
     publish(best_theta, out)
+    # A load_critic-compatible, policy-matched warm start. It intentionally uses
+    # the run/resume `phi__*` layout rather than masquerading as a standalone
+    # schema-2 offline critic with a validation sidecar it does not have.
+    critic_out = out.with_suffix(".critic.npz")
+    critic_tmp = critic_out.with_suffix(".tmp.npz")
+    np.savez(critic_tmp, **_flat("phi", best_phi))
+    os.replace(critic_tmp, critic_out)
     publish({k: np.asarray(v) for k, v in theta.items()}, out.with_suffix(".last.npz"))
     out.with_suffix(".json").write_text(json.dumps(
         {"accepted": accepted, "score": round(score, 4),
@@ -2621,7 +2711,18 @@ def main() -> None:
     print(f"\ngate on {len(gate)} fresh competition-distance games: trained "
           f"{score:.3f} vs init {init_score:.3f}, needs +{margin:.3f} -> "
           f"{'ACCEPTED' if accepted else 'REJECTED'}   (reached stage {stage})")
-    print(f"wrote {out}  ({time.time() - started:.0f}s)")
+    print(f"wrote {out} with matched critic {critic_out}  "
+          f"({time.time() - started:.0f}s)")
+    from tools import manifest
+    inputs = [args.init, out, critic_out, out.with_suffix(".last.npz")]
+    if args.init_critic:
+        inputs.append(args.init_critic)
+    manifest.write(out.with_suffix(".manifest.json"), command=sys.argv,
+                   artifacts=inputs,
+                   extra={"kind": "curriculum-ppo", "args": vars(args),
+                          "gate": {"accepted": accepted, "score": score,
+                                   "init_score": init_score, "margin": margin},
+                          "stage_reached": stage, "opponents": opp_specs})
     print("Confirm it before believing it:")
     print(f"  python -m arena.runner --a clone:{out} --b ours:configs/v16.json "
           f"--games 400 --workers {args.workers}")

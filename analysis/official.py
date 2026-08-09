@@ -38,6 +38,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -99,6 +100,14 @@ def _get(url: str, tries: int = 4) -> dict:
 
 def fetch_profile(player: str) -> dict:
     return _get(f"{API}?profile={urllib.parse.quote(player)}")
+
+
+def fetch_leaderboard() -> list[dict]:
+    data = _get(API)
+    rows = data.get("leaderboard") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        raise ValueError("leaderboard API returned no leaderboard list")
+    return rows
 
 
 def fetch_matches(player: str) -> list[dict]:
@@ -463,7 +472,19 @@ def cmd_harvest(args) -> None:
     out = Path(args.out)
     (out / "replays").mkdir(parents=True, exist_ok=True)
     seen: set[int] = set()
-    for name in [p.strip() for p in args.players.split(",") if p.strip()]:
+    if args.top:
+        board = fetch_leaderboard()
+        ranked = [r for r in board if r.get("kind") == "user"]
+        chosen = ranked[:args.top]
+        names = [r["label"] for r in chosen]
+        (out / "leaderboard.json").write_text(json.dumps(
+            {"fetched_utc": datetime.now(timezone.utc).isoformat(),
+             "selected_top": args.top, "leaderboard": board}, indent=2))
+        print("top field: " + ", ".join(
+            f"#{i + 1} {r['label']} ({r.get('elo')})" for i, r in enumerate(chosen)))
+    else:
+        names = [p.strip() for p in args.players.split(",") if p.strip()]
+    for name in names:
         try:
             matches = fetch_matches(name)
         except Exception as e:                       # noqa: BLE001
@@ -533,7 +554,10 @@ def main() -> None:
     f.set_defaults(func=cmd_fetch)
 
     h = sub.add_parser("harvest", help="download many players' games (free ground truth)")
-    h.add_argument("--players", required=True, help="comma-separated names")
+    hg = h.add_mutually_exclusive_group(required=True)
+    hg.add_argument("--players", help="comma-separated names")
+    hg.add_argument("--top", type=int,
+                    help="use the live top N non-baseline leaderboard players")
     h.add_argument("--out", default="/local/data/vng205/replays")
     h.add_argument("--limit", type=int, default=150,
                    help="most recent N games per player; 0 = all")

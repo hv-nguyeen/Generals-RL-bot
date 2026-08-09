@@ -124,14 +124,15 @@ def make_step(forward):
     from generals.core import game as jgame
 
     @jax.jit
-    def step(states, h, w, theta, key, t, ended, winner):
+    def step(states, h, w, theta, key, t, ended, winner, memory):
         n = h.shape[0]
         obs = jax.tree.map(
             lambda a, b: jnp.concatenate([a, b]),
             jax.vmap(jgame.get_observation, in_axes=(0, None))(states, 0),
             jax.vmap(jgame.get_observation, in_axes=(0, None))(states, 1))
         hh, ww = jnp.concatenate([h, h]), jnp.concatenate([w, w])
-        x = jax.vmap(rlenv.encode_jax)(obs, hh, ww)
+        memory = jax.vmap(rlenv.update_memory_jax)(memory, obs)
+        x = jax.vmap(rlenv.encode_jax)(obs, hh, ww, memory)
         mask = jax.vmap(rlenv.legal_mask_jax)(obs)
         # -1e9 and not -inf: this is the masking `netoracle.policy_loss` and
         # `ref_logp_of` use, and the stored logp has to be the density those
@@ -150,7 +151,8 @@ def make_step(forward):
         first = (ended < 0) & info.is_done
         return (states, x.astype(jnp.float16), jnp.packbits(mask, axis=1),
                 a_idx, logp,
-                jnp.where(first, t, ended), jnp.where(first, info.winner, winner))
+                jnp.where(first, t, ended), jnp.where(first, info.winner, winner),
+                memory)
 
     return step
 
@@ -180,13 +182,14 @@ def rollout(step, pool, idx: np.ndarray, theta, key, max_turns: int) -> list[dic
     h, w = pool["h"][jnp.asarray(idx)], pool["w"][jnp.asarray(idx)]
     ended = jnp.full(n, -1, jnp.int32)
     winner = jnp.full(n, -1, jnp.int32)
+    memory = rlenv.empty_memory_jax(2 * n)
 
     xs, ms, ids, lps = [], [], [], []
     steps = 0
     for t in range(max_turns):
         key, sub = jr.split(key)
-        states, x, packed, a_idx, logp, ended, winner = step(
-            states, h, w, theta, sub, jnp.int32(t), ended, winner)
+        states, x, packed, a_idx, logp, ended, winner, memory = step(
+            states, h, w, theta, sub, jnp.int32(t), ended, winner, memory)
         hx, hp, hi, hl = _to_host(x, packed, a_idx, logp)
         # `[None]` so the parts are `(1, 2n, ...)` and `_join` is the same
         # concatenate the scan path uses. It is a view; it costs nothing.
@@ -369,19 +372,19 @@ def make_scan(step, chunk: int):
     import jax.random as jr
 
     @jax.jit
-    def run(states, h, w, theta, key, t0, ended, winner):
+    def run(states, h, w, theta, key, t0, ended, winner, memory):
         def body(carry, _):
-            states, key, t, ended, winner = carry
+            states, key, t, ended, winner, memory = carry
             key, sub = jr.split(key)
-            states, x, packed, a_idx, logp, ended, winner = step(
-                states, h, w, theta, sub, t, ended, winner)
+            states, x, packed, a_idx, logp, ended, winner, memory = step(
+                states, h, w, theta, sub, t, ended, winner, memory)
             # `t` is ABSOLUTE, which is why it is carried and not a scan index.
             # `step` latches `ended = where(first, t, ended)`, so restarting the
             # counter at 0 each chunk would silently shorten every game that
             # ends after chunk 0 -- shapes stay consistent, z stays right, and
             # the tail of every decided game just vanishes from the buffer.
-            return (states, key, t + 1, ended, winner), (x, packed, a_idx, logp)
-        return jax.lax.scan(body, (states, key, t0, ended, winner), None,
+            return (states, key, t + 1, ended, winner, memory), (x, packed, a_idx, logp)
+        return jax.lax.scan(body, (states, key, t0, ended, winner, memory), None,
                             length=chunk)
     return run
 
@@ -433,12 +436,13 @@ def rollout_scan(run, pool, idx: np.ndarray, theta, key, max_turns: int,
     h, w = pool["h"][jnp.asarray(idx)], pool["w"][jnp.asarray(idx)]
     ended = jnp.full(n, -1, jnp.int32)
     winner = jnp.full(n, -1, jnp.int32)
+    memory = rlenv.empty_memory_jax(2 * n)
 
     xs, ms, ids, lps = [], [], [], []
     steps = 0
     for t0 in range(0, max_turns, chunk):
-        (states, key, _, ended, winner), (x, m, i_, l_) = run(
-            states, h, w, theta, key, jnp.int32(t0), ended, winner)
+        (states, key, _, ended, winner, memory), (x, m, i_, l_) = run(
+            states, h, w, theta, key, jnp.int32(t0), ended, winner, memory)
         hx, hm, hi, hl = _to_host(x, m, i_, l_)
         xs.append(hx)
         ms.append(hm)
@@ -474,8 +478,9 @@ def selfcheck() -> None:
     theta = bc.init_params(key, {"layers": 4, "channels": 8, "residual": False})
     states = jax.tree_util.tree_map(lambda a: a[jnp.arange(n)], pool["states"])
     out = step(states, pool["h"], pool["w"], theta, key, jnp.int32(0),
-               jnp.full(n, -1, jnp.int32), jnp.full(n, -1, jnp.int32))
-    states2, x, packed, a_idx, logp, ended, winner = out
+               jnp.full(n, -1, jnp.int32), jnp.full(n, -1, jnp.int32),
+               rlenv.empty_memory_jax(2 * n))
+    states2, x, packed, a_idx, logp, ended, winner, memory = out
     assert x.shape == (2 * n, features.C, features.PAD, features.PAD), x.shape
     assert packed.shape == (2 * n, MASK_BYTES), packed.shape
     assert packed.dtype == np.uint8, packed.dtype
@@ -506,6 +511,7 @@ def selfcheck() -> None:
                    [:, :features.N_ACTIONS] != 0), m), "device unpack != host unpack"
     assert int(np.asarray(states2.time)[0]) == 1
     assert np.all(np.asarray(ended) == -1) and np.all(np.asarray(winner) == -1)
+    assert np.asarray(memory["initialised"]).all()
 
     # seat rows: row i and row n + i are the SAME board seen by the two players,
     # so they must differ (own fog) but share the VALID channel

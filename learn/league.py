@@ -109,9 +109,9 @@ call -- the gate verdict and its per-opponent bracket -- and both come from
 netoracle's stdout, which is worth reading live: it prints a kill checklist.
 
 An `oracle-nn-*` row in the table is a NETWORK. If it wins max-min, this writes
-`<out>.npz` and STOPS: `bot/main.py` builds a Controller and nothing else, so a
-neural winner is a result, not a submission. Read that before booking a night on
-`--oracle net`.
+`<out>.npz`. It becomes a submission candidate only after the promotion suite
+passes and that exact file is copied to `bot/weights.npz` for hash-locked
+packaging.
 
     # Does this deserve a night on the cluster? One oracle call against v12
     # alone, plus a control against v16. ~1 hour.
@@ -126,7 +126,8 @@ neural winner is a result, not a submission. Read that before booking a night on
     # The league with the wider oracle class. Each --oracle net iteration costs
     # ~1 h of GPU on top of the CEM budget.
     python -m learn.league --dir runs/league-nn --out runs/league-nn/best.json \
-        --oracle both --nn-init /local/data/vng205/clone.npz --nn-iters 200 \
+        --oracle both --nn-init runs/top3-v2/incumbent-c40-context.npz \
+        --nn-init-critic runs/top3-v2/incumbent-value.npz --nn-iters 200 \
         --iters 6 --gens 4 --pop 20 --elite 5 --games 48 --pair-games 48 \
         --maps runs/bigmaps.json --workers 60
 
@@ -543,6 +544,33 @@ def oracle(base: Config, specs: list[str], sigma: np.ndarray, *, space: list, po
 
 # --------------------------------------------------------------------------
 # archive + checkpoint
+def net_oracle_command(args, npz: Path, ckpt: Path,
+                       maps: str | None, it: int) -> list[str]:
+    """Materialise the neural subprocess command, including every train knob.
+
+    Keeping this pure makes the forwarding contract testable without importing
+    JAX or launching a multi-hour oracle. These values also live in the league
+    resume identity below, so a resumed payoff matrix cannot silently change
+    the optimiser that produced its members.
+    """
+    cmd = [sys.executable, "-m", "learn.netoracle",
+           "--league", str(ckpt), "--init", args.nn_init, "--out", str(npz),
+           "--workers", str(args.workers), "--iters", str(args.nn_iters),
+           "--games", str(args.nn_games), "--max-turns", str(args.max_turns),
+           "--epochs", str(args.nn_epochs),
+           "--minibatch", str(args.nn_minibatch),
+           "--lr", str(args.nn_lr),
+           "--critic-lr", str(args.nn_critic_lr),
+           "--warm-evar", str(args.nn_warm_evar),
+           "--sigma-floor", str(args.nn_sigma_floor),
+           "--seed", str(args.seed + 1000 * it)]
+    if args.nn_init_critic:
+        cmd += ["--init-critic", args.nn_init_critic]
+    if maps:
+        cmd += ["--maps", maps]
+    return cmd
+
+
 def net_oracle(args, out: Path, ckpt: Path, maps: str | None, it: int) -> tuple[Path, dict]:
     """Widen the oracle class: PPO best response to sigma. Returns (weights, gate).
 
@@ -558,14 +586,7 @@ def net_oracle(args, out: Path, ckpt: Path, maps: str | None, it: int) -> tuple[
     """
     npz = (out / "nn" / f"oracle-nn-{it}.npz").resolve()
     npz.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [sys.executable, "-m", "learn.netoracle",
-           "--league", str(ckpt), "--init", args.nn_init, "--out", str(npz),
-           "--workers", str(args.workers), "--iters", str(args.nn_iters),
-           "--games", str(args.nn_games), "--max-turns", str(args.max_turns),
-           "--sigma-floor", str(args.nn_sigma_floor),
-           "--seed", str(args.seed + 1000 * it)]
-    if maps:
-        cmd += ["--maps", maps]
+    cmd = net_oracle_command(args, npz, ckpt, maps, it)
     print(f"\n  neural oracle: {' '.join(cmd)}", flush=True)
     try:
         subprocess.run(cmd, check=True)
@@ -597,7 +618,7 @@ def materialise(members: list[dict], cfgdir: Path) -> None:
     for m in members:
         if m.get("config") is not None:
             path = (cfgdir / f"{m['name']}.json").resolve()
-            path.write_text(json.dumps(m["config"], indent=2) + "\n")
+            Config.from_dict(m["config"]).save(path)
             m["spec"] = f"ours:{path}"
 
 
@@ -714,6 +735,16 @@ def runoff(state: dict, mins: np.ndarray, top: int, games: int, workers: int,
     return max(fresh, key=fresh.get), fresh
 
 
+def serialise_runoff(fresh: dict[int, float]) -> dict[str, float]:
+    """JSON-safe runoff scores keyed by archive index.
+
+    ``runoff`` returns a sparse dict because only the finalists are replayed.
+    Treating it like a NumPy array (`fresh.tolist()`) crashed both terminal
+    league paths after all games had finished and before the manifest landed.
+    """
+    return {str(int(i)): float(score) for i, score in sorted(fresh.items())}
+
+
 # --------------------------------------------------------------------------
 def selfcheck() -> None:
     # Rock-paper-scissors: the unique Nash is uniform.
@@ -729,6 +760,10 @@ def selfcheck() -> None:
     w = fictitious_play(dom, 20_000)
     assert w[3] < 0.01, w
     assert np.abs(w[:3] - 1 / 3).max() < 0.03, w
+
+    record = serialise_runoff({3: np.float64(0.625), 1: 0.5})
+    assert record == {"1": 0.5, "3": 0.625}
+    assert json.loads(json.dumps(record)) == record
 
     # Every searched field's default lies inside its range, so encode() does not
     # silently clip and the round trip below is testing something real.
@@ -873,10 +908,24 @@ def main() -> None:
                          "that iteration if the net fails its gate, so the archive "
                          "always grows. both: append both. net/both need --nn-init")
     ap.add_argument("--nn-init", default=None,
-                    help="behaviour clone .npz the neural oracle starts from and "
-                         "anchors to; from random weights it never learns the game")
+                    help="trained policy .npz the neural oracle starts from and "
+                         "anchors to; use the incumbent/accepted curriculum "
+                         "candidate, never random weights")
+    ap.add_argument("--nn-init-critic", default=None,
+                    help="gated critic passed to every neural oracle warm start")
     ap.add_argument("--nn-iters", type=int, default=200)
     ap.add_argument("--nn-games", type=int, default=256, help="rollout games per PPO iteration")
+    ap.add_argument("--nn-epochs", type=int, default=1,
+                    help="passes over each neural-oracle rollout buffer")
+    ap.add_argument("--nn-minibatch", type=int, default=4096)
+    ap.add_argument("--nn-lr", type=float, default=1e-4,
+                    help="neural-oracle policy learning rate")
+    ap.add_argument("--nn-critic-lr", type=float, default=1e-4,
+                    help="neural-oracle critic learning rate. 1e-3 memorised "
+                         "the buffer in measured full-distance runs")
+    ap.add_argument("--nn-warm-evar", type=float, default=0.10,
+                    help="keep the neural-oracle policy frozen until its critic "
+                         "reaches this explained variance")
     ap.add_argument("--nn-sigma-floor", type=float, default=0.15,
                     help="uniform mass mixed into sigma for the neural oracle's "
                          "TRAINING opponents. `support 1` in the table above means "
@@ -907,9 +956,11 @@ def main() -> None:
 
     if args.oracle != "config":
         if not args.nn_init:
-            raise SystemExit(f"--oracle {args.oracle} needs --nn-init <clone.npz>")
+            raise SystemExit(f"--oracle {args.oracle} needs --nn-init <policy.npz>")
         if not Path(args.nn_init).exists():
             raise SystemExit(f"--nn-init not found: {args.nn_init}")
+        if args.nn_init_critic and not Path(args.nn_init_critic).exists():
+            raise SystemExit(f"--nn-init-critic not found: {args.nn_init_critic}")
 
     out = Path(args.dir)
     (out / "candidates").mkdir(parents=True, exist_ok=True)
@@ -926,8 +977,12 @@ def main() -> None:
     # What a payoff entry MEANS is fixed by these; a resume that changes one of
     # them mixes entries measured on different boards or budgets into one matrix,
     # and check_antisymmetry cannot see it because each entry is self-consistent.
-    params = {k: getattr(args, k) for k in
-              ("pair_games", "games", "maps", "max_turns", "group", "params")}
+    params = {k: getattr(args, k) for k in (
+        "pair_games", "games", "runoff_games", "maps", "max_turns",
+        "oracle", "group", "params", "gens", "pop", "elite", "spread",
+        "floor", "base", "seed", "nn_init", "nn_init_critic", "nn_iters",
+        "nn_games", "nn_epochs", "nn_minibatch", "nn_lr",
+        "nn_critic_lr", "nn_warm_evar", "nn_sigma_floor")}
 
     if args.resume:
         if not ckpt.exists():
@@ -1046,8 +1101,22 @@ def main() -> None:
 
     dest = Path(args.out) if args.out else out / "best.json"
     dest.parent.mkdir(parents=True, exist_ok=True)
+
+    def write_manifest(result: Path) -> None:
+        from tools import manifest
+        inputs = [ckpt, result]
+        for item in (args.nn_init, args.nn_init_critic, args.maps):
+            if item:
+                inputs.append(item)
+        manifest.write(result.with_suffix(".manifest.json"), command=sys.argv,
+                       artifacts=inputs,
+                       extra={"kind": "psro-league", "args": vars(args),
+                              "winner": winner,
+                              "fresh_min": serialise_runoff(fresh),
+                              "sigma": sigma.tolist(), "params": params})
+
     if winner.get("config") is not None:
-        dest.write_text(json.dumps(winner["config"], indent=2) + "\n")
+        Config.from_dict(winner["config"]).save(dest)
     elif winner["spec"].startswith("ours:"):
         Config.load(winner["spec"][5:]).save(dest)
     elif winner["spec"].startswith("clone:"):
@@ -1056,11 +1125,12 @@ def main() -> None:
         wdest = dest.with_suffix(".npz")
         shutil.copy(winner["spec"][6:], wdest)
         print(f"wrote {wdest} -- the max-min member is a network, not a config. "
-              f"bot/main.py builds a Controller and nothing else, so this is NOT "
-              f"shippable through the submission path yet.")
+              f"Copy it to bot/weights.npz and package it only after the "
+              f"promotion suite passes.")
         print("Confirm it first:")
         print(f"  python -m arena.runner --a clone:{wdest} --b ours:configs/v16.json "
               f"--games 400 --workers {args.workers}")
+        write_manifest(wdest)
         return
     else:
         # A hand-written baseline with the best worst case is itself a result:
@@ -1076,6 +1146,7 @@ def main() -> None:
         (Config.from_dict(m["config"]) if m.get("config")
          else Config.load(m["spec"][5:])).save(dest)
     print(f"wrote {dest}")
+    write_manifest(dest)
     print("Confirm before submitting:")
     print(f"  python -m arena.runner --a ours:{dest} --b ours:configs/v16.json "
           f"--games 400 --workers {args.workers}")

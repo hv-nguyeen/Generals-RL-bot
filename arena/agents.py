@@ -10,6 +10,7 @@ A spec is a string so runs are reproducible from a command line:
     random                   uniform over legal moves
     idle                     always passes
     clone:weights.npz        a behaviour-cloned policy (learn/train.py)
+    search:policy|value      top-K policy moves reranked by a gated value model
     tta:weights.npz          the same policy, logits averaged over the 8 symmetries
     ship:weights.npz         EXACTLY what bot/main.py packages: net + tta + guard
     ship8:weights.npz        the same, pinned to the full 8-element group
@@ -390,6 +391,12 @@ def make(spec: str, player_id: int, h: int, w: int, seed: int = 0):
     if name == "clone":
         from bot.policy.net import ClonePolicy
         return ClonePolicy(player_id, h, w, arg)
+    if name == "search":
+        from bot.policy.search import SearchPolicy
+        policy, sep, critic = arg.partition("|")
+        if not sep:
+            raise ValueError("search spec is search:POLICY|CRITIC")
+        return SearchPolicy(player_id, h, w, policy, critic)
     if name == "tta":
         # `tta:weights.npz` is `clone:` with the same weights, averaging the
         # logits over the board's dihedral group instead of reading one

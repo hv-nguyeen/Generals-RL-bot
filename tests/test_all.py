@@ -205,6 +205,37 @@ def test_a_new_structure_in_fog_is_read_as_an_enemy_castle():
     assert b.enemy_castles.sum() == 1
 
 
+def test_temporal_enemy_history_survives_recapture():
+    from bot.memory import TemporalMemory
+    from bot.obs import Obs
+
+    ty = np.full((3, 3), rules.T_PLAIN, np.int8)
+    owner = np.zeros((3, 3), np.int8)
+    army = np.zeros((3, 3), np.int32)
+    owner[1, 1], army[1, 1] = rules.OWNER_OPP, 7
+    mem = TemporalMemory(3, 3)
+    mem.update(Obs(3, 3, 1, 1, 1, 1, 7, ty, owner, army))
+    assert mem.ever_enemy[1, 1]
+    owner = owner.copy(); army = army.copy()
+    owner[1, 1], army[1, 1] = rules.OWNER_ME, 2
+    mem.update(Obs(3, 3, 2, 2, 3, 0, 0, ty, owner, army))
+    assert mem.ever_enemy[1, 1], "EVER_ENEMY must encode history, not current owner"
+
+
+def test_temporal_memory_copy_is_independent():
+    from bot.memory import TemporalMemory
+
+    mem = TemporalMemory(4, 5)
+    mem.mem_army[1, 2] = 17
+    mem.ever_seen[1, 2] = True
+    copied = mem.copy()
+    copied.mem_army[1, 2] = 3
+    copied.ever_seen[0, 0] = True
+    assert mem.mem_army[1, 2] == 17
+    assert not mem.ever_seen[0, 0]
+    assert copied.H == mem.H and copied.W == mem.W
+
+
 def test_room_field_matches_a_direct_count():
     grid = mapgen.generate(5)
     passable = grid != -2
@@ -287,7 +318,8 @@ def test_a_checkpoint_states_its_own_architecture():
             p = weights(layers, ch, residual)
             np.savez(td / "w.npz", **p, **npnet.arch_record(p))
             net = npnet.Net(str(td / "w.npz"))
-            assert net.arch == {"layers": layers, "channels": ch, "residual": residual}
+            assert net.arch == {"layers": layers, "channels": ch,
+                                "residual": residual, "context": False}
             assert net.logits(obs).shape == (features.N_ACTIONS,)
 
         # a residual file whose keys were renamed into a plain stack has entirely
@@ -342,6 +374,216 @@ def test_a_checkpoint_states_its_own_architecture():
                 pass
 
 
+def test_legacy_24_channel_policy_migration_preserves_its_function():
+    import tempfile
+    from pathlib import Path
+
+    from bot import features
+    from bot.policy import net as npnet
+
+    rng = np.random.default_rng(91)
+    ch = 6
+    p = {
+        "conv0_w": rng.normal(0, .1, (ch, features.BASE_C, 3, 3)).astype("f4"),
+        "conv0_b": rng.normal(0, .1, ch).astype("f4"),
+        "head_w": rng.normal(0, .1, (features.PER_CELL, ch, 3, 3)).astype("f4"),
+        "head_b": rng.normal(0, .1, features.PER_CELL).astype("f4"),
+        "pass_w": rng.normal(0, .1, ch).astype("f4"),
+        "pass_b": np.float32(.2),
+    }
+    x = np.zeros((features.C, features.PAD, features.PAD), np.float32)
+    x[:features.BASE_C] = rng.normal(size=x[:features.BASE_C].shape)
+    old_h = np.maximum(npnet._conv3x3(x[:features.BASE_C], p["conv0_w"],
+                                      p["conv0_b"]), 0)
+    old_move = npnet._conv3x3(old_h, p["head_w"], p["head_b"])
+    old = np.concatenate([np.transpose(old_move, (1, 2, 0)).reshape(-1),
+                          [float(p["pass_w"] @ old_h.mean(axis=(1, 2)) + p["pass_b"])]])
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "legacy24.npz"
+        np.savez(path, **p, **npnet.arch_record(p))
+        got = npnet.Net(str(path))._logits_from(x)
+    assert np.allclose(got, old, atol=1e-6), np.max(np.abs(got - old))
+
+
+def test_configs_are_strict_and_legacy_migration_is_explicit():
+    import json
+    import tempfile
+    from dataclasses import asdict
+    from pathlib import Path
+
+    from bot.config import Config
+
+    cfg = Config()
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "c.json"
+        cfg.save(path)
+        assert asdict(Config.load(path)) == asdict(cfg)
+        raw = json.loads(path.read_text())
+        raw.pop("guard_radius")
+        path.write_text(json.dumps(raw))
+        try:
+            Config.load(path)
+            raise AssertionError("strict loader accepted a missing field")
+        except ValueError:
+            pass
+        raw["guard_radius"] = cfg.guard_radius
+        raw["typo_radius"] = 3
+        try:
+            Config.from_dict(raw, strict=True)
+            raise AssertionError("strict loader accepted an unknown field")
+        except ValueError:
+            pass
+    legacy = asdict(cfg)
+    legacy.pop("guard_radius")
+    legacy["general_reserve"] = 2
+    assert Config.migrate_legacy(legacy).guard_radius == Config().guard_radius
+
+
+def test_league_materialises_strict_configs():
+    import tempfile
+    from dataclasses import asdict
+    from pathlib import Path
+
+    from bot.config import Config
+    from learn.league import materialise
+
+    members = [{"name": "oracle-0", "spec": "", "config": asdict(Config())}]
+    with tempfile.TemporaryDirectory() as td:
+        materialise(members, Path(td))
+        path = Path(members[0]["spec"].removeprefix("ours:"))
+        assert Config.load(path).to_dict() == Config().to_dict()
+
+
+def test_league_forwards_safe_neural_optimizer_settings():
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from learn.league import net_oracle_command
+
+    args = SimpleNamespace(
+        nn_init="incumbent.npz", nn_init_critic="critic.npz",
+        workers=60, nn_iters=200, nn_games=256, max_turns=1200,
+        nn_epochs=1, nn_minibatch=2048, nn_lr=7e-5,
+        nn_critic_lr=1e-4, nn_warm_evar=0.12,
+        nn_sigma_floor=0.25, seed=3)
+    cmd = net_oracle_command(args, Path("oracle.npz"), Path("league.json"),
+                             "maps.json", 2)
+
+    def value(flag):
+        return cmd[cmd.index(flag) + 1]
+
+    assert value("--init") == "incumbent.npz"
+    assert value("--init-critic") == "critic.npz"
+    assert value("--epochs") == "1"
+    assert value("--minibatch") == "2048"
+    assert value("--lr") == "7e-05"
+    assert value("--critic-lr") == "0.0001"
+    assert value("--warm-evar") == "0.12"
+    assert value("--sigma-floor") == "0.25"
+    assert value("--seed") == "2003"
+    assert value("--maps") == "maps.json"
+
+
+def test_league_runoff_manifest_value_is_json_safe():
+    import json
+
+    from learn.league import serialise_runoff
+
+    got = serialise_runoff({4: np.float64(0.55), 1: 0.625})
+    assert got == {"1": 0.625, "4": 0.55}
+    assert json.loads(json.dumps({"fresh_min": got}))["fresh_min"] == got
+
+
+def test_top3_promotion_suite_uses_fresh_seeds_and_a_sanity_greedy_floor():
+    from tools.evaluate import load_suite
+
+    suite = load_suite("evaluation/top3-v2.json")
+    assert suite["seed0"] == 8_000_000
+    assert suite["games_per_bucket"] == 2000
+    greedy = next(b for b in suite["buckets"] if b["name"] == "greedy")
+    assert greedy["min_lower_score"] <= 0.70
+
+
+def test_value_validation_split_never_leaks_a_game():
+    import tempfile
+    from pathlib import Path
+
+    from learn import valuetrain
+
+    with tempfile.TemporaryDirectory() as td:
+        paths = []
+        for i, games in enumerate(([10, 10, 20], [20, 30, 30])):
+            path = Path(td) / f"shard_{i:04d}.npz"
+            n = len(games)
+            np.savez(path, x=np.zeros((n, 1, 1, 1), np.float16),
+                     y=np.asarray([-1, 0, 1][:n], np.float32),
+                     game=np.asarray(games, np.int64), seat=np.zeros(n, np.int8),
+                     t=np.arange(n))
+            paths.append(path)
+        game_ids, _, _ = valuetrain.canonical_game_ids(paths)
+        _, yv, gv, held, val_games = valuetrain.split(
+            paths, .34, np.random.default_rng(2), game_ids)
+        assert set(np.unique(gv)) == val_games
+        assert 0.0 in set(yv), "draw targets were dropped"
+        for path in paths:
+            assert not (set(game_ids[path][~held[path]]) & val_games)
+
+        # Equal raw ids from independent generators are different games.
+        other = Path(td) / "selfplay"
+        other.mkdir()
+        path = other / "shard_0000.npz"
+        np.savez(path, x=np.zeros((2, 1, 1, 1), np.float16),
+                 y=np.asarray([-1, 1], np.float32),
+                 game=np.asarray([10, 40], np.int64), seat=np.zeros(2, np.int8),
+                 t=np.arange(2))
+        mixed, refs, _ = valuetrain.canonical_game_ids(paths + [path])
+        official_ten = mixed[paths[0]][0]
+        selfplay_ten = mixed[path][0]
+        assert official_ten != selfplay_ten
+        assert refs[int(official_ten)] != refs[int(selfplay_ten)]
+
+
+def test_dataset_rebuild_removes_only_stale_artifacts():
+    import tempfile
+    from pathlib import Path
+
+    from learn import dataset, valuedata
+
+    for prepare in (dataset.prepare_output, valuedata.prepare_output):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td)
+            np.savez(out / "shard_0000.npz", x=np.zeros(1))
+            np.savez(out / "shard_0042.npz", x=np.zeros(1))
+            (out / "meta.json").write_text("stale")
+            keep = out / "notes.txt"
+            keep.write_text("preserve me")
+            assert prepare(out) == 2
+            assert not list(out.glob("shard_*.npz"))
+            assert not (out / "meta.json").exists()
+            assert keep.read_text() == "preserve me"
+
+
+def test_value_pooling_matches_numpy_and_jax():
+    try:
+        import jax.numpy as jnp
+    except ImportError:
+        print("  SKIPPED (no jax): value pooling parity is UNVERIFIED")
+        return
+    from bot.policy.net import ValueNet
+    from learn.valuetrain import pooled
+
+    rng = np.random.default_rng(17)
+    h = rng.normal(size=(3, 5, 21, 21)).astype(np.float32)
+    valid = np.zeros((3, 21, 21), np.float32)
+    valid[0, :21, :21] = 1
+    valid[1, :15, :18] = 1
+    valid[2, :9, :12] = 1
+    got = np.asarray(pooled(jnp.asarray(h), jnp.asarray(valid)))
+    want = np.stack([ValueNet._pooled(h[i], valid[i]) for i in range(len(h))])
+    assert got.shape == want.shape == (3, 55)
+    assert np.max(np.abs(got - want)) < 2e-6
+
+
 def test_the_training_seam_matches_the_submission():
     """Step both engines in lockstep and compare what a JAX rollout would feed a
     policy: the observation, the encoder, the legal mask and the flat action map.
@@ -360,9 +602,13 @@ def test_the_training_seam_matches_the_submission():
     except ImportError:
         print("  SKIPPED (no jax): the encoder equivalence is UNVERIFIED in this run")
         return
-    from tools.verify_engine import check_encoders
+    from tools.verify_engine import check_encoders, check_memory_encoders
 
     check_encoders(boards=12, turns=320, stride=8)
+    # Keep this long and close-range enough that every temporal plane becomes
+    # active.  The verifier asserts activity, so a broken enemy-memory half can
+    # no longer pass merely because both encoders emitted zeros.
+    check_memory_encoders(boards=4, turns=240)
 
 
 def test_the_scanned_rollout_matches_the_python_loop():

@@ -31,7 +31,122 @@ sys.path.insert(0, str(REPO / "third_party" / "generals-bots"))
 from bot import features, rules                              # noqa: E402
 
 
-def encode_jax(obs, valid_h, valid_w):
+def empty_memory_jax(batch: int):
+    """Zero temporal state for ``batch`` observations."""
+    import jax.numpy as jnp
+
+    board_b = jnp.zeros((batch, features.PAD, features.PAD), jnp.bool_)
+    board_i = jnp.zeros((batch, features.PAD, features.PAD), jnp.int32)
+    return {
+        "initialised": jnp.zeros((batch,), jnp.bool_),
+        "turn": jnp.full((batch,), -1, jnp.int32),
+        "known_mountains": board_b,
+        "mem_owner": board_i,
+        "mem_army": board_i,
+        "mem_turn": jnp.full_like(board_i, -1),
+        "ever_seen": board_b,
+        "ever_enemy": board_b,
+        "enemy_castles": board_b,
+        "my_gained": board_b,
+        "opp_gained": board_b,
+        "my_army_delta": board_i,
+        "opp_army_delta": board_i,
+        "my_army": jnp.zeros((batch,), jnp.int32),
+        "opp_army": jnp.zeros((batch,), jnp.int32),
+        "my_land": jnp.zeros((batch,), jnp.int32),
+        "opp_land": jnp.zeros((batch,), jnp.int32),
+        "delta_my_army": jnp.zeros((batch,), jnp.int32),
+        "delta_opp_army": jnp.zeros((batch,), jnp.int32),
+        "delta_land_adv": jnp.zeros((batch,), jnp.int32),
+    }
+
+
+def update_memory_jax(memory, obs):
+    """Unbatched JAX mirror of ``bot.memory.TemporalMemory.update``."""
+    import jax.numpy as jnp
+
+    visible = ~(obs.fog_cells | obs.structures_in_fog)
+    mine, opp = obs.owned_cells, obs.opponent_cells
+    owner = jnp.where(mine, 1, jnp.where(opp, 2, 0)).astype(jnp.int32)
+    known_mountains = jnp.where(
+        memory["initialised"], memory["known_mountains"],
+        obs.mountains | obs.structures_in_fog)
+    known_mountains = ((known_mountains | obs.mountains)
+                       & ~(visible & ~obs.mountains))
+    changed = visible & memory["ever_seen"]
+    my_gained = changed & mine & (memory["mem_owner"] != 1)
+    opp_gained = changed & opp & (memory["mem_owner"] != 2)
+    delta = obs.armies.astype(jnp.int32) - memory["mem_army"]
+    my_army_delta = jnp.where(changed & mine, delta, 0)
+    opp_army_delta = jnp.where(changed & opp, delta, 0)
+    enemy_castles = (memory["enemy_castles"]
+                     | (obs.structures_in_fog & ~known_mountains
+                        & (memory["mem_owner"] == 2))
+                     | (obs.castles & opp))
+    enemy_castles &= ~(obs.castles & ~opp)
+    mem_owner = jnp.where(visible, owner, memory["mem_owner"])
+    mem_army = jnp.where(visible, obs.armies.astype(jnp.int32), memory["mem_army"])
+    mem_turn = jnp.where(visible, obs.timestep.astype(jnp.int32), memory["mem_turn"])
+    ever_seen = memory["ever_seen"] | visible
+    ever_enemy = memory["ever_enemy"] | (visible & opp)
+    seen_before = memory["turn"] >= 0
+    dma = jnp.where(seen_before, obs.owned_army_count - memory["my_army"], 0)
+    doa = jnp.where(seen_before, obs.opponent_army_count - memory["opp_army"], 0)
+    dla = jnp.where(
+        seen_before,
+        (obs.owned_land_count - memory["my_land"])
+        - (obs.opponent_land_count - memory["opp_land"]), 0)
+    updated = {
+        "initialised": jnp.bool_(True),
+        "turn": obs.timestep.astype(jnp.int32),
+        "known_mountains": known_mountains,
+        "mem_owner": mem_owner,
+        "mem_army": mem_army,
+        "mem_turn": mem_turn,
+        "ever_seen": ever_seen,
+        "ever_enemy": ever_enemy,
+        "enemy_castles": enemy_castles,
+        "my_gained": my_gained,
+        "opp_gained": opp_gained,
+        "my_army_delta": my_army_delta,
+        "opp_army_delta": opp_army_delta,
+        "my_army": obs.owned_army_count.astype(jnp.int32),
+        "opp_army": obs.opponent_army_count.astype(jnp.int32),
+        "my_land": obs.owned_land_count.astype(jnp.int32),
+        "opp_land": obs.opponent_land_count.astype(jnp.int32),
+        "delta_my_army": dma.astype(jnp.int32),
+        "delta_opp_army": doa.astype(jnp.int32),
+        "delta_land_adv": dla.astype(jnp.int32),
+    }
+    same = obs.timestep.astype(jnp.int32) == memory["turn"]
+    return {k: jnp.where(same, memory[k], v) for k, v in updated.items()}
+
+
+def memory_planes_jax(obs, memory, valid):
+    import jax.numpy as jnp
+
+    mine = memory["mem_owner"] == 1
+    opp = memory["mem_owner"] == 2
+    neutral = memory["ever_seen"] & ~(mine | opp)
+    la = jnp.log1p(jnp.maximum(memory["mem_army"], 0).astype(jnp.float32)) / 6.0
+    age = jnp.where(
+        memory["ever_seen"],
+        jnp.clip((obs.timestep - memory["mem_turn"]) / 200.0, 0.0, 1.0), 1.0)
+    ones = jnp.ones_like(valid)
+    out = jnp.stack([
+        mine, opp, neutral, la * mine, la * opp, age,
+        memory["ever_seen"], memory["ever_enemy"], memory["enemy_castles"],
+        memory["my_gained"], memory["opp_gained"],
+        jnp.tanh(memory["my_army_delta"] / 16.0),
+        jnp.tanh(memory["opp_army_delta"] / 16.0),
+        ones * jnp.tanh(memory["delta_my_army"] / 50.0),
+        ones * jnp.tanh(memory["delta_opp_army"] / 50.0),
+        ones * jnp.tanh(memory["delta_land_adv"] / 10.0),
+    ]).astype(jnp.float32)
+    return out * valid[None]
+
+
+def encode_jax(obs, valid_h, valid_w, memory=None):
     """(C, 21, 21) float32 from a starter-kit Observation. Mirrors features.encode."""
     import jax.numpy as jnp
 
@@ -39,7 +154,8 @@ def encode_jax(obs, valid_h, valid_w):
     opp = obs.opponent_cells.astype(jnp.float32)
     sif = obs.structures_in_fog.astype(jnp.float32)
     fog = jnp.clip(obs.fog_cells.astype(jnp.float32) + sif, 0, 1)
-    mountain = jnp.clip(obs.mountains.astype(jnp.float32) + sif, 0, 1)
+    mountain = (memory["known_mountains"].astype(jnp.float32) if memory is not None
+                else jnp.clip(obs.mountains.astype(jnp.float32) + sif, 0, 1))
 
     la = jnp.log1p(jnp.maximum(obs.armies, 0).astype(jnp.float32)) / 6.0
     rows = jnp.arange(features.PAD)[:, None] < valid_h
@@ -80,6 +196,12 @@ def encode_jax(obs, valid_h, valid_w):
         valid,
         *scalars,
     ])
+    if memory is None:
+        memory_x = jnp.zeros((features.MEMORY_C, features.PAD, features.PAD),
+                             jnp.float32)
+    else:
+        memory_x = memory_planes_jax(obs, memory, valid)
+    x = jnp.concatenate([x, memory_x])
     # everything outside the real board is padding, not board state
     return x * valid[None]
 

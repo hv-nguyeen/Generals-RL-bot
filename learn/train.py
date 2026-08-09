@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -44,20 +45,22 @@ from pathlib import Path
 import numpy as np
 
 from bot import features
-from bot.policy.net import (DEFAULT_CHANNELS, DEFAULT_LAYERS, arch_of,
+from bot.policy.net import (DEFAULT_CHANNELS, DEFAULT_CONTEXT, DEFAULT_LAYERS, arch_of,
                             arch_record, trunk_keys)
 
 
 # --------------------------------------------------------------------------
 # architecture
-def resolve_arch(init: str | None, layers=None, channels=None, residual=None) -> dict:
+def resolve_arch(init: str | None, layers=None, channels=None, residual=None,
+                 context=None) -> dict:
     """The architecture for a run that may warm start from a checkpoint.
 
     A checkpoint's own shape wins, always. A flag that disagrees with it is a
     mistake — silently honouring either side produces a run whose weights and
     whose logs describe different networks.
     """
-    want = {"layers": layers, "channels": channels, "residual": residual}
+    want = {"layers": layers, "channels": channels, "residual": residual,
+            "context": context}
     if init:
         have = arch_of(np.load(init))
         bad = {k: f"flag {v} vs checkpoint {have[k]}"
@@ -67,7 +70,8 @@ def resolve_arch(init: str | None, layers=None, channels=None, residual=None) ->
         return have
     return {"layers": DEFAULT_LAYERS if layers is None else layers,
             "channels": DEFAULT_CHANNELS if channels is None else channels,
-            "residual": bool(residual)}
+            "residual": bool(residual),
+            "context": DEFAULT_CONTEXT if context is None else bool(context)}
 
 
 def init_params(key, arch: dict | None = None, cin: int = features.C):
@@ -75,7 +79,7 @@ def init_params(key, arch: dict | None = None, cin: int = features.C):
     import jax.numpy as jnp
 
     arch = arch or {"layers": DEFAULT_LAYERS, "channels": DEFAULT_CHANNELS,
-                    "residual": False}
+                    "residual": False, "context": DEFAULT_CONTEXT}
     names = trunk_keys(arch["layers"], arch["residual"])
     ch = arch["channels"]
     params = {}
@@ -97,6 +101,11 @@ def init_params(key, arch: dict | None = None, cin: int = features.C):
     params["head_b"] = jnp.zeros((features.PER_CELL,))
     params["pass_w"] = jax.random.normal(keys[len(names) + 1], (prev,)) * 0.01
     params["pass_b"] = jnp.zeros(())
+    if arch.get("context", False):
+        # Small non-zero mixing lets the new path learn immediately without
+        # overwhelming a local policy at initialisation.
+        params["context_global"] = jnp.full((ch,), 0.05)
+        params["context_region"] = jnp.full((ch,), 0.05)
     return params
 
 
@@ -123,11 +132,30 @@ def trunk(params, x):
         h = x
         for n in names:
             h = jax.nn.relu(_conv(h, *wb(n)))
-        return h
-    h = _conv(x, *wb(names[0]))
-    for a, b in zip(names[1::2], names[2::2]):
-        h = h + _conv(jax.nn.relu(_conv(jax.nn.relu(h), *wb(a))), *wb(b))
-    return jax.nn.relu(h)
+    else:
+        h = _conv(x, *wb(names[0]))
+        for a, b in zip(names[1::2], names[2::2]):
+            h = h + _conv(jax.nn.relu(_conv(jax.nn.relu(h), *wb(a))), *wb(b))
+        h = jax.nn.relu(h)
+    if arch["context"]:
+        import jax.numpy as jnp
+        valid = x[:, features.VALID].astype(h.dtype)
+        den = jnp.maximum(valid.sum(axis=(1, 2)), 1.0)
+        mean = (h * valid[:, None]).sum(axis=(2, 3)) / den[:, None]
+        regional = jnp.zeros_like(h)
+        edges = (0, 7, 14, features.PAD)
+        for ri in range(3):
+            for ci in range(3):
+                rs, cs = slice(edges[ri], edges[ri + 1]), slice(edges[ci], edges[ci + 1])
+                v = valid[:, rs, cs]
+                q = h[:, :, rs, cs]
+                d = jnp.maximum(v.sum(axis=(1, 2)), 1.0)
+                rmean = (q * v[:, None]).sum(axis=(2, 3)) / d[:, None]
+                regional = regional.at[:, :, rs, cs].set(rmean[:, :, None, None])
+        h = jax.nn.relu(h + params["context_global"][None, :, None, None]
+                        * mean[:, :, None, None]
+                        + params["context_region"][None, :, None, None] * regional)
+    return h
 
 
 def forward(params, x):
@@ -288,6 +316,8 @@ def main() -> None:
     ap.add_argument("--channels", type=int, default=None)
     ap.add_argument("--residual", action="store_true",
                     help="pre-activation residual blocks; needs an odd --layers")
+    ap.add_argument("--context", action=argparse.BooleanOptionalAction, default=True,
+                    help="mix global and 3x3 regional summaries into local features")
     ap.add_argument("--augment", action="store_true",
                     help="dihedral symmetry, 8x effective data")
     ap.add_argument("--selfcheck", action="store_true")
@@ -302,7 +332,7 @@ def main() -> None:
     import jax.numpy as jnp
 
     print("devices:", jax.devices())
-    arch = resolve_arch(None, args.layers, args.channels, args.residual)
+    arch = resolve_arch(None, args.layers, args.channels, args.residual, args.context)
     shards = shard_list(Path(args.data))
     # Held out BY SHARD, and a shard is a run of whole replays, so this is a
     # split by game rather than by position — except for the one replay that
@@ -433,6 +463,14 @@ def main() -> None:
         indent=2))
     print(f"\nwrote {out} (best val top-1 {best:.3f} +-{best_se:.3f} "
           f"at epoch {best_epoch} of {args.epochs})")
+    from tools import manifest
+    artifacts = [out]
+    if (Path(args.data) / "meta.json").is_file():
+        artifacts.append(Path(args.data) / "meta.json")
+    manifest.write(out.with_suffix(".manifest.json"), command=sys.argv,
+                   artifacts=artifacts,
+                   extra={"kind": "behaviour-cloning", "args": vars(args),
+                          "validation_shards": [p.name for p in val_shards]})
     print("Use it as a sparring partner:")
     print(f"  python -m arena.runner --a ours:configs/v16.json --b clone:{out} --games 200 --workers 32")
 
@@ -480,16 +518,21 @@ def selfcheck() -> None:
         p["head_b"] = (rng.normal(size=features.PER_CELL) * 0.2).astype("f4")
         p["pass_w"] = (rng.normal(size=prev) * 0.2).astype("f4")
         p["pass_b"] = np.float32(0.3)
+        if arch.get("context", False):
+            p["context_global"] = (rng.normal(size=prev) * 0.1).astype("f4")
+            p["context_region"] = (rng.normal(size=prev) * 0.1).astype("f4")
         return p
 
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
 
         # --- numpy and JAX agree at several shapes, residual on and off
-        for layers, channels, residual in ((4, 32, False), (1, 8, False),
-                                           (6, 16, False), (3, 24, True),
-                                           (7, 16, True)):
-            arch = {"layers": layers, "channels": channels, "residual": residual}
+        for layers, channels, residual, context in (
+                (4, 32, False, False), (1, 8, False, False),
+                (6, 16, False, False), (3, 24, True, False),
+                (7, 16, True, False), (4, 12, False, True)):
+            arch = {"layers": layers, "channels": channels,
+                    "residual": residual, "context": context}
             p = rand_params(arch)
             ref = np.asarray(forward(p, jnp.asarray(x)))[0]
             path = td / f"a{layers}x{channels}{int(residual)}.npz"
@@ -499,7 +542,7 @@ def selfcheck() -> None:
             got = _numpy_logits_of(n, x[0])
             scale = max(float(np.abs(ref).max()), 1.0)
             assert np.abs(got - ref).max() < 1e-4 * scale, \
-                f"numpy/JAX disagree at {layers}x{channels} residual={residual}"
+                f"numpy/JAX disagree at {layers}x{channels} residual={residual} context={context}"
 
         # --- an old-style 4x32 file, written before any of this existed, still
         #     loads and produces byte-identical logits to the old fixed loader
@@ -514,7 +557,8 @@ def selfcheck() -> None:
         old = td / "legacy.npz"
         np.savez(old, **legacy)                      # no residual marker: 2024 vintage
         n = npnet.Net(str(old))
-        assert n.arch == {"layers": 4, "channels": 32, "residual": False}, n.arch
+        assert n.arch == {"layers": 4, "channels": 32, "residual": False,
+                          "context": False}, n.arch
         h = x[0]
         for i in range(4):                           # the loader this replaced
             h = np.maximum(npnet._conv3x3(h, legacy[f"conv{i}_w"], legacy[f"conv{i}_b"]), 0.0)
@@ -525,7 +569,8 @@ def selfcheck() -> None:
         assert np.array_equal(_numpy_logits_of(n, x[0]), want), "legacy logits moved"
 
         # --- npz round trip, and the refusals
-        p = rand_params({"layers": 5, "channels": 12, "residual": True})
+        p = rand_params({"layers": 5, "channels": 12, "residual": True,
+                         "context": False})
         rp = td / "res.npz"
         save(p, rp)
         z = dict(np.load(rp))
@@ -564,14 +609,15 @@ def selfcheck() -> None:
 
         # --- the trainer's own init lays down exactly the keys the loader hunts
         p = init_params(jax.random.PRNGKey(1), {"layers": 3, "channels": 2,
-                                                "residual": True})
+                                                "residual": True, "context": False})
         assert set(p) == {"conv0_w", "conv0_b", "res0a_w", "res0a_b",
                           "res0b_w", "res0b_b", "head_w", "head_b",
                           "pass_w", "pass_b"}, sorted(p)
         assert not np.asarray(p["res0b_w"]).any(), "blocks must start as the identity"
         save(p, td / "init.npz")
         assert arch_of(np.load(td / "init.npz")) == {"layers": 3, "channels": 2,
-                                                     "residual": True}
+                                                     "residual": True,
+                                                     "context": False}
 
     # --- dihedral augmentation moves the board and the label the same way
     for h, w in ((18, 21), (21, 21), (20, 18)):
@@ -625,6 +671,8 @@ def _numpy_logits_of(net, x):
     """Net.logits takes an Obs; the checks feed a raw encoded tensor."""
     from bot.policy import net as npnet
     h = npnet._trunk(x.copy(), net.layers, net.arch["residual"])
+    h = npnet._context_mix(h, x[features.VALID], net.context_global,
+                           net.context_region)
     mv = npnet._conv3x3(h, net.head_w, net.head_b)
     return np.concatenate([np.transpose(mv, (1, 2, 0)).reshape(-1),
                            [float(net.pass_w @ h.mean(axis=(1, 2)) + net.pass_b)]])

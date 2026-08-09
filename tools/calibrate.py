@@ -32,10 +32,9 @@ from sim import engine, mapgen
 
 # Measured on the leaderboard. Sample sizes differ, so the ordering is more
 # trustworthy than the gaps: v5 and v10 are 1.6 sigma apart, v5 and v12 are 3.6.
-# NOTE these must be configs that still reconstruct the build under the current
-# code. Config.from_dict fills absent keys from today's defaults, so a config
-# saved before a key existed silently becomes a different bot — configs/v5.json
-# predates lock_enabled and would now load with the lock ON, i.e. as v6.
+# These configs are schema-versioned and fully materialized. Legacy partial
+# files now fail to load until tools.migrate_configs makes their inherited
+# defaults explicit.
 LADDER = [
     ("configs/v13.json", 1737, "v5/v13  thrust 20/0.10, no lock"),
     ("configs/v9.json", 1651, "v10     + general-drain fix"),

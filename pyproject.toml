@@ -3,10 +3,11 @@ name = "generals-bot"
 version = "0.1.0"
 description = "generals.bot competition bot, arena and analysis tooling"
 requires-python = ">=3.12"
-dependencies = ["numpy>=2.0"]
+dependencies = ["numpy>=2.0,<3"]
 
 [project.optional-dependencies]
-verify = ["jax[cpu]>=0.4"]
+train = ["jax>=0.4,<1"]
+verify = ["jax[cpu]>=0.4,<1"]
 
-[tool.setuptools]
-packages = ["bot", "bot.policy", "sim", "arena", "analysis", "tools"]
+[tool.setuptools.packages.find]
+include = ["bot*", "sim*", "arena*", "analysis*", "learn*", "tools*", "tests*"]

@@ -27,12 +27,14 @@ from __future__ import annotations
 import numpy as np
 
 from bot import features, rules, symmetry
+from bot.memory import TemporalMemory
 from bot.obs import Obs
 
 # Only the starting point for a fresh `learn/train.py` run. Nothing at inference
 # time reads these: a loaded checkpoint always wins.
 DEFAULT_CHANNELS = 32
 DEFAULT_LAYERS = 4
+DEFAULT_CONTEXT = True
 
 
 def trunk_keys(layers: int, residual: bool) -> list[str]:
@@ -61,7 +63,7 @@ def _run_length(files: set[str], pat: str) -> int:
 
 
 def arch_of(z) -> dict:
-    """`{'layers', 'channels', 'residual'}` from an npz or a parameter dict.
+    """Architecture and context wiring from an npz or parameter dict.
 
     Everything suspicious raises. A gap in the numbering (`conv0,conv1,conv3`)
     would otherwise be read as a 2-layer net and the rest ignored, which is the
@@ -82,9 +84,13 @@ def arch_of(z) -> dict:
         raise ValueError(f"a residual trunk has exactly one stem conv, found {convs}")
     # .shape, not np.asarray(...).shape: the trainers call this on dicts of jax
     # tracers inside jit, where converting to numpy is an error
+    context_keys = {"context_global", "context_region"}
+    present_context = context_keys & files
+    if present_context and present_context != context_keys:
+        raise ValueError(f"incomplete context mixer: found {sorted(present_context)}")
     arch = {"layers": 1 + 2 * blocks if residual else convs,
             "channels": int(z["conv0_w"].shape[0]),
-            "residual": residual}
+            "residual": residual, "context": bool(present_context)}
     # The key names cannot express a trunk truncated at the TAIL: drop conv4 and
     # conv5 from a 6-layer file and the scan simply stops at conv3, reports a
     # 4-layer net, and everything downstream still has valid shapes. The only
@@ -94,19 +100,25 @@ def arch_of(z) -> dict:
         if k in files and int(z[k]) != int(v):
             raise ValueError(f"checkpoint says {k}={int(z[k])} but the trunk keys "
                              f"say {k}={int(v)}; refusing to guess")
+    if ("input_channels" in files
+            and int(z["input_channels"]) != int(z["conv0_w"].shape[1])):
+        raise ValueError(f"checkpoint says input_channels={int(z['input_channels'])} "
+                         f"but conv0_w takes {z['conv0_w'].shape[1]}")
     return arch
 
 
 def arch_record(params: dict) -> dict:
     """Extra npz entries a saver must write so the file states its own wiring.
 
-    All three, not just `residual`: the key names recover the wiring and the
-    widths but not the depth the writer intended, so depth is the one the file
-    has to carry.
+    The record includes residual wiring, depth, width, context, and input width.
+    Key names recover most wiring but not every intent, so the redundant record
+    is cross-checked on load rather than trusted blindly.
     """
     a = arch_of(params)
     return {"residual": np.int8(a["residual"]), "layers": np.int16(a["layers"]),
-            "channels": np.int16(a["channels"])}
+            "channels": np.int16(a["channels"]),
+            "context": np.int8(a["context"]),
+            "input_channels": np.int16(params["conv0_w"].shape[1])}
 
 
 def _conv3x3(x: np.ndarray, w: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -149,6 +161,27 @@ def _trunk(x: np.ndarray, layers: list, residual: bool) -> np.ndarray:
     return np.maximum(h, 0.0)
 
 
+def _context_mix(h: np.ndarray, valid: np.ndarray,
+                 global_scale: np.ndarray | None,
+                 region_scale: np.ndarray | None) -> np.ndarray:
+    """Inject whole-board and 3x3 regional summaries into every local cell."""
+    if global_scale is None:
+        return h
+    v = valid.astype(np.float32)
+    global_mean = (h * v[None]).sum(axis=(1, 2)) / max(float(v.sum()), 1.0)
+    regional = np.zeros_like(h)
+    edges = (0, 7, 14, features.PAD)
+    for ri in range(3):
+        for ci in range(3):
+            rs, cs = slice(edges[ri], edges[ri + 1]), slice(edges[ci], edges[ci + 1])
+            vv = v[rs, cs]
+            mean = (h[:, rs, cs] * vv[None]).sum(axis=(1, 2)) / max(float(vv.sum()), 1.0)
+            regional[:, rs, cs] = mean[:, None, None]
+    out = h + global_scale[:, None, None] * global_mean[:, None, None]
+    out += region_scale[:, None, None] * regional
+    return np.maximum(out, 0.0)
+
+
 def _load_trunk(z) -> tuple[list, dict]:
     arch = arch_of(z)
     layers = [(z[f"{n}_w"].astype(np.float32), z[f"{n}_b"].astype(np.float32))
@@ -177,23 +210,38 @@ class Net:
         # channels, so a stem from before them is a different function of a
         # different board. It would otherwise die in a BLAS shape error deep
         # inside _conv3x3, mid-match, naming neither the file nor the reason.
-        if self.layers[0][0].shape[1] != features.C:
+        stem_c = self.layers[0][0].shape[1]
+        if stem_c == features.BASE_C and features.C > features.BASE_C:
+            # Function-preserving migration: the old policy ignores every new
+            # temporal channel until training gives those zero columns weight.
+            w, b = self.layers[0]
+            grown = np.zeros((w.shape[0], features.C, 3, 3), np.float32)
+            grown[:, :features.BASE_C] = w
+            self.layers[0] = (grown, b)
+        elif stem_c != features.C:
             raise ValueError(
-                f"{path}: stem takes {self.layers[0][0].shape[1]} input channels, "
+                f"{path}: stem takes {stem_c} input channels, "
                 f"this build encodes {features.C}. The observation changed (turn "
                 f"and the army/land totals are planes now); retrain, do not reuse.")
         self.pass_w = z["pass_w"].astype(np.float32)
         self.pass_b = float(z["pass_b"])
+        self.context_global = (z["context_global"].astype(np.float32)
+                               if self.arch["context"] else None)
+        self.context_region = (z["context_region"].astype(np.float32)
+                               if self.arch["context"] else None)
 
     def _logits_from(self, enc: np.ndarray) -> np.ndarray:
         x = _trunk(enc, self.layers, self.arch["residual"])
+        x = _context_mix(x, enc[features.VALID], self.context_global,
+                         self.context_region)
         move = _conv3x3(x, self.head_w, self.head_b)   # (PER_CELL, H, W)
         # (H, W, PER_CELL) flattened must match features.action_to_index ordering
         flat = np.transpose(move, (1, 2, 0)).reshape(-1)
         pass_logit = float(self.pass_w @ x.mean(axis=(1, 2)) + self.pass_b)
         return np.concatenate([flat, [pass_logit]])
 
-    def logits(self, obs: Obs, tta: bool = False, full: bool = False) -> np.ndarray:
+    def logits(self, obs: Obs, tta: bool = False, full: bool = False,
+               memory=None) -> np.ndarray:
         """Masked-move logits, optionally averaged over the board's symmetries.
 
         The rules are symmetric under the eight rigid motions of the square, so
@@ -204,7 +252,7 @@ class Net:
         The budget pays for it easily -- one forward is ~1.2 ms against a 150 ms
         limit -- and this is the only axis of the problem nobody has spent.
         """
-        enc = features.encode(obs)
+        enc = features.encode(obs, memory)
         if not tta:
             return self._logits_from(enc)
         els = symmetry.group(obs.H, obs.W, full)
@@ -220,6 +268,7 @@ class ClonePolicy:
         self.H, self.W = h, w
         self.tta = tta
         self.full = full
+        self.memory = TemporalMemory(h, w)
         self.last_debug: dict = {}
         # Pay the one-time costs HERE, before the first frame. Construction is
         # outside the per-move budget; the first move is not.
@@ -236,8 +285,13 @@ class ClonePolicy:
             for g in symmetry.group(h, w, full):
                 symmetry.maps(h, w, g)
 
+    def score_logits(self, obs: Obs) -> np.ndarray:
+        self.memory.update(obs)
+        return self.net.logits(obs, tta=self.tta, full=self.full,
+                               memory=self.memory)
+
     def act(self, obs: Obs, deadline=None):
-        logits = self.net.logits(obs, tta=self.tta, full=self.full)
+        logits = self.score_logits(obs)
         mask = features.legal_mask(obs)
         if not mask.any():
             return rules.PASS_ACTION
@@ -248,7 +302,7 @@ class ClonePolicy:
 
 
 class ValueNet:
-    """Win probability for a position, from the field-outcome model.
+    """Direct game value for a position, from the field-outcome model.
 
     Same trunk as the policy, a scalar head. Used to score positions our own bot
     reaches against what actually wins against real opponents — the local
@@ -259,10 +313,61 @@ class ValueNet:
     def __init__(self, path: str):
         z = np.load(path)
         self.layers, self.arch = _load_trunk(z)
+        stem_c = self.layers[0][0].shape[1]
+        if stem_c == features.BASE_C and features.C > features.BASE_C:
+            w, b = self.layers[0]
+            grown = np.zeros((w.shape[0], features.C, 3, 3), np.float32)
+            grown[:, :features.BASE_C] = w
+            self.layers[0] = (grown, b)
+        elif stem_c != features.C:
+            raise ValueError(f"{path}: critic stem has {stem_c} channels, expected "
+                             f"{features.C}")
         self.head_w = z["v_w"].astype(np.float32)
         self.head_b = float(z["v_b"])
+        self.schema = int(z["value_schema"]) if "value_schema" in z.files else 1
+        self.context_global = (z["context_global"].astype(np.float32)
+                               if self.arch["context"] else None)
+        self.context_region = (z["context_region"].astype(np.float32)
+                               if self.arch["context"] else None)
+        self.memory = None
+
+    @staticmethod
+    def _pooled(h: np.ndarray, valid: np.ndarray) -> np.ndarray:
+        v = valid.astype(np.float32)
+        mean = (h * v[None]).sum(axis=(1, 2)) / max(float(v.sum()), 1.0)
+        maximum = np.where(v[None] > 0, h, -1e9).max(axis=(1, 2))
+        parts = [mean, maximum]
+        edges = (0, 7, 14, features.PAD)
+        for ri in range(3):
+            for ci in range(3):
+                vv = v[edges[ri]:edges[ri + 1], edges[ci]:edges[ci + 1]]
+                q = h[:, edges[ri]:edges[ri + 1], edges[ci]:edges[ci + 1]]
+                parts.append((q * vv[None]).sum(axis=(1, 2))
+                             / max(float(vv.sum()), 1.0))
+        return np.concatenate(parts)
+
+    def value(self, obs: Obs) -> float:
+        if (self.memory is None or self.memory.H != obs.H or self.memory.W != obs.W
+                or obs.turn < self.memory.turn):
+            self.memory = TemporalMemory(obs.H, obs.W)
+        self.memory.update(obs)
+        enc = features.encode(obs, self.memory)
+        return self.value_encoded(enc)
+
+    def value_encoded(self, enc: np.ndarray) -> float:
+        """Score an already encoded counterfactual without mutating memory."""
+        h = _trunk(enc, self.layers, self.arch["residual"])
+        h = _context_mix(h, enc[features.VALID], self.context_global,
+                         self.context_region)
+        if self.schema >= 2:
+            pooled = self._pooled(h, enc[features.VALID])
+            if self.head_w.shape != pooled.shape:
+                raise ValueError(f"value head is {self.head_w.shape}, pooled state is "
+                                 f"{pooled.shape}")
+            return float(np.tanh(self.head_w @ pooled + self.head_b))
+        # Legacy value files were BCE logits over P(win).
+        logit = float(self.head_w @ h.mean(axis=(1, 2)) + self.head_b)
+        return float(2.0 / (1.0 + np.exp(-logit)) - 1.0)
 
     def win_prob(self, obs: Obs) -> float:
-        x = _trunk(features.encode(obs), self.layers, self.arch["residual"])
-        logit = float(self.head_w @ x.mean(axis=(1, 2)) + self.head_b)
-        return 1.0 / (1.0 + np.exp(-logit))
+        return 0.5 * (self.value(obs) + 1.0)

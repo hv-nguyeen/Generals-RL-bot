@@ -45,11 +45,16 @@ from bot import features, rules
 from bot.policy import net as pnet
 
 
-def critic_value(phi_layers, v_w, v_b, obs) -> float:
+def critic_value(phi_layers, v_w, v_b, obs, residual=False, context=None) -> float:
     """V(s) for one state. Mirrors `valuetrain.forward` + the tanh in selfplay."""
     x = features.encode(obs)
-    h = pnet._trunk(x, phi_layers, False)
-    return float(np.tanh(h.mean(axis=(1, 2)) @ v_w + v_b))
+    h = pnet._trunk(x, phi_layers, residual)
+    if context is not None:
+        h = pnet._context_mix(h, x[features.VALID], *context)
+    pooled = (pnet.ValueNet._pooled(h, x[features.VALID])
+              if v_w.shape[0] == h.shape[0] * 11
+              else h.mean(axis=(1, 2)))
+    return float(np.tanh(pooled @ v_w + v_b))
 
 
 def _load_phi(path: str):
@@ -63,7 +68,11 @@ def _load_phi(path: str):
     arch = pnet.arch_of(phi)
     layers = [(np.asarray(phi[f"{k}_w"], np.float32), np.asarray(phi[f"{k}_b"], np.float32))
               for k in pnet.trunk_keys(arch["layers"], arch["residual"])]
-    return layers, np.asarray(phi["v_w"], np.float32), float(phi["v_b"]), arch
+    context = ((np.asarray(phi["context_global"], np.float32),
+                np.asarray(phi["context_region"], np.float32))
+               if arch["context"] else None)
+    return (layers, np.asarray(phi["v_w"], np.float32), float(phi["v_b"]),
+            arch, context)
 
 
 def _rear_tile(obs):
@@ -85,7 +94,7 @@ def _my_general(obs):
 def probe(resume: str, weights: str, games: int, turns: int, seed0: int) -> dict:
     from sim import engine, mapgen
 
-    phi_layers, v_w, v_b, arch = _load_phi(resume)
+    phi_layers, v_w, v_b, arch, context = _load_phi(resume)
     print(f"critic: {arch['layers']}x{arch['channels']} from {resume}")
     pol = pnet.Net(weights)
 
@@ -106,7 +115,9 @@ def probe(resume: str, weights: str, games: int, turns: int, seed0: int) -> dict
             if engine.step(st, acts[0], acts[1]):
                 break
         obs = engine.observe(st, 0)
-        base = critic_value(phi_layers, v_w, v_b, obs)
+        value = lambda o: critic_value(  # noqa: E731
+            phi_layers, v_w, v_b, o, arch["residual"], context)
+        base = value(obs)
         site = _rear_tile(obs)
         gen = _my_general(obs)
         if site is None or gen is None:
@@ -117,13 +128,13 @@ def probe(resume: str, weights: str, games: int, turns: int, seed0: int) -> dict
         # whether the critic has learned that a castle is worth anything.
         o2 = engine.observe(st, 0)
         o2.type_grid[r, c] = rules.T_CASTLE
-        free.append(critic_value(phi_layers, v_w, v_b, o2) - base)
+        free.append(value(o2) - base)
 
         # (b) the REAL trade the policy faces: castle, minus 35 army.
         o3 = engine.observe(st, 0)
         o3.type_grid[r, c] = rules.T_CASTLE
         o3.army_grid[r, c] = max(int(o3.army_grid[r, c]) - 35, 1)
-        paid.append(critic_value(phi_layers, v_w, v_b, o3) - base)
+        paid.append(value(o3) - base)
 
         # (c) garrison: the ladder deaths, as a counterfactual. Same board, the
         # general holding 25 versus holding 2.
@@ -131,8 +142,7 @@ def probe(resume: str, weights: str, games: int, turns: int, seed0: int) -> dict
         o4, o5 = engine.observe(st, 0), engine.observe(st, 0)
         o4.army_grid[gr, gc] = 25
         o5.army_grid[gr, gc] = 2
-        garr.append(critic_value(phi_layers, v_w, v_b, o4)
-                    - critic_value(phi_layers, v_w, v_b, o5))
+        garr.append(value(o4) - value(o5))
 
     def line(name, xs, reads):
         if not xs:

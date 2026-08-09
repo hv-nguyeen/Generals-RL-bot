@@ -83,8 +83,9 @@ existing tree keeps every checkpoint and log.
 Only `/home/vng205` is shared. `/local/data` is per-node, so a fresh node needs
 the venv, the repo, the board pools and the checkpoints. In that order.
 
-`make setup` installs numpy ONLY — `bot/` is numpy-only by design and the
-training stack's jax+CUDA is not in the Makefile. Pin the versions off a working
+`make setup` installs the package and numpy only — `bot/` is numpy-only by
+design. `make setup-cpu` is for laptop verification, not this GPU node. Pin the
+CUDA JAX versions off a working
 node first so the new one matches:
 
 ```bash
@@ -128,18 +129,21 @@ Checkpoints are ~300 KB each and go through home. From a node that has them:
 cp runs/nn/sp9-i600.npz runs/nn/sp9-i500.npz runs/nn/sp3-i500-0733.npz runs/nn/sp9.resume.npz ~/
 ```
 
-`field/` (~86 MB of harvested replays) is only needed for behaviour cloning, not
-for RL. Do not re-harvest it — the fetcher got the cluster IP 403'd once.
+`field/` is needed for behaviour cloning and the offline field-value source, but
+not during PPO rollouts. Harvest from an accepted laptop IP and transfer it; the
+fetcher got the cluster IP 403'd once.
 
-**After 2026-08-05 the encoder is 22 channels and every older checkpoint is 20.**
-`net.py:181` refuses the mismatch on purpose. Migrate before running anything:
+**The current encoder is C=40: 24 one-frame channels plus 16 temporal channels.**
+The loader and PPO entry points function-preservingly pad a C=24 stem with zero
+columns. To make the global/regional context path trainable too, materialize the
+checkpoint explicitly:
 
 ```bash
-$PY -m tools.grow --net runs/nn/CKPT.npz --out runs/nn/CKPT-c22.npz --layers 8 --channels 32
+$PY -m tools.grow --net runs/nn/CKPT.npz --out runs/nn/CKPT-c40-context.npz --layers 8 --channels 32 --context
 ```
 
 ```bash
-$PY -m tools.grow --net runs/nn/RUN.resume.npz --out runs/nn/RUN-critic-c22.npz --prefix phi --layers 8 --channels 32
+$PY -m tools.grow --net runs/nn/RUN.resume.npz --out runs/nn/RUN-critic-c40.npz --prefix phi --layers 8 --channels 32 --context
 ```
 
 The second is the CRITIC, which lives inside a resume file under `phi__*` and
@@ -229,7 +233,7 @@ export JAX_PLATFORMS=cpu
 make test PY=$PY
 ```
 
-Wants `21/21 passed`.
+Wants `28/28 passed` (or higher as checks are added).
 
 ```bash
 $PY -m tools.verify_engine --games 40 --max-turns 200 --encoders

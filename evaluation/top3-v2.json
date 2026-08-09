@@ -1,0 +1,42 @@
+{
+  "schema_version": 2,
+  "games_per_bucket": 2000,
+  "seed0": 8000000,
+  "elo_margin": 25.0,
+  "max_turns": 1200,
+  "max_move_ms": 125.0,
+  "candidate_spec": "ship:{candidate}",
+  "buckets": [
+    {
+      "name": "champion",
+      "opponent": "ship:{reference}",
+      "weight": 4.0,
+      "min_lower_score": 0.5,
+      "requires_sprt": true
+    },
+    {
+      "name": "sniper",
+      "opponent": "snipe:{reference}@120",
+      "weight": 3.0,
+      "min_lower_score": 0.45
+    },
+    {
+      "name": "hunter",
+      "opponent": "hunter",
+      "weight": 1.0,
+      "min_lower_score": 0.9
+    },
+    {
+      "name": "greedy",
+      "opponent": "greedy",
+      "weight": 1.0,
+      "min_lower_score": 0.7
+    },
+    {
+      "name": "expander",
+      "opponent": "expander",
+      "weight": 0.5,
+      "min_lower_score": 0.9
+    }
+  ]
+}

@@ -1,5 +1,13 @@
 # Where the project is — 2026-08-08
 
+> **2026-08-08 v2 implementation note:** the actionable plan at the top of this
+> file has now been implemented and is superseded by
+> [`TOP3-V2-HANDOFF.md`](TOP3-V2-HANDOFF.md). Temporal channels, complete-game
+> value splits, direct draw-aware targets, spatial value pooling, strict configs,
+> global/regional policy context, top-leaderboard replay harvesting, population
+> training, and a multi-opponent promotion gate are in the tree. The older
+> sections below are retained as experiment history, not current instructions.
+
 `docs/ml-log.md` is the full measured history and it is long. This file is the
 short version: what is true right now, what is running, and what to do next.
 Read this first, then the log for the reasoning behind any line, and
@@ -12,9 +20,11 @@ The competition has two checkpoints. **Sprint closed 2026-08-08**; the
 the leaderboard is continuous. Everything below about "the deadline" from the
 2026-08-07 revision refers to the Sprint only.
 
-**Deployed: `generals-bot-nn12`** — `sp16-c24` + test-time augmentation + the
-guard. Rank **27 of 107** over 200 ladder games, peak Elo 1912. Still the best
-thing measured; nothing since has beaten it in an arena.
+**Live snapshot on 2026-08-08:** H.V.Nguyen rank **29**, Elo **1902**, at
+137W/96L/1D. The historical deployed lineage is `generals-bot-nn12` —
+`sp16-c24` + test-time augmentation + the guard — with a peak Elo of 1912. Its
+weights remain on the cluster and are intentionally absent from the clean repo;
+copy and hash that exact incumbent before running the v2 promotion suite.
 
 ## WHAT CHANGED ON 2026-08-08 — castles, and why the critic was the whole story
 

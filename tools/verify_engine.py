@@ -245,7 +245,10 @@ def _frame_diff(st: engine.State, theirs, p: int, fns, cov) -> str | None:
     # totals against the official `owned_army_count` family -- so agreeing is
     # meaningful, but only for a channel that actually moved. A scalar wired to
     # something always 0 agrees with the other side's always 0 forever.
-    s = xn[features.CLOCK:, 0, 0]
+    # This seam deliberately exercises the stateless encoder. Temporal planes
+    # are validated in their own trajectory test and are zero here, so only the
+    # broadcast base scalars count toward coverage.
+    s = xn[features.CLOCK:features.BASE_C, 0, 0]
     cov["scalar_lo"] = np.minimum(cov["scalar_lo"], s)
     cov["scalar_hi"] = np.maximum(cov["scalar_hi"], s)
 
@@ -306,7 +309,7 @@ def check_encoders(boards: int = 12, turns: int = 320, stride: int = 8,
            "mask": jax.jit(rlenv.legal_mask_jax),
            "step": jax.jit(transition)}
 
-    nscalar = features.C - features.CLOCK
+    nscalar = features.BASE_C - features.CLOCK
     cov = {"frames": 0, "growth_frames": 0, "deathtouch_frames": 0,
            "legal_build_frames": 0, "builds_executed": 0, "encoder_worst": 0.0,
            "build_cells": set(), "costs": set(), "steps": 0, "shapes": set(),
@@ -386,6 +389,73 @@ def check_encoders(boards: int = 12, turns: int = 320, stride: int = 8,
     return cov
 
 
+def check_memory_encoders(boards: int = 4, turns: int = 240,
+                          seed0: int = 20_000) -> dict:
+    """Compare stateful encoders with non-vacuous temporal-plane coverage.
+
+    Competition-distance random games often do not make contact in 120 turns,
+    so both encoders can zero the entire enemy-history half and still agree.
+    Short-distance boards make ownership changes and enemy sightings part of
+    the mandatory green gate rather than an accidental property of a seed.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    from bot.memory import TemporalMemory
+    from learn import rlenv
+
+    _, jgame, transition = _jax_bits()
+    observe = jax.jit(jgame.get_observation, static_argnums=(1,))
+    step = jax.jit(transition)
+    worst, frames, activity = 0.0, 0, 0.0
+    plane_peak = np.zeros(features.MEMORY_C, dtype=np.float32)
+    for b in range(boards):
+        grid = mapgen.generate(seed0 + b, 2, 6)
+        h, w = grid.shape
+        ours = engine.from_grid(grid)
+        theirs = jgame.create_initial_state(jnp.asarray(pad_grid(grid), dtype=jnp.int32))
+        nm = [TemporalMemory(h, w), TemporalMemory(h, w)]
+        jm = [{k: v[0] for k, v in rlenv.empty_memory_jax(1).items()} for _ in range(2)]
+        rng = np.random.default_rng(seed0 * 13 + b)
+        for _ in range(turns + 1):
+            for p in (0, 1):
+                no, jo = engine.observe(ours, p), observe(theirs, p)
+                nm[p].update(no)
+                jm[p] = rlenv.update_memory_jax(jm[p], jo)
+                xn = features.encode(no, nm[p])
+                xj = np.asarray(rlenv.encode_jax(jo, h, w, jm[p]))
+                d = float(np.max(np.abs(xn - xj)))
+                worst = max(worst, d); frames += 1
+                plane_peak = np.maximum(
+                    plane_peak,
+                    np.max(np.abs(xn[features.BASE_C:]), axis=(1, 2)))
+                activity = max(activity, float(np.max(np.abs(
+                    xn[features.MY_GAINED:features.DELTA_LAND_ADV + 1]))))
+                assert d <= 1e-6, (f"temporal encoder seed={seed0 + b} "
+                                   f"turn={ours.time} seat={p} max|d|={d:.3e}")
+                before = {k: np.asarray(v).copy() for k, v in jm[p].items()}
+                again = rlenv.update_memory_jax(jm[p], jo)
+                assert all(np.array_equal(before[k], np.asarray(again[k])) for k in before)
+                nm[p].update(no)
+            if ours.winner >= 0:
+                break
+            a0, a1 = random_action(rng, ours, 0), random_action(rng, ours, 1)
+            engine.step(ours, a0, a1)
+            theirs, _ = step(theirs, jnp.asarray([a0, a1], dtype=jnp.int32))
+    assert activity > 0.0, "temporal change planes never activated"
+    required = [features.MEM_OPP, features.MEM_ARMY_OPP, features.EVER_ENEMY,
+                features.OPP_GAINED, features.OPP_ARMY_DELTA,
+                features.DELTA_OPP_ARMY, features.DELTA_LAND_ADV]
+    missing = [ch for ch in required if plane_peak[ch - features.BASE_C] == 0]
+    assert not missing, (f"temporal equality is vacuous: required enemy/change "
+                         f"planes {missing} never activated")
+    active = [features.BASE_C + i for i, value in enumerate(plane_peak) if value > 0]
+    print(f"  temporal seam: {frames} frames, max|d| {worst:.1e}, "
+          f"activity {activity:.2f}, active planes {active}")
+    return {"frames": frames, "worst": worst, "activity": activity,
+            "plane_peak": plane_peak}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -393,7 +463,8 @@ def main() -> None:
     ap.add_argument("--max-turns", type=int, default=140)
     ap.add_argument("--seed0", type=int, default=0)
     ap.add_argument("--encoders", action="store_true",
-                    help="also compare the observation/encoder/mask/action-map seam")
+                    help="also compare the stateless seam plus stateful temporal "
+                         "memory, with non-vacuous coverage for all 16 planes")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -401,6 +472,7 @@ def main() -> None:
         failures = run(args.games, args.max_turns, args.seed0, args.verbose)
         if args.encoders:
             check_encoders(verbose=args.verbose)
+            check_memory_encoders()
     except ImportError as e:
         sys.exit(f"needs jax and third_party/generals-bots: {e}\n"
                  f"  uv pip install --python .venv/bin/python 'jax[cpu]'")

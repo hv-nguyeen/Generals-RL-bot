@@ -27,6 +27,7 @@ from __future__ import annotations
 import numpy as np
 
 from bot import features, rules
+from bot.memory import TemporalMemory
 from bot.obs import Obs
 from bot.policy.net import Net
 
@@ -43,8 +44,9 @@ class EnsembleNet:
         self.mode = mode
         self.arch = self.nets[0].arch
 
-    def logits(self, obs: Obs, tta: bool = False, full: bool = False) -> np.ndarray:
-        outs = [n.logits(obs, tta=tta, full=full) for n in self.nets]
+    def logits(self, obs: Obs, tta: bool = False, full: bool = False,
+               memory=None) -> np.ndarray:
+        outs = [n.logits(obs, tta=tta, full=full, memory=memory) for n in self.nets]
         if len(outs) == 1:
             return outs[0]
         if self.mode == "logit":
@@ -67,6 +69,7 @@ class EnsemblePolicy:
         self.H, self.W = h, w
         self.tta = tta
         self.full = full
+        self.memory = TemporalMemory(h, w)
         self.last_debug: dict = {}
         # Pay every member's first-forward cost before the first frame, for the
         # same reason ClonePolicy does: construction is outside the move budget.
@@ -78,8 +81,13 @@ class EnsemblePolicy:
             for g in symmetry.group(h, w, full):
                 symmetry.maps(h, w, g)
 
+    def score_logits(self, obs: Obs) -> np.ndarray:
+        self.memory.update(obs)
+        return self.net.logits(obs, tta=self.tta, full=self.full,
+                               memory=self.memory)
+
     def act(self, obs: Obs, deadline=None):
-        logits = self.net.logits(obs, tta=self.tta, full=self.full)
+        logits = self.score_logits(obs)
         mask = features.legal_mask(obs)
         if not mask.any():
             return rules.PASS_ACTION

@@ -17,7 +17,9 @@ from bot import rules
 from bot.obs import Obs
 
 PAD = 21                      # every competition board fits in 21x21
-C = 24                        # feature channels: 12 spatial, then 12 broadcast
+BASE_C = 24                   # one-frame channels; old checkpoints use this
+MEMORY_C = 16                 # observation-only temporal channels
+C = BASE_C + MEMORY_C
 DIRS_N = 4
 SPLITS = 2
 BUILD_OFFSET = DIRS_N * SPLITS      # slot 8 of a cell is "build a castle here"
@@ -31,7 +33,12 @@ PASS_INDEX = N_ACTIONS - 1
  # LAST channels and stay contiguous — `encode` fills them as one slice.
  CLOCK, PARITY, GROW_PHASE, DEATHTOUCH,
  ARMY_TOTAL_MINE, ARMY_TOTAL_OPP, LAND_MINE, LAND_OPP,
- GARRISON, HIDDEN_OPP, MAX_STACK_MINE, MAX_STACK_OPP) = range(C)
+ GARRISON, HIDDEN_OPP, MAX_STACK_MINE, MAX_STACK_OPP) = range(BASE_C)
+
+(MEM_MINE, MEM_OPP, MEM_NEUTRAL, MEM_ARMY_MINE, MEM_ARMY_OPP,
+ MEM_STALENESS, EVER_SEEN, EVER_ENEMY, ENEMY_CASTLE,
+ MY_GAINED, OPP_GAINED, MY_ARMY_DELTA, OPP_ARMY_DELTA,
+ DELTA_MY_ARMY, DELTA_OPP_ARMY, DELTA_LAND_ADV) = range(BASE_C, C)
 
 
 def scalar_features(turn, my_army, opp_army, my_land, opp_land,
@@ -109,7 +116,37 @@ def scalar_features(turn, my_army, opp_army, my_land, opp_land,
             log1p(max_opp) / 6.0)
 
 
-def encode(obs: Obs) -> np.ndarray:
+def memory_planes(obs: Obs, memory) -> np.ndarray:
+    """Build the temporal suffix after ``memory.update(obs)``."""
+    p = np.zeros((MEMORY_C, PAD, PAD), dtype=np.float32)
+    h, w = obs.H, obs.W
+    mine = memory.mem_owner == rules.OWNER_ME
+    opp = memory.mem_owner == rules.OWNER_OPP
+    neutral = memory.ever_seen & ~(mine | opp)
+    p[MEM_MINE - BASE_C, :h, :w] = mine
+    p[MEM_OPP - BASE_C, :h, :w] = opp
+    p[MEM_NEUTRAL - BASE_C, :h, :w] = neutral
+    la = np.log1p(np.maximum(memory.mem_army, 0).astype(np.float32)) / 6.0
+    p[MEM_ARMY_MINE - BASE_C, :h, :w] = np.where(mine, la, 0.0)
+    p[MEM_ARMY_OPP - BASE_C, :h, :w] = np.where(opp, la, 0.0)
+    age = np.where(memory.ever_seen,
+                   np.clip((obs.turn - memory.mem_turn) / 200.0, 0.0, 1.0),
+                   1.0)
+    p[MEM_STALENESS - BASE_C, :h, :w] = age
+    p[EVER_SEEN - BASE_C, :h, :w] = memory.ever_seen
+    p[EVER_ENEMY - BASE_C, :h, :w] = memory.ever_enemy
+    p[ENEMY_CASTLE - BASE_C, :h, :w] = memory.enemy_castles
+    p[MY_GAINED - BASE_C, :h, :w] = memory.my_gained
+    p[OPP_GAINED - BASE_C, :h, :w] = memory.opp_gained
+    p[MY_ARMY_DELTA - BASE_C, :h, :w] = np.tanh(memory.my_army_delta / 16.0)
+    p[OPP_ARMY_DELTA - BASE_C, :h, :w] = np.tanh(memory.opp_army_delta / 16.0)
+    p[DELTA_MY_ARMY - BASE_C, :h, :w] = np.tanh(memory.delta_my_army / 50.0)
+    p[DELTA_OPP_ARMY - BASE_C, :h, :w] = np.tanh(memory.delta_opp_army / 50.0)
+    p[DELTA_LAND_ADV - BASE_C, :h, :w] = np.tanh(memory.delta_land_adv / 10.0)
+    return p
+
+
+def encode(obs: Obs, memory=None) -> np.ndarray:
     """(C, PAD, PAD) float32 from one fogged observation."""
     x = np.zeros((C, PAD, PAD), dtype=np.float32)
     h, w = obs.H, obs.W
@@ -121,7 +158,9 @@ def encode(obs: Obs) -> np.ndarray:
     x[OPP, :h, :w] = opp
     x[NEUTRAL, :h, :w] = (o == rules.OWNER_NEUTRAL) & (t == rules.T_PLAIN)
     x[FOG, :h, :w] = (t == rules.T_FOG) | (t == rules.T_STRUCTURE_IN_FOG)
-    x[MOUNTAIN, :h, :w] = (t == rules.T_MOUNTAIN) | (t == rules.T_STRUCTURE_IN_FOG)
+    x[MOUNTAIN, :h, :w] = (memory.known_mountains if memory is not None else
+                            ((t == rules.T_MOUNTAIN) |
+                             (t == rules.T_STRUCTURE_IN_FOG)))
     x[CASTLE, :h, :w] = t == rules.T_CASTLE
     x[MY_GEN, :h, :w] = (t == rules.T_GENERAL) & mine
     x[OPP_GEN, :h, :w] = (t == rules.T_GENERAL) & opp
@@ -148,11 +187,13 @@ def encode(obs: Obs) -> np.ndarray:
     # that is usually just the garrison would carry no extra information.
     max_mine = float(np.where(mine & ~is_gen, a, 0).max()) if (mine & ~is_gen).any() else 0.0
     max_opp = float(np.where(opp, a, 0).max()) if opp.any() else 0.0
-    x[CLOCK:, :h, :w] = np.array(
+    x[CLOCK:BASE_C, :h, :w] = np.array(
         scalar_features(obs.turn, obs.my_army, obs.opp_army,
                         obs.my_land, obs.opp_land, garrison, hidden_opp,
                         max_mine, max_opp),
         dtype=np.float32)[:, None, None]
+    if memory is not None:
+        x[BASE_C:] = memory_planes(obs, memory)
     return x
 
 

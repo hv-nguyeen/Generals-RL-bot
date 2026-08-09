@@ -135,6 +135,7 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -143,6 +144,7 @@ import numpy as np
 
 from arena import agents
 from bot import features, rules
+from bot.memory import TemporalMemory
 from bot.policy.net import (DEFAULT_CHANNELS, DEFAULT_LAYERS, Net, arch_record,
                             trunk_keys)
 from learn.league import allocate, dense, fictitious_play, stderr
@@ -174,8 +176,11 @@ def policy_keys(arch: dict) -> set:
     Derived, not enumerated: the old hardcoded set silently projected a deeper
     checkpoint down onto four layers and trained the truncation.
     """
-    return ({f"{n}_{s}" for n in trunk_keys(arch["layers"], arch["residual"])
+    keys = ({f"{n}_{s}" for n in trunk_keys(arch["layers"], arch["residual"])
              for s in "wb"} | {"head_w", "head_b", "pass_w", "pass_b"})
+    if arch.get("context", False):
+        keys |= {"context_global", "context_region"}
+    return keys
 
 
 # --------------------------------------------------------------------------
@@ -387,6 +392,7 @@ def _rollout(job):
     grid = mapgen.pool_grid(maps, seed) if (greedy and maps) else mapgen.generate(seed)
     st = engine.from_grid(grid)
     net = Net(_CTX["live"])
+    memory = TemporalMemory(*grid.shape)
     foe = agents.make(_CTX["specs"][opp], 1 - seat, *grid.shape, seed)
     rng = np.random.default_rng(seed * 2 + seat)
 
@@ -394,14 +400,15 @@ def _rollout(job):
     turns, faults = 0, 0
     for turns in range(1, _CTX["max_turns"] + 1):
         obs = engine.observe(st, seat)
+        memory.update(obs)
         mask = features.legal_mask(obs)          # PASS is always legal: never empty
-        lg = np.where(mask, net.logits(obs), -np.inf)
+        lg = np.where(mask, net.logits(obs, memory=memory), -np.inf)
         lg -= lg.max()
         p = np.exp(lg)
         p /= p.sum()
         idx = int(np.argmax(p)) if greedy else int(rng.choice(len(p), p=p))
         if not greedy:
-            xs.append(features.encode(obs).astype(np.float16))
+            xs.append(features.encode(obs, memory).astype(np.float16))
             ids.append(idx)
             masks.append(mask)
             lps.append(np.log(p[idx]))
@@ -552,7 +559,8 @@ def selfcheck() -> None:
 
     # --- a checkpoint round-trips into the loader the submission uses. Not the
     #     4x32 default: a residual trunk is what would break the key plumbing.
-    arch = {"layers": 5, "channels": DEFAULT_CHANNELS, "residual": True}
+    arch = {"layers": 5, "channels": DEFAULT_CHANNELS, "residual": True,
+            "context": False}
     names = trunk_keys(arch["layers"], arch["residual"])
     ch, p, prev = arch["channels"], {}, features.C
     for n in names:
@@ -565,7 +573,7 @@ def selfcheck() -> None:
     p["pass_b"] = np.float32(0.0)
     assert set(p) == policy_keys(arch), set(p) ^ policy_keys(arch)
     assert len(policy_keys({"layers": DEFAULT_LAYERS, "channels": ch,
-                            "residual": False})) == 2 * DEFAULT_LAYERS + 4
+                            "residual": False, "context": False})) == 2 * DEFAULT_LAYERS + 4
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "ck.npz"
         publish(p, path)
@@ -599,14 +607,23 @@ def main() -> None:
     ap.add_argument("--league", default=None, help="league.json; the ONLY source of sigma")
     ap.add_argument("--init", default="/local/data/vng205/clone.npz",
                     help="behaviour clone to start from and to anchor to")
+    ap.add_argument("--init-critic", default=None,
+                    help="gated standalone value model or PPO resume critic; "
+                         "must match --init architecture")
     ap.add_argument("--out", default="/local/data/vng205/oracle-nn.npz")
     ap.add_argument("--workers", type=int, default=60)
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--games", type=int, default=256, help="per iteration, both seats")
-    ap.add_argument("--epochs", type=int, default=2)
+    ap.add_argument("--epochs", type=int, default=1,
+                    help="PPO/value passes over each rollout buffer. Historical "
+                         "transfer runs used one pass; two amplified critic "
+                         "overfit and policy drift")
     ap.add_argument("--minibatch", type=int, default=4096)
     ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--critic-lr", type=float, default=1e-3)
+    ap.add_argument("--critic-lr", type=float, default=1e-4,
+                    help="critic Adam step. 1e-3 memorised the on-policy buffer "
+                         "in measured full-distance runs; 1e-4 is the safe "
+                         "transfer default")
     ap.add_argument("--warm-evar", type=float, default=0.10,
                     help="hold the policy frozen until the critic explains this "
                          "much of the return; 0 restores the old fixed warmup")
@@ -704,14 +721,22 @@ def main() -> None:
               "print a single entry, so the farming tripwire cannot fire. Raise "
               "--sigma-floor or grow the archive before believing the gate.")
 
-    z0 = np.load(args.init)
+    raw0 = np.load(args.init)
     # The architecture is the checkpoint's, whatever it is; a flag is only ever
     # an assertion about it. arch_of refuses a truncated or mislabelled trunk.
     arch = bc.resolve_arch(args.init, args.layers, args.channels, args.residual)
     keys = policy_keys(arch)
-    missing = keys - set(z0.files)
+    missing = keys - set(raw0.files)
     if missing:
         raise SystemExit(f"{args.init} is not a policy checkpoint, missing {sorted(missing)}")
+    z0 = {k: np.asarray(raw0[k]) for k in keys}
+    if z0["conv0_w"].shape[1] == features.BASE_C and features.C > features.BASE_C:
+        old = z0["conv0_w"]
+        stem = np.zeros((old.shape[0], features.C, 3, 3), np.float32)
+        stem[:, :features.BASE_C] = old
+        z0["conv0_w"] = stem
+        print(f"policy input migration: {features.BASE_C} -> {features.C} channels "
+              "with zero temporal columns (function-preserving)")
     # Names and depth are not enough: an npz trained against a different
     # features.C passes both and then dies inside bc.forward at the first policy
     # step, three iterations and 60 dead workers later.
@@ -728,6 +753,12 @@ def main() -> None:
     theta_ref = dict(theta)          # frozen; never rebound, never in a grad graph
     theta_init = {k: np.asarray(v) for k, v in theta.items()}
     phi = vt.init_params(jax.random.PRNGKey(args.seed), arch)   # critic, same size
+    if args.init_critic:
+        from learn.selfplay import load_critic
+        warm = load_critic(args.init_critic, arch,
+                           {k: np.asarray(v) for k, v in phi.items()})
+        phi = {k: jnp.asarray(v) for k, v in warm.items()}
+        print(f"critic: warm start from {args.init_critic}", flush=True)
     opt_p = {k: (jnp.zeros_like(v), jnp.zeros_like(v)) for k, v in theta.items()}
     opt_v = {k: (jnp.zeros_like(v), jnp.zeros_like(v)) for k, v in phi.items()}
 
@@ -1006,6 +1037,16 @@ def main() -> None:
           f"{'ACCEPTED' if accepted else 'REJECTED'}")
     print(f"  per opponent {per}")
     print(f"wrote {out}  ({time.time() - started:.0f}s)")
+    from tools import manifest
+    inputs = [args.init, args.league, out, out.with_suffix(".last.npz")]
+    if args.init_critic:
+        inputs.append(args.init_critic)
+    manifest.write(out.with_suffix(".manifest.json"), command=sys.argv,
+                   artifacts=inputs,
+                   extra={"kind": "population-ppo", "args": vars(args),
+                          "gate": {"accepted": accepted, "score": score,
+                                   "init_score": init_score, "margin": margin},
+                          "opponents": specs, "sigma": sigma.tolist()})
     if accepted:
         print("Confirm it before believing it:")
         print(f"  python -m arena.runner --a clone:{out} --b ours:configs/v16.json "
