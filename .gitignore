@@ -5,3 +5,5 @@ __pycache__/
 *.pyc
 .DS_Store
 third_party/generals-bots/**/__pycache__/
+*.zip
+*.tar.gz
