@@ -3,6 +3,12 @@
 Date: 2026-08-03
 Target: top 10 on the generals.bot leaderboard (Sprint checkpoint Aug 8, Marathon after).
 
+> **Status 2026-08-09:** this is the original rules/design specification, not the
+> current training recipe. Operational instructions and verified implementation
+> status live in `README.md`, `docs/TOP3-V2-HANDOFF.md`, `docs/STATE.md`, and
+> `docs/CLUSTER.md`. The current incumbent is a C=40/context temporal neural
+> policy; the active experiments split mirror self-play from neural league PPO.
+
 ## 1. Ruleset (ground truth, read from the engine source, not the rules page)
 
 Source: `strakam/generals-bots`, `GeneralsEnv(mode="competition")`.
@@ -76,7 +82,7 @@ bot/            the submission — self-contained, numpy only
     castle.py      build siting and timing
 sim/            exact pure-numpy mirror of the competition transition
 arena/          parallel headless matches, in-process agents, timing enforcement,
-                Elo + SPRT
+                Elo + pair-aware fixed-sample tests
 analysis/       replay format, per-game stats, loss-cause classifier,
                 self-contained HTML replay viewer and report
 tools/          tune.py (CEM parameter search), verify_engine.py (differential
@@ -126,8 +132,9 @@ first-class:
    in-process (no subprocess), enforcing the 150 ms budget and recording a
    replay per game. Replays store only the initial grid plus both action
    streams — the sim is deterministic, so a replay is a few kB.
-2. `arena/rating.py` gives Elo and an SPRT verdict, so "B is better than A" is a
-   statistical claim, not a vibe.
+2. `arena/rating.py` gives Elo and a statistical verdict, so "B is better than A"
+   is a claim over paired fixed-sample evidence, not a vibe. Older design notes
+   call this an SPRT; current output is pair-aware and fixed-sample.
 3. `analysis/report.py` turns a run into an HTML report: win rate, Elo, loss
    causes, land/army curves, time-per-move histogram, castle timings.
 4. `analysis/viewer.py` renders any single game to a self-contained HTML replay
@@ -137,7 +144,7 @@ first-class:
 
 Loss-driven iteration: `report.py` classifies each loss (rushed, starved,
 out-macroed, timed out, drew) and links the replay, so "what went wrong" is one
-click, and a fix is a weight change plus an SPRT run.
+click, and a fix is a weight change plus a paired fixed-sample run.
 
 ## 5. Correctness
 
@@ -148,8 +155,11 @@ click, and a fix is a weight change plus an SPRT run.
 - `arena --stdio` runs the real `bot/run.sh` through the wire protocol so the
   submitted artifact is what was measured.
 
-## 6. Non-goals for now
+## 6. Original non-goals for the first implementation
 
-No RL training code and no torch dependency. The seam is one interface
-(`Policy.act(obs) -> action`) plus a feature encoder the analysis layer needs
-anyway. Revisit after qualification.
+The first implementation intentionally had no RL training code and no torch
+dependency. That boundary has since been extended by the JAX stack under
+`learn/`; the current neural training and promotion workflow is documented in
+the r3 handoff, not in this original design specification. The stable bot seam
+remains one interface (`Policy.act(obs) -> action`) plus a feature encoder the
+analysis layer can inspect.

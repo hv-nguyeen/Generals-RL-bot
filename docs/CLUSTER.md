@@ -22,9 +22,12 @@ The banner also prints GPU_AVAIL per node. **Pick one with ~22G free.** Two JAX
 processes on one L4 OOM at ~22 GB, and the second one dies with
 `RESOURCE_EXHAUSTED`.
 
-`/home/vng205` IS shared between compute nodes, so a tarball uploaded once is
-visible from all of them. `/local/data/vng205` is NOT — each node has its own,
-and the two clusters have identical paths with different contents.
+`/home/vng205` IS shared between compute nodes, so a tarball and small checkpoint
+bundle uploaded once are visible from all of them. `/local/data/vng205` is NOT —
+each node has its own, and the two clusters have identical paths with different
+contents. The home filesystem may show plenty of free space while the user or
+project quota is full; use `du`/`quota`, not only `df`, when a write returns
+`Errno 122`.
 
 ## JupyterHub is not the compute node
 
@@ -49,39 +52,47 @@ that has touched JAX holds GPU memory that `nvidia-smi` reports with **"No
 running processes found"**, because it cannot see across containers — so do not
 train from the Hub, and stop the server when a node looks mysteriously full.
 
-## Install a tarball
+## Install the verified r3 tarball
 
-Upload to home (JupyterHub, or scp with the jump host). If you used the Hub,
-`ls ~` from the SSH shell FIRST and confirm the file is actually there — the two
-homes are not guaranteed to be the same one. Then:
-
-```bash
-ls -lh ~/generals-bot-YYYYMMDD-HHMM.tar.gz
-```
-
-Check the byte count against what was quoted. Home has a ~3 GB quota that has
-silently truncated uploads three times.
+Upload `generals-bot-top3-v2-r3.tar.gz` to the shared home directory. If you used
+the Hub, `ls ~` from the SSH shell FIRST and confirm the file is actually there —
+the two homes are not guaranteed to be the same one. The verified bundle hash is
+`8fea299aa929ce02110112496bcd4fe3afd19c6f0896224fe40f51c97de10dec`.
 
 ```bash
-sha256sum ~/generals-bot-YYYYMMDD-HHMM.tar.gz
+ls -lh ~/top3-v2-shared/generals-bot-top3-v2-r3.tar.gz
+```
+
+Check the byte count against what was quoted. Home has a small per-user/project
+quota; a `df -h` line for the PanFS filesystem does not prove that the quota has
+space. If a write returns `Disk quota exceeded`, inspect `du`/`quota` and keep
+the source tree and checkpoints node-local where possible.
+
+```bash
+sha256sum ~/top3-v2-shared/generals-bot-top3-v2-r3.tar.gz
 ```
 
 ```bash
-tar -tzf ~/generals-bot-YYYYMMDD-HHMM.tar.gz >/dev/null && echo OK
+tar -tzf ~/top3-v2-shared/generals-bot-top3-v2-r3.tar.gz >/dev/null && echo OK
 ```
 
 ```bash
-tar -xzf ~/generals-bot-YYYYMMDD-HHMM.tar.gz -C /local/data/vng205
+mkdir -p /local/data/vng205/generals-bot-top3-v2-r3-nodeN
+tar --strip-components=1 \
+  -xzf ~/top3-v2-shared/generals-bot-top3-v2-r3.tar.gz \
+  -C /local/data/vng205/generals-bot-top3-v2-r3-nodeN
 ```
 
-The tarball has a top-level `generals-bot/` directory, so `-C /local/data/vng205`
-lands it in the right place. It carries no `runs/`, so extracting over an
-existing tree keeps every checkpoint and log.
+The tarball has a top-level `generals-bot-top3-v2-r3/` directory and carries no
+`runs/`, weights, replay data, or venv. Extract it to node-local storage; keep
+only small verified checkpoints, critics, hashes, and manifests in shared home.
 
 ## Bringing up a NODE THAT HAS NOTHING
 
-Only `/home/vng205` is shared. `/local/data` is per-node, so a fresh node needs
-the venv, the repo, the board pools and the checkpoints. In that order.
+Only `/home/vng205` is shared. `/local/data` is per-node, so a fresh node needs a
+node-local source tree and Python/JAX environment. The source comes from the
+shared tarball; the 5.5 GB venv must not be copied through home. Copy or install
+the venv node-locally, then load the incumbent/critic from shared home.
 
 `make setup` installs the package and numpy only — `bot/` is numpy-only by
 design. `make setup-cpu` is for laptop verification, not this GPU node. Pin the
@@ -329,10 +340,13 @@ for p in /proc/[0-9]*; do tr '\0' ' ' < $p/cmdline 2>/dev/null | grep -q "spN" &
 
 Also: `tail -3 file` fails on this shell. Use `tail -n 3`, one file per command.
 
-## Running a training job
+## Running the two continuation arms
 
 ```bash
-nohup $PY -m learn.selfplay --init CHECKPOINT.npz --out runs/nn/spN.npz --backend gpu --workers 60 --iters 1200 --warm-evar 0.05 --stage-cap 400 --games 256 > runs/nn/spN.log 2>&1 &
+nohup $PY -m learn.selfplay --init CHECKPOINT.npz --init-critic CRITIC.npz \
+  --out runs/top3-v2/selfplay-node1/selfplay.npz --workers 60 --iters 600 \
+  --start-stage 4 --stage-replay 0 --games 256 --warm-evar 0.10 \
+  > runs/top3-v2/selfplay-node1.log 2>&1 &
 ```
 
 `nohup` + `&` survives the SSH session dropping. **Launch it once** — two
@@ -340,7 +354,8 @@ instances writing the same `--out` clobber each other's checkpoints and split
 the box.
 
 ```bash
-sleep 300; grep -E "^iter|^comp-eval" runs/nn/spN.log | tail -n 4
+sleep 300; grep -E '^(iter|stage-eval|comp-eval)|RE-FREEZE|COLLAPSE' \
+  runs/top3-v2/selfplay-node1.log | tail -n 20
 ```
 
 Confirm `devices: [CudaDevice(id=0)]`, the expected stage, and iterations
@@ -350,11 +365,31 @@ the safe default.
 Watch it with:
 
 ```bash
-grep -E "^comp-eval|STAGE|KILL|COLLAPSE" runs/nn/spN.log | tail -n 20
+grep -E "^(iter|stage-eval|comp-eval)|RE-FREEZE|KILL|COLLAPSE" \
+  runs/top3-v2/selfplay-node1.log | tail -n 20
 ```
 
-`comp-eval` is the only progress number. `.best.npz` is rewritten whenever it
-improves, so killing the run at any point keeps the best policy.
+`stage-eval` is the self-play comparison to the weights entering the stage;
+`comp-eval` is the external-opponent diagnostic and may saturate against weak
+heuristics. Neither replaces the final fresh 2,000-game direct incumbent test.
+`.best.npz` is a checkpoint, not an acceptance decision.
+
+The adversarial arm is:
+
+```bash
+nohup $PY -m learn.league --oracle net --nn-no-fallback \
+  --nn-init CHECKPOINT.npz --nn-init-critic CRITIC.npz \
+  --seeds 'clone:CHECKPOINT.npz,snipe:CHECKPOINT.npz,greedy,hunter,expander,ours:configs/v16.json' \
+  --dir /local/data/vng205/top3-v2/ceiling-r2 \
+  --out /local/data/vng205/top3-v2/ceiling-r2/winner.json \
+  --iters 1 --nn-iters 300 --nn-games 384 --nn-epochs 1 \
+  --nn-lr 5e-5 --nn-critic-lr 1e-4 --nn-warm-evar 0.10 \
+  --nn-sigma-floor 0.50 --workers 60 \
+  > /local/data/vng205/top3-v2/ceiling-r2.log 2>&1 &
+```
+
+Here the archive members do affect training. Use `ps -ef | grep '[l]earn'` when
+`pgrep` is unavailable, and initialize `RUN`/`LOG` again in every new shell.
 
 ## Packaging a submission
 

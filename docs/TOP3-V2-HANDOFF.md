@@ -1,6 +1,6 @@
 # Top-3 v2 implementation and verification handoff
 
-Date: 2026-08-08
+Date: 2026-08-09
 Target: a reproducible training and promotion pipeline capable of producing a
 materially stronger generals.bot submission.
 Review owner: Fable (independent verification)
@@ -34,9 +34,27 @@ failed neural oracles do not enter the archive, and candidates cannot be called
 promoted without passing the defined statistical, fault, runtime, and artifact
 gates.
 
-No v2 weights were trained in this workspace. Training needs the replay corpus,
-the incumbent checkpoint from the VU cluster, and GPU time. The repository is
-ready for that run after the independent checks below pass.
+The r3 source bundle has now been installed and verified on the VU cluster. The
+current neural weights remain external to git: use the immutable
+`incumbent-refresh-onpolicy.npz` plus its matching `.critic.npz` as the starting
+pair. The repository is not a random-weight or fresh-BC training recipe.
+
+Current continuation arms are deliberately different:
+
+- Node 1 runs `learn.selfplay` at competition distance. Its `--opp` list is
+  evaluation-only; it does not train against those opponents.
+- Node 2 runs `learn.league --oracle net`. Its `clone:` archive members are
+  sampled during rollouts and do affect training.
+
+The Node 2 `ceiling-r2` pilot completed 300 neural iterations but failed its
+fresh gate (`0.539` trained versus `0.504` init; `+0.071` required). Keep its
+logs and checkpoints as negative evidence only. Node 1 also has no acceptance
+result; its Stage-5 transition was forced at the stage cap rather than earned
+by two passing stage evaluations.
+
+The old ladder ZIP is iteration 150 and the current incumbent is the later local
+continuation. No new candidate is a champion until it beats the immutable
+incumbent on fresh direct games and passes the full promotion suite.
 
 ### Post-review correction: continuation is the primary arm
 
@@ -67,8 +85,9 @@ They are repaired in the replacement bundle:
 2. League runoff scores are serialized from their sparse dictionary into a
    JSON-safe record. Both terminal winner paths now reach manifest creation.
 3. Promotion suite schema 2 treats greedy only as a catastrophic-regression
-   check (`lower_score >= 0.70`), not as a strength proxy. The +25 Elo incumbent
-   SPRT remains the promotion decision.
+   check (`lower_score >= 0.70`), not as a strength proxy. New runner/evaluator
+   output uses paired fixed-sample evidence and a conservative lower bound; it
+   is not an SPRT even where older filenames retain that compatibility key.
 4. Promotion moved from the already-consumed 3,000,000 seed block to the fresh
    8,000,000 block; each matchup receives a disjoint sub-block.
 5. `make verify` now runs stateful memory parity automatically. It uses close
@@ -99,7 +118,7 @@ not a constant; save the next run's `leaderboard.json` with the artifacts.
 
 | Ceiling cause | Why it blocked progress | Implemented correction | Proof or gate |
 |---|---|---|---|
-| Single-lineage evaluation | A candidate could farm v16/greedy and lose to the field. Historical local rankings repeatedly inverted ladder rankings. | `tools.evaluate` evaluates champion, sniper, hunter, greedy, expander, plus optional archive opponents. `learn.league` grows an exploit archive. | Fresh paired boards, conservative lower bounds, +25 Elo SPRT, 2000 games per bucket. |
+| Single-lineage evaluation | A candidate could farm v16/greedy and lose to the field. Historical local rankings repeatedly inverted ladder rankings. | `tools.evaluate` evaluates champion, sniper, hunter, greedy, expander, plus optional archive opponents. `learn.league` grows an exploit archive. | Fresh paired boards, conservative lower bounds, 2000 games per bucket; direct incumbent comparison is mandatory. |
 | Stateless neural policy | Fog history, ownership transitions, stale army information, and enemy castle evidence disappeared every turn. The rich heuristic `Belief` never reached the net. | `bot.memory.TemporalMemory` and 16 temporal planes are used in inference, replay data, Python rollout, and JAX rollout. | Full-trajectory NumPy/JAX seam check; same-turn updates are idempotent. |
 | Mostly local receptive field | A local move head could not directly compare global reserves, remote threats, or board regions. | Trainable valid-masked global and 3x3 regional context mixer; critic pools mean, max, and nine regional means. | NumPy/JAX forward self-check and explicit pooled-value parity test. |
 | Weak/leaky value training | Position-level splits leak near-identical states. Draws were discarded. BCE and direct game value used incompatible units. Long games dominated metrics. | Direct `-1/0/+1` targets including draws; complete-game split; source-namespaced game IDs; game-balanced Huber fit and metrics; schema-2 checkpoints. | Tests prove no game crosses the split and equal raw IDs from different sources remain distinct. |
@@ -143,7 +162,35 @@ flowchart TD
     X --> E
 ```
 
-## Exact training sequence
+## Historical bootstrap sequence (completed)
+
+The following sequence documents how the C=40/context incumbent was built from
+the archived sp16 checkpoint. Do not restart it from the old sp16 path for the
+current experiment. For current work, use the continuation recipe below.
+
+### Current two-node continuation
+
+Use node-local run directories and shared home only for the source tarball and
+small checkpoint/critic artifacts. Set `P` to the immutable incumbent and `V`
+to its matched critic. Node 1's self-play command may include `--opp` opponents
+for measurement, but those opponents do not train the policy. Node 2's neural
+league command is the arm that trains against its archive mixture.
+
+The current run names are `selfplay-node1` and `ceiling-r2`; `ceiling-r1` is
+retained for inspection, and `ceiling-r2` is now a rejected pilot. Watch the
+logs with `grep`/`tail`; do not use the existence of `.best.npz` as a promotion
+decision. At the end, compare only a viable candidate with:
+
+```bash
+$PY -m arena.runner --a ship:CANDIDATE.npz --b ship:"$P" \
+  --games 2000 --workers 60 --seed0 9300000 \
+  --out runs/top3-v2/candidate-vs-incumbent
+```
+
+Then run `snipe:$P@120`, `snipe:$P@160`, and the unchanged promotion suite.
+Only after those tests pass may accepted candidates be added as `clone:` archive
+members for a cross-training league. `learn.selfplay --opp` is never a
+substitute for that direct comparison.
 
 Do not overwrite the incumbent. Copy its exact `.npz` from the cluster first,
 record its SHA-256, and keep it as `runs/top3-v2/incumbent.npz`. The clean
@@ -468,7 +515,8 @@ Add accepted archive networks as extra opponents when practical:
 
 A candidate is promoted only when `summary.json` says all of the following:
 
-- champion bucket lower score >= 0.5 and SPRT accepts H1 at +25 Elo;
+- champion bucket lower score >= 0.5 and the paired fixed-sample incumbent test
+  passes its configured lower-bound criterion;
 - sniper lower score >= 0.45;
 - hunter lower score >= 0.90;
 - greedy lower score >= 0.70. This is a catastrophic-regression floor only;
@@ -521,7 +569,7 @@ games to be interpretable.
 | BC | Finite training; no patience/NaN failure; artifact manifest present | Fix fit/data; no strength claim. |
 | Critic | Complete-game holdout; target variance > 0.05; decided fraction > 0.1; evar gain over scalar >= 0.02; ECE <= 0.15 | Do not launch PPO. |
 | Population | Effective opponents >= 2; neural oracle fresh gate accepted; no seed/pool overlap warning | Increase diversity or reject oracle. |
-| Promotion | Every matchup floor, +25 Elo champion SPRT, zero faults, <=125 ms | Keep incumbent. |
+| Promotion | Every matchup floor, paired incumbent lower-bound test, zero faults, <=125 ms | Keep incumbent. |
 | Artifact | Expected weight hash matches packaged hash; stdio smoke passes | Do not upload. |
 | Ladder | Canary has no faults or catastrophic failure; sufficient field sample before an Elo conclusion | Roll back or continue measuring. |
 

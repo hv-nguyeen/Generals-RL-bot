@@ -1,6 +1,37 @@
-# Where the project is — 2026-08-08
+# Where the project is — 2026-08-09
 
-> **2026-08-08 v2 implementation note:** the actionable plan at the top of this
+## Current operational state
+
+The verified r3 source is committed at `5997415` and installed on two compute
+nodes. The immutable local starting policy is
+`runs/top3-v2/incumbent-refresh-onpolicy.npz` (SHA-256
+`cb8d2bfa9cff1f03f6b6f67245e322f149bf7e958a03e0c1c489e7fd4099f386`) with its
+matched `.critic.npz`. It beat the archived sp16 incumbent by +106 Elo over
+2,000 local games; this is a local result, not a ladder claim.
+
+The two-node experiment is intentionally split:
+
+1. **Node 1:** `learn.selfplay`, starting at competition distance. It trains
+   mirror self-play; `--opp` controls only `comp-eval` measurement. Its latest
+   observed Stage-5 transition was forced at the stage cap, not earned by the
+   `stage-eval` gate.
+2. **Node 2:** `learn.league --oracle net`, which trained against the archive
+   mixture including `clone:$P`, randomized snipe, and heuristic/config anchors.
+   It completed its 300-iteration pilot but failed the final gate: trained
+   `0.539` versus init `0.504`, requiring `+0.071`.
+
+The old `ceiling-r1` league process was interrupted around iteration 39 and has
+only `.best/.live` artifacts, not an acceptance gate. Node 2 `ceiling-r2` is
+also retained as a rejected experiment, not a candidate. Node 1 remains
+unaccepted. A high `comp-eval` against greedy/hunter is not a ceiling result;
+the required follow-up is a fresh 2,000-game `ship:candidate` versus
+`ship:incumbent`, pinned snipe tests, then the full promotion suite.
+
+Keep run outputs on each node's `/local/data` (it is not shared). Copy only
+verified checkpoints, critics, hashes, and manifests into the shared home
+directory. Do not copy the venv or replay lake into home.
+
+> **2026-08-09 v2 implementation note:** the actionable plan at the top of this
 > file has now been implemented and is superseded by
 > [`TOP3-V2-HANDOFF.md`](TOP3-V2-HANDOFF.md). Temporal channels, complete-game
 > value splits, direct draw-aware targets, spatial value pooling, strict configs,
@@ -79,21 +110,18 @@ the run during a normal stale patch.
 
 ## What to do next, in order
 
-1. **An opponent in a TRAINING seat.** Still never tried, and now the
-   highest-value item rather than the third. Everything measured on 2026-08-08 was
-   learned in a mirror where both seats build and neither is punished for the
-   tempo, so the castle rate may be calibrated against itself and wrong against an
-   aggressor. `vecroll` stacks both seats through one forward, so this is real
-   surgery, not a flag.
-2. **A critic that tracks a moving policy.** The refit loop works but caps the
-   duty cycle near 50%. More independent games help more than a finer stride —
-   the failure mode is memorising trajectories, and 226k samples are only ~512
-   independent games.
-3. **Temporal channels.** Unchanged from the last revision: the encoder sees one
-   frame and cannot tell an advancing stack from a parked one, and the ladder
-   losses are decapitations 7–36 turns after the general empties.
-4. **Inference compute.** TTA is +31.2 for zero training at 5 ms of a 150 ms
-   budget. Still 96% unspent.
+1. **Finish the two divergent arms.** Node 1 is the competition-distance mirror
+   self-play/economy arm; Node 2 is the archive-mixture neural league arm.
+2. **Use direct incumbent tests.** `comp-eval` against weak heuristics can
+   saturate. For every viable checkpoint, run fresh paired `ship:candidate` vs
+   `ship:incumbent`, then pinned `snipe@120` and `@160`, followed by the full
+   promotion suite.
+3. **Cross-train only accepted candidates.** Add a validated Node 1/Node 2
+   checkpoint as a `clone:` archive member in a new league. Do not use
+   `learn.selfplay --opp` as if it trained against that opponent; it does not.
+4. **Only then test capacity.** A function-preserving 8x64/context growth is a
+   separate ceiling arm, not something to combine with a failed opponent-mixture
+   run.
 
 ---
 
@@ -194,10 +222,11 @@ pair the improved policy with the last critic known to have been healthy.
 2. **More of the move budget.** Search needs a `bot/`-side transition function and
    a trustworthy evaluator, and both are logged traps -- but TTA proves the axis
    pays, and 145 ms a move is still unspent.
-3. **An opponent in a TRAINING seat.** Still never tried. Symmetric self-play is
-   the most-replicated failure here: castles get deleted at every stage because a
-   mirror cancels the signal. `vecroll` stacks both seats through one forward, so
-   this is real surgery, not a flag.
+3. **An opponent in a TRAINING seat.** This was still never tried when this
+   historical section was written. The current Node 2 `learn.league --oracle net`
+   arm is the first attempt to train against an archive mixture; the Node 1
+   `learn.selfplay` arm remains mirror self-play and uses `--opp` only for
+   measurement.
 
 ## THE RECIPE IS EXHAUSTED — six runs from `sp9-i600`, none beat it
 
@@ -230,9 +259,10 @@ agreeing on nothing. Pooled score oscillated 0.545-0.655 around a 0.573 base for
 1200 iterations with no trend.
 
 So the four hidden-army channels did not rescue it, and neither did width, stage,
-or more iterations. **Stop launching self-play runs from the champion.** The two
-things never tried are below: a critic trained on real games, and an opponent in
-a TRAINING seat rather than the eval set.
+or more iterations. **Stop launching identical historical self-play runs from
+the champion.** At the time, the two things not yet tried were a critic trained
+on real games and an opponent in a TRAINING seat; both are now represented by
+the current continuation arms documented at the top of this file.
 
 One detail worth carrying: both sp17 and sp18 ended at `bld 0.01` with `bldA`
 around -3, having stopped building castles entirely. Every checkpoint that

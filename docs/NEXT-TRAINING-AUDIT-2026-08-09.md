@@ -1,27 +1,40 @@
-# Next-training audit and rush-resilience pilot — 2026-08-09
+# Next-training audit and continuation experiments — 2026-08-09
 
 This is the verification handoff for the source after checkpoint commit
-`043456f` (`feat: harden top3 v2 training pipeline`). It separates reproduced
+`5997415` (`fix: harden neural training and promotion`). It separates reproduced
 correctness defects from strategic hypotheses. None of the code changes below
 is evidence that playing strength improved; only fresh terminal games and then
 a sufficiently large ladder sample can establish that.
 
+## Execution status
+
+The r3 bundle was installed and `make verify` passed on both nodes. The finished
+incumbent was used as the starting point for two divergent arms; neither earned
+promotion:
+
+| arm | method | current status |
+|---|---|---|
+| Node 1 `selfplay-node1` | competition-distance mirror self-play | unaccepted; Stage 5 was reached by the 200-iteration cap, not the stage gate |
+| Node 2 `ceiling-r2` | neural league PPO against archive mixture | completed and rejected: trained 0.539 vs init 0.504; required +0.071 |
+| Node 1 `ceiling-r1` | earlier neural league duplicate | interrupted around iteration 39; `.best/.live` only, no gate |
+
+`--opp` in `learn.selfplay` is evaluation-only. Only `learn.league --oracle
+net` trains against its archive mixture. A candidate must be tested directly
+against the incumbent before any claim about a higher ceiling.
+
 ## Executive decision
 
-Do **not** fine-tune from the ladder-tested ZIP yet. The ladder evidence is for
-the iteration-150 artifact, while the completed policy is the iteration-850
-checkpoint and has never been tested against the reported rush opponents.
+The ladder-tested ZIP remains the iteration-150 artifact; it is not the current
+incumbent. The safe source install, incumbent identity check, fresh snipe audit,
+and first neural pilot have already been completed. The current decision loop is:
 
-The smallest safe sequence is:
-
-1. install and verify this source;
-2. measure the immutable final policy against random, `@120`, and `@160` snipe
-   on fresh paired boards;
-3. launch one fixed-root neural-oracle pilot only if that final policy still has
-   a statistically clear weakness;
-4. evaluate the accepted neural checkpoint externally against the two pinned
-   snipers and the untouched economy/incumbent buckets;
-5. only then consider a longer adversarial run.
+1. keep the immutable incumbent and its matched critic unchanged;
+2. retain the rejected Node 2 run as negative evidence and decide whether Node 1
+   is worth finishing;
+3. test any viable Node 1 `.best` checkpoint directly against `ship:$P` on fresh paired
+   games, then run pinned snipe and the full promotion suite;
+4. add only accepted candidates as `clone:` members of a new league for
+   cross-training.
 
 No replay shard rebuild is needed for this first pilot. No garrison rule,
 banking override, castle reward, territory reward, or fixed early defence has

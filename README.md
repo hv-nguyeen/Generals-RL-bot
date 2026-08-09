@@ -3,11 +3,36 @@
 A bot for the [generals.bot](https://www.generals.bot) 1v1 competition, plus the
 arena and analysis tooling to make it better.
 
-**The submission is a neural policy**, not the heuristic — 8 layers, 32 channels,
-~74k parameters, trained by curriculum self-play PPO. The heuristic is still in
-`bot/policy/controller.py` and still runs as a fallback and as a benchmark
-opponent (`ours:configs/v16.json`), but it has been retired as a submission: it
-peaked around 1737 Elo and the net is ~130 above it.
+**The submission is a neural policy**, not the heuristic — the current incumbent
+is an 8-layer, 32-channel C=40/context network (about 79k parameters) with
+observation-only temporal memory. The heuristic remains in
+`bot/policy/controller.py` as a fallback and benchmark opponent
+(`ours:configs/v16.json`), but is not the submission.
+
+## Current training status — 2026-08-09
+
+The verified source bundle is r3 (`5997415`). The immutable strong starting
+policy is `runs/top3-v2/incumbent-refresh-onpolicy.npz` with its matched
+`incumbent-refresh-onpolicy.critic.npz`; the policy hash is
+`cb8d2bfa9cff1f03f6b6f67245e322f149bf7e958a03e0c1c489e7fd4099f386`.
+It beat the archived sp16 incumbent by +106 Elo over 2,000 local games, but
+that is not a ladder or top-three claim.
+
+Two deliberately different continuation arms were launched from that same
+pair:
+
+- **Node 1:** `learn.selfplay` at competition distance. `--opp` is evaluation
+  only; the training seats are mirror self-play. It has not passed its stage
+  gate; its latest observed Stage-5 transition was forced at the iteration cap.
+- **Node 2:** `learn.league --oracle net`, which actually samples the opponent
+  archive (including `clone:$P`) during training. Its final gate was rejected:
+  trained `0.539` versus init `0.504`, below the required `+0.071`.
+
+Neither run overwrote the incumbent, and Node 2 produced no promotable candidate.
+A candidate is promotable only after a fresh direct `ship:candidate` versus
+`ship:incumbent` test, pinned rush tests, and the unchanged promotion suite.
+`eval` or `comp-eval` against weak bots is not sufficient evidence of a higher
+ceiling.
 
 **Read [`docs/TOP3-V2-HANDOFF.md`](docs/TOP3-V2-HANDOFF.md) first.** It is the
 current implementation, gates, exact training sequence, and verification handoff.
@@ -35,7 +60,7 @@ be pasted straight back into a chat:
 ```bash
 make diag WORKERS=32                    # full, a few minutes
 make diag-quick WORKERS=8               # ~1 minute
-make diag CONFIG=runs/tune/best.json VS=configs/v2.json   # A/B with SPRT
+make diag CONFIG=runs/tune/best.json VS=configs/v2.json   # A/B with paired test
 ```
 
 Read it in this order: any `faults` is a bug that costs real games; `land@200`
@@ -70,8 +95,10 @@ python -m tools.evaluate --candidate runs/new.npz --reference runs/champ.npz \
 ```
 
 `arena/runner.py` plays in-process against a numpy mirror of the competition
-engine. Every seed is played twice with the colours swapped. The promotion suite
-uses 2000 games per bucket; use `--games` only for a smoke test.
+engine. Every seed is played twice with the colours swapped. Results now report
+a pair-aware fixed-sample test; the old `sprt` label is not used for new results.
+The promotion suite uses 2000 games per bucket; use `--games` only for a smoke
+test.
 
 The report classifies every loss (`early_rush`, `out_expanded`, `out_gathered`,
 `blundered`, `timeout`, `draw`), names the config knob each cause points at, and
@@ -145,7 +172,7 @@ bot/            the submission. numpy only, self-contained
 sim/            exact numpy mirror of the competition transition + map generator
 learn/          the training stack (jax). selfplay is the one that produced the
                 shipped policy; train/ is behaviour cloning, exploit/ an exploiter
-arena/          parallel headless matches, agent registry, Elo + SPRT, stdio agent
+arena/          parallel headless matches, agent registry, Elo + paired tests, stdio agent
 analysis/       replays, per-game stats, loss classifier, HTML viewer and report
 tools/          grow, evaluate + manifests, vprobe, package, verify_engine,
                 sweep, tune (CEM), profile_turn
@@ -227,10 +254,11 @@ digest-pinned command above.
 
 ## Current standing
 
-As of 2026-08-08, the live leaderboard reports H.V.Nguyen at rank 29, Elo 1902,
-137W/96L/1D. The top three are ResBot 3212, Kubic 3121, and bca 3034. This is a
-large measured gap; the v2 changes create a credible training and promotion
-pipeline, not a guarantee that one run closes it. See the handoff for the gates.
+The last recorded leaderboard snapshot is historical, not a live claim. Keep the
+leaderboard JSON and exact submitted ZIP with every release; local arena Elo does
+not substitute for a fresh ladder sample. The current v2 work has a strong local
+incumbent and two in-progress continuation arms, but no new candidate has yet
+passed the full promotion suite.
 
 Two things worth knowing before running anything:
 
@@ -243,5 +271,6 @@ under 2000 games as a shortlist rather than a verdict. 2000 games costs ~85
 seconds.
 
 **The submission's weights are not in this repo.** They live on the cluster under
-`runs/nn/`, and `bot/weights.npz` is deleted after packaging on purpose. A clean
-checkout therefore runs the heuristic — that is the intended state, not a bug.
+the run directories, and `bot/weights.npz` is deleted after packaging on purpose.
+A clean checkout therefore runs the heuristic — that is the intended state, not
+a bug.

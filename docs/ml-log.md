@@ -3,7 +3,7 @@
 Running log so nothing gets tried twice. Every entry needs a measured number, not
 an impression. If an entry has no number it does not belong here.
 
-Last updated 2026-08-08.
+Last updated 2026-08-09.
 
 **For the current state and what to do next, read `docs/STATE.md`.** This file is
 the full measured history and the reasoning; that one is the short version.
@@ -154,10 +154,11 @@ Also true and unresolved:
   Use `--opp` with a champion clone so a reading lands near 0.5.
 * **`.best` is therefore close to a lottery** -- the max of ~24 noisy draws is
   the luckiest, not the strongest. Snapshot on a timer and arena several.
-* **It is all learned in a mirror.** Both seats build, so neither is punished for
-  the tempo. The castle rate may be calibrated against itself and wrong against
-  an aggressor. `STATE.md`'s "opponent in a TRAINING seat" is still never tried
-  and is now the highest-value item.
+* **It was all learned in a mirror in this historical entry.** Both seats build,
+  so neither is punished for the tempo. The castle rate may be calibrated against
+  itself and wrong against an aggressor. The current Node 2 continuation is the
+  first neural-league attempt to put archive opponents in the training mixture;
+  treat its result as provisional until it passes the direct incumbent gate.
 
 ## The one-line summary
 
@@ -1351,3 +1352,31 @@ Every live risk was in a side tool, and four were fixed:
 
 **The pattern holds: this project's bugs are in its instruments, not its
 learning.** A lying docstring is a bug, and three of these four were.
+## Current status — 2026-08-09
+
+The current local incumbent is the C=40/context policy
+`runs/top3-v2/incumbent-refresh-onpolicy.npz` (SHA-256
+`cb8d2bfa9cff1f03f6b6f67245e322f149bf7e958a03e0c1c489e7fd4099f386`) with its
+matched critic. It beat the archived sp16 incumbent by +106 Elo over 2,000
+local games; this is not a ladder result.
+
+Two continuation arms were launched from that exact pair. Node 1 uses
+`learn.selfplay` at competition distance. Its `--opp` list is measurement-only,
+so its `stage-eval` is the direct comparison to the stage-entry policy and its
+`comp-eval` is only an external-opponent diagnostic. Node 2 used
+`learn.league --oracle net`; its `clone:` archive members affected training,
+with the opponent mixture floor printed at startup, but its final gate rejected
+the resulting oracle (`0.539` trained vs `0.504` init; `+0.071` required).
+
+Node 1 stage-eval readings remain noisy and have not earned a stage promotion;
+its Stage-5 transition was forced at the stage cap. Node 2's snipe-eval readings
+were noisy and its final gate rejected it. Do not promote `.best` files from
+either run. The next honest measurement is a fresh 2,000-game
+`ship:candidate` versus `ship:incumbent`, pinned snipe tests, and the full paired
+promotion suite.
+
+The interrupted duplicate `ceiling-r1` run is retained as evidence only; it
+stopped before its neural gate and is not a candidate. The later `ceiling-r2`
+neural-league pilot also failed its final gate: trained `0.539` versus init
+`0.504`, with `+0.071` required. It is negative evidence for this mixture and
+hyperparameter setting, not a replacement policy.

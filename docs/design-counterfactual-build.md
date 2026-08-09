@@ -1,5 +1,10 @@
 # Final design review: counterfactual build supervision mixed into PPO
 
+> **Status 2026-08-09:** deferred research design. The current r3 training arms
+> do not use this term. The measured incumbent/critic continuation and neural
+> league should be evaluated first; do not add counterfactual build shaping to a
+> live run without repeating the pre-flight sign test and a matched ablation.
+
 ## 1. Verdict
 
 **DO NOT BUILD** — not as a permanent refusal, but as a refusal to spend three weeks of cluster time before one hour of measurement.
@@ -185,7 +190,7 @@ The control still **generates and logs** forks at `--cf-frac 0.25` with zero wei
 | A4 | **Iteration 50** | Paired comp-eval, treatment minus control, identical `SP_COMP_SEED0` boards (`:315`) | ±0.022 at the standard comp-eval n (400 games/arm) | Abort if `treat - ctrl < -0.03` | Two arms, same boards, same seed — the pairing is the point. |
 | A5 | **Iteration 100** | `bld` at stage 4, treatment vs control, mean over iterations 80-100 | ±0.04 over 20 iterations × 256 games | Abort if `bld_treat <= bld_ctrl` | The term exists to raise the build rate. 100 iterations at half the aux weight and no movement means it never will. |
 | A6 | **Iteration 200** | Aux weight reaches zero by design; run continues on pure PPO. | — | — | Not an abort; the phase boundary. |
-| A7 | **Final** | `python -m arena.runner --a <treat.best> --b <champion> --games 2000`, `faults == 0` | ±15 Elo | **+25 Elo or the arm is not an improvement** | CLAUDE.md's non-negotiable. Measure `.best`, never `.live`. |
+| A7 | **Final** | `python -m arena.runner --a <treat.best> --b <champion> --games 2000`, `faults == 0` | paired lower bound | **positive direct-incumbent lower bound plus the unchanged promotion suite** | Current runner is fixed-sample paired evidence; measure `.best`, never `.live`. |
 
 A3 is the load-bearing one. It is the pre-flight re-run on live weights, and it is cheap because the numbers are already being logged.
 

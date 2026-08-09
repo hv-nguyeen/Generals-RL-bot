@@ -26,11 +26,11 @@ reason. The log exists so none of them gets tried a seventh time.
 
 ## Non-negotiables
 
-- **Never claim a change is an improvement unless `tools.evaluate` passes the
-  versioned promotion suite.** It includes 2000 fresh paired games per bucket,
-  a +25 Elo SPRT against the reigning champion, exploit and baseline floors,
-  zero faults, and the runtime safety margin. **Measure `.best`, never `.live`**:
-  one run read +35.7 on `.best` and -9.2 on `.live`.
+- **Never claim a change is an improvement unless the versioned promotion suite
+  and a fresh direct incumbent comparison pass.** The runner/evaluator use
+  paired fixed-sample evidence; do not call new output an SPRT. Use 2000 fresh
+  games per bucket, inspect the pair-aware lower bound, require zero faults and
+  runtime margin, and measure `.best` rather than `.live`.
 - **`bot/` must stay self-contained and numpy-only.** It is the submission. It
   may not import `sim/`, `arena/`, or `analysis/`.
 - **`sim/engine.py` mirrors the official engine exactly.** If you touch it, run
@@ -45,3 +45,15 @@ reason. The log exists so none of them gets tried a seventh time.
 `bot/policy/controller.py` is the fallback and heuristic opponent.
 `bot/memory.py` is the neural temporal state, while `bot/belief.py` remains the
 richer heuristic belief. `tools.evaluate.py` owns promotion.
+
+## Current training split
+
+The current incumbent is the C=40/context continuation checkpoint
+`runs/top3-v2/incumbent-refresh-onpolicy.npz` with its matching critic. Node 1's
+`learn.selfplay` run is a mirror-self-play/economy arm; its `--opp` list is
+measurement-only. Node 2's `learn.league --oracle net` run is the adversarial
+mixture arm; its `clone:` archive members affect training. Do not confuse a high
+win rate against weak heuristic opponents with a higher ceiling, and do not
+replace the incumbent before fresh direct tests. The `ceiling-r2` pilot completed
+and failed its gate (`0.539` trained vs `0.504` init; `+0.071` required), so it is
+not a candidate.
