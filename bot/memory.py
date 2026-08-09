@@ -11,6 +11,7 @@ from __future__ import annotations
 import numpy as np
 
 from bot import rules
+from bot.board import bfs_field_from
 from bot.obs import Obs
 
 
@@ -22,6 +23,8 @@ class TemporalMemory:
         self.turn = -1
         self.initialised = False
         self.known_mountains = np.zeros((h, w), dtype=bool)
+        self.dist_home = np.full((h, w), h * w, dtype=np.int32)
+        self.general_candidates = np.zeros((h, w), dtype=bool)
         self.mem_owner = np.zeros((h, w), dtype=np.int8)
         self.mem_army = np.zeros((h, w), dtype=np.int32)
         self.mem_turn = np.full((h, w), -1, dtype=np.int32)
@@ -67,13 +70,28 @@ class TemporalMemory:
         known_before = self.ever_seen.copy()
 
         if not self.initialised:
-            # Mountains and neutral castles share the structure-in-fog token.
-            # Treat both as blocked until first sight, then correct below.
+            # The competition ruleset strips neutral castles before turn 1, so
+            # every initial structure-in-fog is a mountain. A mode that retains
+            # neutral castles needs a different, explicitly versioned belief:
+            # after one refogs its ownership is not locally observable.
             self.known_mountains = (
                 (t == rules.T_MOUNTAIN) | (t == rules.T_STRUCTURE_IN_FOG))
+            passable = ~self.known_mountains
+            own_general = np.argwhere((t == rules.T_GENERAL) & mine)
+            if len(own_general):
+                home = (int(own_general[0, 0]), int(own_general[0, 1]))
+            else:
+                owned = np.argwhere(mine)
+                home = ((int(owned[0, 0]), int(owned[0, 1]))
+                        if len(owned) else (0, 0))
+            self.dist_home = bfs_field_from(passable, home)
+            self.general_candidates = (
+                passable
+                & (self.dist_home >= rules.MIN_GENERALS_DISTANCE)
+            )
             self.initialised = True
-        # A revealed neutral/enemy castle disproves the provisional mountain;
-        # an actually visible mountain confirms it.
+        # A revealed built castle disproves the provisional mountain; an
+        # actually visible mountain confirms it.
         self.known_mountains |= t == rules.T_MOUNTAIN
         self.known_mountains &= ~(visible & (t != rules.T_MOUNTAIN))
 
@@ -104,6 +122,17 @@ class TemporalMemory:
         self.mem_turn[visible] = obs.turn
         self.ever_seen |= visible
         self.ever_enemy |= visible & opp
+
+        seen_general = (t == rules.T_GENERAL) & opp
+        if seen_general.any():
+            self.general_candidates[:] = seen_general
+        else:
+            # A visible cell that is not the opponent general is impossible.
+            self.general_candidates &= ~visible
+            if not self.general_candidates.any():
+                self.general_candidates = (
+                    ~self.known_mountains & ~self.ever_seen
+                    & (self.dist_home >= rules.MIN_GENERALS_DISTANCE // 2))
 
         if self.turn >= 0:
             self.delta_my_army = int(obs.my_army) - self._my_army

@@ -44,7 +44,8 @@ from pathlib import Path
 import numpy as np
 
 from bot import features
-from bot.policy.net import arch_of, arch_record, trunk_keys
+from bot.policy.net import (STRATEGY_OUTPUT_BLOCKS, STRATEGY_TOKEN_BLOCKS,
+                            arch_of, arch_record, strategy_spec, trunk_keys)
 
 # Incoming weights for new channels. Small enough not to saturate relu on the
 # first step, large enough that the outgoing gradient is not denormal.
@@ -52,14 +53,28 @@ INIT_SCALE = 0.5
 
 
 def grow(z, layers: int, channels: int, seed: int = 0,
-         context: bool | None = None) -> dict:
+         context: bool | None = None, dense_context: bool | None = None,
+         strategy_hidden: int | None = None) -> dict:
     arch = arch_of(z)
     if arch["residual"]:
         raise SystemExit("residual trunks pair into blocks; grow plain ones only")
     L, C = arch["layers"], arch["channels"]
-    target_context = arch["context"] if context is None else bool(context)
+    source_dense = bool(arch["context"] and np.ndim(z["context_global"]) == 2)
+    target_dense = source_dense if dense_context is None else bool(dense_context)
+    target_context = ((arch["context"] if context is None else bool(context))
+                      or target_dense)
     if arch["context"] and not target_context:
         raise SystemExit("removing a trained context mixer is not function-preserving")
+    if source_dense and not target_dense:
+        raise SystemExit("dense context cannot be reduced to diagonal exactly")
+    source_strategy = strategy_spec(z)
+    source_hidden = int(source_strategy["hidden"]) if source_strategy else 0
+    if strategy_hidden is not None and strategy_hidden < 0:
+        raise SystemExit("strategy hidden width must be zero or positive")
+    if source_strategy and strategy_hidden is not None and strategy_hidden != source_hidden:
+        raise SystemExit("changing or removing a trained strategy module is not "
+                         "function-preserving")
+    target_hidden = source_hidden if source_strategy else int(strategy_hidden or 0)
     if layers < L or channels < C:
         raise SystemExit(f"{L}x{C} cannot grow to {layers}x{channels}; both must not shrink")
 
@@ -100,14 +115,71 @@ def grow(z, layers: int, channels: int, seed: int = 0,
         out[f"conv{j}_b"] = np.zeros((channels,), np.float32)
 
     if target_context:
-        # Adding the mixer at zero is exactly the old local trunk. If the source
-        # already had one, widen its per-channel scales just like a bias vector.
+        # Vector -> diagonal matrix is exact: each old per-channel scale lands
+        # on its diagonal and all new cross-channel terms start at zero.
         for key in ("context_global", "context_region"):
-            v = (np.asarray(z[key], np.float32) if arch["context"]
-                 else np.zeros((C,), np.float32))
-            nv = np.zeros((channels,), np.float32)
-            nv[:len(v)] = v
+            v = (np.asarray(z[key], np.float32) if arch["context"] else None)
+            if target_dense:
+                nv = np.zeros((channels, channels), np.float32)
+                if v is not None and v.ndim == 1:
+                    nv[np.arange(C), np.arange(C)] = v
+                elif v is not None:
+                    nv[:C, :C] = v
+            else:
+                nv = np.zeros((channels,), np.float32)
+                if v is not None:
+                    nv[:C] = v
             out[key] = nv
+
+    if target_hidden:
+        # Keep each pooled/input block and each target-region output block in
+        # place when widening channels. New paths into the historical function
+        # are zero, exactly as in the convolutional Net2Net migration above.
+        if source_strategy:
+            w1 = np.asarray(z["strategy_w1"], np.float32).reshape(
+                STRATEGY_TOKEN_BLOCKS, C, target_hidden)
+            nw1 = np.zeros((STRATEGY_TOKEN_BLOCKS, channels, target_hidden), np.float32)
+            nw1[:, :C] = w1
+            out["strategy_w1"] = nw1.reshape(
+                STRATEGY_TOKEN_BLOCKS * channels, target_hidden)
+            out["strategy_b1"] = np.asarray(z["strategy_b1"], np.float32)
+
+            w2 = np.asarray(z["strategy_w2"], np.float32).reshape(
+                target_hidden, STRATEGY_OUTPUT_BLOCKS, C)
+            nw2 = np.zeros((target_hidden, STRATEGY_OUTPUT_BLOCKS, channels), np.float32)
+            nw2[:, :, :C] = w2
+            out["strategy_w2"] = nw2.reshape(
+                target_hidden, STRATEGY_OUTPUT_BLOCKS * channels)
+            b2 = np.asarray(z["strategy_b2"], np.float32).reshape(
+                STRATEGY_OUTPUT_BLOCKS, C)
+            nb2 = np.zeros((STRATEGY_OUTPUT_BLOCKS, channels), np.float32)
+            nb2[:, :C] = b2
+            out["strategy_b2"] = nb2.reshape(-1)
+
+            for stem in ("strategy_ref1", "strategy_ref2"):
+                w = np.asarray(z[f"{stem}_w"], np.float32)
+                b = np.asarray(z[f"{stem}_b"], np.float32)
+                nw = np.zeros((channels, channels, 3, 3), np.float32)
+                nb = np.zeros((channels,), np.float32)
+                nw[:C, :C] = w
+                nb[:C] = b
+                out[f"{stem}_w"], out[f"{stem}_b"] = nw, nb
+        else:
+            out["strategy_w1"] = rng.normal(
+                0.0, np.sqrt(2.0 / (STRATEGY_TOKEN_BLOCKS * channels)),
+                (STRATEGY_TOKEN_BLOCKS * channels, target_hidden)).astype(np.float32)
+            out["strategy_b1"] = np.zeros((target_hidden,), np.float32)
+            out["strategy_w2"] = np.zeros(
+                (target_hidden, STRATEGY_OUTPUT_BLOCKS * channels), np.float32)
+            out["strategy_b2"] = np.zeros(
+                (STRATEGY_OUTPUT_BLOCKS * channels,), np.float32)
+            out["strategy_ref1_w"] = rng.normal(
+                0.0, np.sqrt(2.0 / (9 * channels)),
+                (channels, channels, 3, 3)).astype(np.float32)
+            out["strategy_ref1_b"] = np.zeros((channels,), np.float32)
+            out["strategy_ref2_w"] = np.zeros(
+                (channels, channels, 3, 3), np.float32)
+            out["strategy_ref2_b"] = np.zeros((channels,), np.float32)
 
     # A CRITIC has the same trunk and a scalar head -- `v_w`/`v_b`, no `head_w`,
     # no `pass_w`. Reading those unconditionally meant `--init-critic` could not
@@ -143,6 +215,16 @@ def grow(z, layers: int, channels: int, seed: int = 0,
         grown[:, :cout] = old
         nvw = grown.reshape((blocks * channels,) + vw.shape[1:])
         out["v_w"], out["v_b"] = nvw, np.asarray(z["v_b"], np.float32)
+        if "v_res1_w" in files:
+            r1 = np.asarray(z["v_res1_w"], np.float32)
+            if r1.shape[0] != vw.shape[0]:
+                raise SystemExit("v_res1_w input width does not match v_w")
+            old_r1 = r1.reshape((blocks, cout, r1.shape[1]))
+            grown_r1 = np.zeros((blocks, channels, r1.shape[1]), np.float32)
+            grown_r1[:, :cout] = old_r1
+            out["v_res1_w"] = grown_r1.reshape((blocks * channels, r1.shape[1]))
+            for key in ("v_res1_b", "v_res2_w", "v_res2_b"):
+                out[key] = np.asarray(z[key], np.float32)
 
     if not ({"head_w", "v_w"} & files):
         raise SystemExit(f"{'/'.join(sorted(files)[:6])}...: no head_w and no "
@@ -156,7 +238,8 @@ def grow(z, layers: int, channels: int, seed: int = 0,
     stale = set(arch_record(out))
     for k in files:
         if (k not in out and k not in stale
-                and not k.startswith(("conv", "head", "pass", "v_", "context_"))):
+                and not k.startswith(("conv", "head", "pass", "v_", "context_",
+                                      "strategy_"))):
             out[k] = z[k]
     out.update(arch_record(out))
     return out
@@ -187,6 +270,32 @@ def _same_moves(a: str, b: str, games: int, seed0: int) -> tuple[int, float]:
             n += 1
             if engine.step(st, features.index_to_action(ia),
                            features.index_to_action(ib)):
+                break
+    return n, worst
+
+
+def _same_values(a: str, b: str, games: int, seed0: int) -> tuple[int, float]:
+    """Compare standalone critic migrations on an exact sequence of positions."""
+    from bot import rules
+    from bot.policy.net import ValueNet
+    from sim import engine, mapgen
+
+    va, vb = ValueNet(a), ValueNet(b)
+    n, worst = 0, 0.0
+    for g in range(games):
+        st = engine.from_grid(mapgen.generate(seed0 + g))
+        for _ in range(60):
+            obs0, obs1 = engine.observe(st, 0), engine.observe(st, 1)
+            ya, yb = va.value(obs0), vb.value(obs0)
+            worst = max(worst, abs(ya - yb))
+            n += 1
+
+            actions = []
+            for obs in (obs0, obs1):
+                legal = np.flatnonzero(features.legal_mask(obs))
+                actions.append(features.index_to_action(int(legal[0]))
+                               if legal.size else rules.PASS_ACTION)
+            if engine.step(st, actions[0], actions[1]):
                 break
     return n, worst
 
@@ -279,6 +388,10 @@ def main() -> None:
     ap.add_argument("--verify-games", type=int, default=12)
     ap.add_argument("--context", action="store_true",
                     help="add the global/regional mixer at zero (function-preserving)")
+    ap.add_argument("--dense-context", action="store_true",
+                    help="migrate context vectors to exact diagonal CxC mixers")
+    ap.add_argument("--strategy-hidden", type=int, default=None, metavar="N",
+                    help="add a zero-output global spatial strategy module of width N")
     ap.add_argument("--prefix", default=None, metavar="phi",
                     help="migrate the arrays under this prefix instead of the "
                          "whole file, and write them back under it. The critic "
@@ -332,9 +445,12 @@ def main() -> None:
          if k.startswith(args.prefix + "__")} if args.prefix else src
     if args.prefix and not z:
         raise SystemExit(f"{args.net} has no {args.prefix}__* arrays")
+    files = set(getattr(z, "files", z))
     before = arch_of(z)
     grown = grow(z, args.layers, args.channels, args.seed,
-                 True if args.context else None)
+                 True if args.context else None,
+                 True if args.dense_context else None,
+                 args.strategy_hidden)
     tmp = Path(args.out)
     if args.prefix:
         # Written back under the prefix so `--init-critic` can read it, and
@@ -345,8 +461,11 @@ def main() -> None:
         np.savez(tmp, **grown)
     after = arch_of(grown)
 
-    n_before = sum(v.size for k, v in z.items() if k.endswith(("_w", "_b")))
-    n_after = sum(v.size for k, v in grown.items() if k.endswith(("_w", "_b")))
+    prefixes = ("conv", "res", "head", "pass", "v_", "context_", "strategy_")
+    n_before = sum(np.asarray(z[k]).size for k in set(getattr(z, "files", z))
+                   if k.startswith(prefixes) and k not in set(arch_record(z)))
+    n_after = sum(np.asarray(v).size for k, v in grown.items()
+                  if k.startswith(prefixes) and k not in set(arch_record(grown)))
     print(f"{before['layers']}x{before['channels']} ({n_before} params) -> "
           f"{after['layers']}x{after['channels']} ({n_after} params, "
           f"{n_after / max(n_before, 1):.1f}x)")
@@ -368,8 +487,13 @@ def main() -> None:
               f"not load under a {features.C}-channel encoder, which is exactly "
               f"the check net.py:181 exists to enforce.")
     else:
-        n, worst = _same_moves(args.net, str(tmp), args.verify_games, 900_000)
-        print(f"verified: {n} positions, identical argmax, max |logit gap| {worst:.2e}")
+        if "head_w" in files:
+            n, worst = _same_moves(args.net, str(tmp), args.verify_games, 900_000)
+            print(f"verified: {n} positions, identical argmax, "
+                  f"max |logit gap| {worst:.2e}")
+        else:
+            n, worst = _same_values(args.net, str(tmp), args.verify_games, 900_000)
+            print(f"verified: {n} positions, max |value gap| {worst:.2e}")
     print(f"wrote {tmp}")
     print("\nResume from it at the stage the parent reached -- it plays the same "
           "game, so a difference later is capacity and not a fresh start.")
@@ -398,7 +522,9 @@ def selfcheck() -> None:
 
     import tempfile
     with tempfile.TemporaryDirectory() as d:
-        a, b, c = Path(d) / "a.npz", Path(d) / "b.npz", Path(d) / "c.npz"
+        a, b, c, e, s = (Path(d) / name for name in
+                         ("a.npz", "b.npz", "c.npz", "dense.npz",
+                          "strategy.npz"))
         np.savez(a, **p)
         np.savez(b, **grow(np.load(a), L + 2, C * 2))
         got = arch_of(np.load(b))
@@ -415,6 +541,34 @@ def selfcheck() -> None:
         nc, wc = _same_moves(str(a), str(c), 3, 22_345)
         assert wc < 1e-6, f"zero context changed the parent by {wc:.2e}"
 
+        # A trained diagonal mixer migrates to a CxC mixer with its scales on
+        # the diagonal. Nonzero scales make this stronger than the zero-context
+        # test above: every old prediction must survive the representation swap.
+        vector_context = dict(contextual)
+        vector_context["context_global"] = rng.normal(0, 0.2, C).astype(np.float32)
+        vector_context["context_region"] = rng.normal(0, 0.2, C).astype(np.float32)
+        vector_context.update(arch_record(vector_context))
+        np.savez(c, **vector_context)
+        dense = grow(np.load(c), L, C, dense_context=True)
+        assert dense["context_global"].shape == (C, C)
+        assert np.array_equal(np.diag(dense["context_global"]),
+                              vector_context["context_global"])
+        np.savez(e, **dense)
+        nd, wd = _same_moves(str(c), str(e), 3, 32_345)
+        assert wd < 1e-6, f"diagonal-to-matrix context moved logits by {wd:.2e}"
+
+        # The global spatial branch is an exact migration even though its first
+        # layers are live. Zero outgoing control/refinement layers preserve the
+        # incumbent and receive a gradient immediately.
+        strategic = grow(np.load(e), L, C, strategy_hidden=11)
+        assert np.abs(strategic["strategy_w1"]).max() > 0
+        assert np.abs(strategic["strategy_ref1_w"]).max() > 0
+        assert np.count_nonzero(strategic["strategy_w2"]) == 0
+        assert np.count_nonzero(strategic["strategy_ref2_w"]) == 0
+        np.savez(s, **strategic)
+        ns, ws = _same_moves(str(e), str(s), 3, 42_345)
+        assert ws < 1e-6, f"zero-output strategy path moved logits by {ws:.2e}"
+
         # The new capacity must be TRAINABLE, not just harmless. Outgoing zero
         # with incoming zero is also function-preserving and is dead weight.
         g = grow(np.load(a), L, C * 2)
@@ -424,8 +578,8 @@ def selfcheck() -> None:
         idl = grow(np.load(a), L + 1, C)[f"conv{L}_w"]
         assert np.array_equal(idl[np.arange(C), np.arange(C), 1, 1], np.ones(C))
         assert idl.sum() == C, "identity layer has weight off the centre tap"
-    print(f"grow selfcheck OK ({n + nc} positions identical, max gap "
-          f"{max(worst, wc):.2e})")
+    print(f"grow selfcheck OK ({n + nc + nd + ns} positions identical, max gap "
+          f"{max(worst, wc, wd, ws):.2e})")
 
 
 if __name__ == "__main__":

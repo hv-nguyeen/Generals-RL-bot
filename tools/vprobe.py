@@ -45,16 +45,22 @@ from bot import features, rules
 from bot.policy import net as pnet
 
 
-def critic_value(phi_layers, v_w, v_b, obs, residual=False, context=None) -> float:
+def critic_value(phi_layers, v_w, v_b, obs, residual=False, context=None,
+                 value_residual=None, strategy=None) -> float:
     """V(s) for one state. Mirrors `valuetrain.forward` + the tanh in selfplay."""
     x = features.encode(obs)
     h = pnet._trunk(x, phi_layers, residual)
     if context is not None:
         h = pnet._context_mix(h, x[features.VALID], *context)
+    h = pnet._strategy_mix(h, x[features.VALID], strategy)
     pooled = (pnet.ValueNet._pooled(h, x[features.VALID])
               if v_w.shape[0] == h.shape[0] * 11
               else h.mean(axis=(1, 2)))
-    return float(np.tanh(pooled @ v_w + v_b))
+    logit = float(pooled @ v_w + v_b)
+    if value_residual is not None:
+        w1, b1, w2, b2 = value_residual
+        logit += float(np.maximum(pooled @ w1 + b1, 0.0) @ w2 + b2)
+    return float(np.tanh(logit))
 
 
 def _load_phi(path: str):
@@ -71,8 +77,13 @@ def _load_phi(path: str):
     context = ((np.asarray(phi["context_global"], np.float32),
                 np.asarray(phi["context_region"], np.float32))
                if arch["context"] else None)
+    value_residual = (tuple(np.asarray(phi[k], np.float32) for k in
+                            ("v_res1_w", "v_res1_b", "v_res2_w", "v_res2_b"))
+                      if "v_res1_w" in phi else None)
+    strategy = ({k: np.asarray(phi[k], np.float32) for k in pnet.strategy_keys()}
+                if arch.get("strategy", False) else None)
     return (layers, np.asarray(phi["v_w"], np.float32), float(phi["v_b"]),
-            arch, context)
+            arch, context, value_residual, strategy)
 
 
 def _rear_tile(obs):
@@ -94,7 +105,7 @@ def _my_general(obs):
 def probe(resume: str, weights: str, games: int, turns: int, seed0: int) -> dict:
     from sim import engine, mapgen
 
-    phi_layers, v_w, v_b, arch, context = _load_phi(resume)
+    phi_layers, v_w, v_b, arch, context, value_residual, strategy = _load_phi(resume)
     print(f"critic: {arch['layers']}x{arch['channels']} from {resume}")
     pol = pnet.Net(weights)
 
@@ -116,7 +127,8 @@ def probe(resume: str, weights: str, games: int, turns: int, seed0: int) -> dict
                 break
         obs = engine.observe(st, 0)
         value = lambda o: critic_value(  # noqa: E731
-            phi_layers, v_w, v_b, o, arch["residual"], context)
+            phi_layers, v_w, v_b, o, arch["residual"], context,
+            value_residual, strategy)
         base = value(obs)
         site = _rear_tile(obs)
         gen = _my_general(obs)

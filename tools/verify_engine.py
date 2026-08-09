@@ -407,8 +407,10 @@ def check_memory_encoders(boards: int = 4, turns: int = 240,
     _, jgame, transition = _jax_bits()
     observe = jax.jit(jgame.get_observation, static_argnums=(1,))
     step = jax.jit(transition)
+    update_memory = jax.jit(rlenv.update_memory_jax)
     worst, frames, activity = 0.0, 0, 0.0
     plane_peak = np.zeros(features.MEMORY_C, dtype=np.float32)
+    strategy_peak = np.zeros(features.STRATEGIC_C, dtype=np.float32)
     for b in range(boards):
         grid = mapgen.generate(seed0 + b, 2, 6)
         h, w = grid.shape
@@ -421,20 +423,24 @@ def check_memory_encoders(boards: int = 4, turns: int = 240,
             for p in (0, 1):
                 no, jo = engine.observe(ours, p), observe(theirs, p)
                 nm[p].update(no)
-                jm[p] = rlenv.update_memory_jax(jm[p], jo)
+                jm[p] = update_memory(jm[p], jo)
                 xn = features.encode(no, nm[p])
                 xj = np.asarray(rlenv.encode_jax(jo, h, w, jm[p]))
                 d = float(np.max(np.abs(xn - xj)))
                 worst = max(worst, d); frames += 1
                 plane_peak = np.maximum(
                     plane_peak,
-                    np.max(np.abs(xn[features.BASE_C:]), axis=(1, 2)))
+                    np.max(np.abs(xn[features.BASE_C:features.STRATEGIC_OFFSET]),
+                           axis=(1, 2)))
+                strategy_peak = np.maximum(
+                    strategy_peak,
+                    np.max(np.abs(xn[features.STRATEGIC_OFFSET:]), axis=(1, 2)))
                 activity = max(activity, float(np.max(np.abs(
                     xn[features.MY_GAINED:features.DELTA_LAND_ADV + 1]))))
                 assert d <= 1e-6, (f"temporal encoder seed={seed0 + b} "
                                    f"turn={ours.time} seat={p} max|d|={d:.3e}")
                 before = {k: np.asarray(v).copy() for k, v in jm[p].items()}
-                again = rlenv.update_memory_jax(jm[p], jo)
+                again = update_memory(jm[p], jo)
                 assert all(np.array_equal(before[k], np.asarray(again[k])) for k in before)
                 nm[p].update(no)
             if ours.winner >= 0:
@@ -450,11 +456,13 @@ def check_memory_encoders(boards: int = 4, turns: int = 240,
     missing = [ch for ch in required if plane_peak[ch - features.BASE_C] == 0]
     assert not missing, (f"temporal equality is vacuous: required enemy/change "
                          f"planes {missing} never activated")
+    assert np.all(strategy_peak > 0), (
+        f"strategic equality is vacuous: peak values {strategy_peak.tolist()}")
     active = [features.BASE_C + i for i, value in enumerate(plane_peak) if value > 0]
     print(f"  temporal seam: {frames} frames, max|d| {worst:.1e}, "
           f"activity {activity:.2f}, active planes {active}")
     return {"frames": frames, "worst": worst, "activity": activity,
-            "plane_peak": plane_peak}
+            "plane_peak": plane_peak, "strategy_peak": strategy_peak}
 
 
 def main() -> None:

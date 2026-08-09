@@ -63,8 +63,10 @@ def pair_scores(rows: list[dict]) -> list[float]:
     return out
 
 
-def paired_summary(rows: list[dict]) -> dict:
+def paired_summary(rows: list[dict], alpha: float = 0.05) -> dict:
     """W/D/L point estimate with uncertainty clustered by board pair."""
+    if not 0.0 < alpha < 1.0:
+        raise ValueError("alpha must be in (0, 1)")
     wins = sum(r.get("a_result") == "win" for r in rows)
     draws = sum(r.get("a_result") == "draw" for r in rows)
     losses = len(rows) - wins - draws
@@ -86,7 +88,7 @@ def paired_summary(rows: list[dict]) -> dict:
         # Empirical Bernstein interval for independent values in [0, 1]. Unlike
         # a plain cluster-normal interval it does not claim zero uncertainty
         # after a finite all-win sweep or perfectly anti-correlated WL pairs.
-        log_term = math.log(3.0 / 0.05)
+        log_term = math.log(3.0 / alpha)
         radius = (math.sqrt(2.0 * max(var, 0.0) * log_term / boards)
                   + 3.0 * log_term / boards)
         lo_score = min(max(score - radius, 1e-9), 1.0 - 1e-9)
@@ -95,25 +97,29 @@ def paired_summary(rows: list[dict]) -> dict:
     return {**base, "boards": boards, "elo_lo": lo, "elo_hi": hi,
             "err": (hi - lo) / 2.0, "pair_stderr": stderr,
             "score_radius": radius,
-            "interval": "95% empirical Bernstein over board pairs"}
+            "alpha": alpha,
+            "confidence": 1.0 - alpha,
+            "interval": f"{100.0 * (1.0 - alpha):g}% empirical Bernstein over board pairs"}
 
 
-def paired_test(rows: list[dict], elo0: float = 0.0, elo1: float = 12.0) -> dict:
+def paired_test(rows: list[dict], elo0: float = 0.0, elo1: float = 12.0,
+                alpha: float = 0.05) -> dict:
     """Fixed-sample 95% decision using the board-clustered interval.
 
     This deliberately is not called an SPRT: the existing LLR assumes
     independent games, while evaluation uses fixed paired boards.
     """
-    s = paired_summary(rows)
+    s = paired_summary(rows, alpha)
     lo, hi = elo_to_score(s["elo_lo"]), elo_to_score(s["elo_hi"])
     verdict = "continue"
     if lo >= elo_to_score(elo1):
         verdict = "accept H1 (A is better)"
     elif hi <= elo_to_score(elo0):
         verdict = "accept H0 (no improvement)"
-    return {"method": "paired fixed-sample 95% empirical Bernstein CI",
+    return {"method": "paired fixed-sample empirical Bernstein CI",
             "verdict": verdict,
             "elo0": elo0, "elo1": elo1, "boards": s["boards"],
+            "alpha": alpha, "confidence": 1.0 - alpha,
             "score_lo": lo, "score_hi": hi}
 
 

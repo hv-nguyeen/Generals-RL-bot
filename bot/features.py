@@ -19,7 +19,10 @@ from bot.obs import Obs
 PAD = 21                      # every competition board fits in 21x21
 BASE_C = 24                   # one-frame channels; old checkpoints use this
 MEMORY_C = 16                 # observation-only temporal channels
-C = BASE_C + MEMORY_C
+STRATEGIC_C = 3               # map prior, home distance, current build price
+STRATEGIC_OFFSET = BASE_C + MEMORY_C
+C = STRATEGIC_OFFSET + STRATEGIC_C
+LEGACY_INPUT_CHANNELS = (BASE_C, STRATEGIC_OFFSET)
 DIRS_N = 4
 SPLITS = 2
 BUILD_OFFSET = DIRS_N * SPLITS      # slot 8 of a cell is "build a castle here"
@@ -38,7 +41,9 @@ PASS_INDEX = N_ACTIONS - 1
 (MEM_MINE, MEM_OPP, MEM_NEUTRAL, MEM_ARMY_MINE, MEM_ARMY_OPP,
  MEM_STALENESS, EVER_SEEN, EVER_ENEMY, ENEMY_CASTLE,
  MY_GAINED, OPP_GAINED, MY_ARMY_DELTA, OPP_ARMY_DELTA,
- DELTA_MY_ARMY, DELTA_OPP_ARMY, DELTA_LAND_ADV) = range(BASE_C, C)
+ DELTA_MY_ARMY, DELTA_OPP_ARMY, DELTA_LAND_ADV) = range(BASE_C, STRATEGIC_OFFSET)
+
+(ENEMY_GENERAL_PRIOR, DIST_HOME, BUILD_COST) = range(STRATEGIC_OFFSET, C)
 
 
 def scalar_features(turn, my_army, opp_army, my_land, opp_land,
@@ -146,6 +151,61 @@ def memory_planes(obs: Obs, memory) -> np.ndarray:
     return p
 
 
+def strategic_planes(obs: Obs, memory=None) -> np.ndarray:
+    """Derived, observation-legal spatial quantities used for long plans.
+
+    The general prior and home-distance field are computed once from the fully
+    recoverable turn-one terrain and then updated only from observations. Build
+    price is rules-exact and depends solely on our visible structures.
+    """
+    p = np.zeros((STRATEGIC_C, PAD, PAD), dtype=np.float32)
+    h, w = obs.H, obs.W
+    if memory is not None:
+        p[ENEMY_GENERAL_PRIOR - STRATEGIC_OFFSET, :h, :w] = (
+            memory.general_candidates)
+        reachable = (~memory.known_mountains).astype(np.float32)
+        p[DIST_HOME - STRATEGIC_OFFSET, :h, :w] = (
+            np.clip(memory.dist_home.astype(np.float32) / (2.0 * PAD), 0.0, 1.0)
+            * reachable)
+    mine = obs.owner_grid == rules.OWNER_ME
+    structures = mine & ((obs.type_grid == rules.T_GENERAL)
+                          | (obs.type_grid == rules.T_CASTLE))
+    cost = rules.build_cost_grid(structures).astype(np.float32)
+    p[BUILD_COST - STRATEGIC_OFFSET, :h, :w] = np.log1p(cost) / 6.0
+    return p
+
+
+def ensure_channels(x: np.ndarray) -> np.ndarray:
+    """Zero-extend stored legacy tensors to the current observation schema.
+
+    Historical shards cannot reconstruct an observation history they did not
+    record. Zero is therefore the only honest migration for new planes; fresh
+    self-play data carries the real values. This keeps old datasets usable as a
+    control without pretending they contain the new signal.
+    """
+    x = np.asarray(x)
+    if x.ndim < 3:
+        raise ValueError(f"encoded observations need at least 3 dimensions, got {x.shape}")
+    cin = int(x.shape[-3])
+    if cin == C:
+        return x
+    if cin not in LEGACY_INPUT_CHANNELS:
+        # Split/weighting unit tests use tiny synthetic feature vectors rather
+        # than board encodings. Leave those generic tensors alone; a real board
+        # tensor with an unknown schema remains a fail-closed error.
+        if tuple(x.shape[-2:]) != (PAD, PAD):
+            return x
+        raise ValueError(f"unsupported encoded observation width {cin}; expected "
+                         f"one of {(*LEGACY_INPUT_CHANNELS, C)}")
+    shape = list(x.shape)
+    shape[-3] = C
+    grown = np.zeros(shape, dtype=x.dtype)
+    sl = [slice(None)] * x.ndim
+    sl[-3] = slice(0, cin)
+    grown[tuple(sl)] = x
+    return grown
+
+
 def encode(obs: Obs, memory=None) -> np.ndarray:
     """(C, PAD, PAD) float32 from one fogged observation."""
     x = np.zeros((C, PAD, PAD), dtype=np.float32)
@@ -193,7 +253,8 @@ def encode(obs: Obs, memory=None) -> np.ndarray:
                         max_mine, max_opp),
         dtype=np.float32)[:, None, None]
     if memory is not None:
-        x[BASE_C:] = memory_planes(obs, memory)
+        x[BASE_C:STRATEGIC_OFFSET] = memory_planes(obs, memory)
+    x[STRATEGIC_OFFSET:] = strategic_planes(obs, memory)
     return x
 
 

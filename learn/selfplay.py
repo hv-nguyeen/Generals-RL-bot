@@ -287,9 +287,10 @@ from arena import agents
 from bot import features, rules
 from bot.memory import TemporalMemory
 from bot.policy.net import Net, arch_of, arch_record
+from learn.replay import GameBalancedReplay
 from learn.league import stderr
 from learn.netoracle import (ADV_CLIP, ANCHOR_HI, ANCHOR_LO, BETA0, BETA_MAX,
-                             BETA_MIN, CHUNK, KL_STOP, MAX_REWINDS, WARMUP,
+                             BETA_MIN, CHUNK, KL_STOP, LAM, MAX_REWINDS, WARMUP,
                              _log_softmax, adam, clip_grads, critic_ready, gae,
                              policy_keys, policy_loss, publish, readiness_step,
                              restore_actor_critic, tally)
@@ -349,7 +350,7 @@ STAGE_COLLAPSE = 0.35 # stage-eval is 0.500 by construction against the policy's
 RESUME_SCALARS = frozenset({
     "it", "stage", "over", "resident", "beta", "lr_scale", "t_p", "t_v",
     "warmed", "low", "rewinds", "best_score", "best_iter", "base_score",
-    "comp_low", "rng_state"})
+    "comp_low", "lam", "augment", "value_hidden", "rng_state"})
 
 
 def outcome(winner: int, seat: int) -> float:
@@ -431,10 +432,14 @@ def numpy_forward(params, x: np.ndarray) -> np.ndarray:
           if arch["context"] else None)
     cr = (np.asarray(params["context_region"], np.float32)
           if arch["context"] else None)
+    strategy = ({k: np.asarray(params[k], np.float32)
+                 for k in npnet.strategy_keys()}
+                if arch.get("strategy", False) else None)
     out = []
     for row in np.asarray(x, dtype=np.float32):
         h = npnet._trunk(row, layers, arch["residual"])
         h = npnet._context_mix(h, row[features.VALID], cg, cr)
+        h = npnet._strategy_mix(h, row[features.VALID], strategy)
         move = npnet._conv3x3(h, hw, hb)
         pass_logit = float(pw @ h.mean(axis=(1, 2)) + pb)
         out.append(np.concatenate(
@@ -481,7 +486,9 @@ def _pack(buf: list, winner: int, turns: int, dist: int,
 
 
 # --------------------------------------------------------------------------
-def build_jobs(it: int, games: int, stage: int, replay: float = 0.0) -> list[tuple]:
+def build_jobs(it: int, games: int, stage: int, replay: float = 0.0,
+               restart_frac: float = 0.0, restart_min: int = 80,
+               restart_max: int = 180) -> list[tuple]:
     """Self-play training jobs. ONE job = one board = one game = TWO trajectories.
 
     There is no seat loop and no opponent index. Both seats are the same
@@ -505,9 +512,17 @@ def build_jobs(it: int, games: int, stage: int, replay: float = 0.0) -> list[tup
     `selfcheck` hold and two runs at different `replay` remain comparable.
     """
     base = SP_TRAIN_SEED0 + it * games
+    restart_rng = np.random.default_rng([SP_TRAIN_SEED0 + it, 97])
+
+    def job(b, dmin, dmax):
+        base_job = (base + b, dmin, dmax, 0, 0)
+        if restart_frac <= 0 or restart_rng.random() >= restart_frac:
+            return base_job
+        return (*base_job, int(restart_rng.integers(restart_min, restart_max + 1)))
+
     if stage == 0 or replay <= 0.0:
         dmin, dmax, _ = STAGES[stage]
-        return [(base + b, dmin, dmax, 0, 0) for b in range(games)]
+        return [job(b, dmin, dmax) for b in range(games)]
 
     rng = np.random.default_rng(SP_TRAIN_SEED0 + it)
     picks = np.where(rng.random(games) < replay,
@@ -515,7 +530,7 @@ def build_jobs(it: int, games: int, stage: int, replay: float = 0.0) -> list[tup
     jobs = []
     for b, s in enumerate(picks):
         dmin, dmax, _ = STAGES[int(s)]
-        jobs.append((base + b, dmin, dmax, 0, 0))
+        jobs.append(job(b, dmin, dmax))
     return jobs
 
 
@@ -717,7 +732,13 @@ def _rollout(job):
                  `specs[mode - 1]`, and the result is tagged `opp = mode - 1`
                  so `netoracle.tally` scores it per instrument.
     """
-    seed, dmin, dmax, mode, seat = job
+    if len(job) == 5:
+        seed, dmin, dmax, mode, seat = job
+        record_from = 1
+    elif len(job) == 6:
+        seed, dmin, dmax, mode, seat, record_from = job
+    else:
+        raise ValueError(f"rollout job must have 5 or 6 fields, got {job}")
     grid = mapgen.generate(seed, dmin, dmax)
     dist = mapgen.generals_distance(grid)
     st = engine.from_grid(grid)
@@ -773,10 +794,11 @@ def _rollout(job):
             idx, mask, lp, probs = _act(net, obs, rng, memories[s])
             xs, ids, masks, lps = buf[s]
             enc = features.encode(obs, memories[s]).astype(np.float16)
-            xs.append(enc)
-            ids.append(idx)
-            masks.append(mask)
-            lps.append(lp)
+            if turns >= record_from:
+                xs.append(enc)
+                ids.append(idx)
+                masks.append(mask)
+                lps.append(lp)
             # engine.observe and engine.step are positional by seat. Placing
             # these the wrong way round trains each seat on the other's rewards
             # and looks like slow noise; selfcheck pins both the sign (via
@@ -895,12 +917,12 @@ def load_critic(path: str, arch: dict, blank: dict) -> dict:
     if standalone and value_schema >= 2:
         sidecar = Path(path).with_suffix(".json")
         if not sidecar.is_file():
-            raise SystemExit(f"schema-2 critic {path} is missing its validation "
-                             f"sidecar {sidecar}")
+            raise SystemExit(f"schema-{value_schema} critic {path} is missing its "
+                             f"validation sidecar {sidecar}")
         meta = json.loads(sidecar.read_text())
         if meta.get("gate_passed") is not True:
-            raise SystemExit(f"schema-2 critic {path} did not pass its held-out "
-                             "board-signal and calibration gate")
+            raise SystemExit(f"schema-{value_schema} critic {path} did not pass "
+                             "its held-out board-signal and calibration gate")
     try:
         a = arch_of(got)
     except ValueError as e:
@@ -915,12 +937,23 @@ def load_critic(path: str, arch: dict, blank: dict) -> dict:
                 f"(residual={a['residual']}), this run is {arch['layers']}x"
                 f"{arch['channels']} (residual={arch['residual']}). Grow or "
                 f"retrain it; a critic for a different trunk is not loadable.")
+    critic_dense = bool(a["context"] and np.ndim(got["context_global"]) == 2)
+    if critic_dense != bool(arch.get("dense_context", False)):
+        raise SystemExit(f"critic in {path} has dense_context={critic_dense}, "
+                         f"this run has dense_context="
+                         f"{bool(arch.get('dense_context', False))}. Grow or retrain it.")
+    critic_strategy = int(a.get("strategy_hidden", 0))
+    policy_strategy = int(arch.get("strategy_hidden", 0))
+    if critic_strategy != policy_strategy:
+        raise SystemExit(f"critic in {path} has strategy_hidden={critic_strategy}, "
+                         f"this run has strategy_hidden={policy_strategy}. "
+                         "Migrate the critic with tools.grow or retrain it.")
     # `arch_record` keys are METADATA, not parameters, and `arch_of` above has
     # already used them for the cross-check that makes a mislabelled file fail
     # loudly. `tools.grow` writes them into everything it produces, so a migrated
     # critic arrives with three keys the freshly built one does not have, and an
     # exact key match rejected it.
-    metadata = set(arch_record(got)) | {"value_schema", "value_pool"}
+    metadata = set(arch_record(got)) | {"value_schema", "value_pool", "value_hidden"}
     got = {k: v for k, v in got.items() if k not in metadata}
     # Migrate the historical mean-only head into the v2 pooled head. The first
     # block of ``valuetrain.pooled`` is the same global mean, so zero-filling the
@@ -932,6 +965,13 @@ def load_critic(path: str, arch: dict, blank: dict) -> dict:
         migrated = np.zeros_like(blank["v_w"], dtype=np.float32)
         migrated[:len(got["v_w"])] = got["v_w"]
         got["v_w"] = migrated
+    # Add the residual value head without moving the historical function. Its
+    # final layer is exactly zero in `valuetrain.init_params`; copying all four
+    # fresh parameters therefore preserves every legacy prediction bit-for-bit
+    # while making the branch trainable from the next update.
+    residual_keys = {"v_res1_w", "v_res1_b", "v_res2_w", "v_res2_b"}
+    if not (residual_keys & set(got)) and residual_keys <= set(blank):
+        got.update({k: np.asarray(blank[k]) for k in residual_keys})
     if set(got) != set(blank):
         missing = sorted(set(blank) - set(got)) or None
         extra = sorted(set(got) - set(blank)) or None
@@ -1319,7 +1359,9 @@ def selfcheck() -> None:
         st = {"it": 41, "stage": 2, "over": 1, "resident": 12, "beta": 0.05,
               "lr_scale": 0.5, "t_p": 100, "t_v": 130, "warmed": True, "low": 0,
               "rewinds": 1, "best_score": 0.31, "best_iter": 40,
-              "base_score": 0.19, "comp_low": 1, "rng_state": r.bit_generator.state}
+              "base_score": 0.19, "comp_low": 1, "lam": LAM,
+              "augment": False, "value_hidden": 0,
+              "rng_state": r.bit_generator.state}
         # save_resume asserts against RESUME_SCALARS, so a key added to the
         # trainer's write and not to this dict fails HERE rather than as a
         # KeyError on the cluster, after the preemption the resume exists to
@@ -1427,6 +1469,19 @@ def main() -> None:
                     help="critic Adam step. 1e-3 memorised the on-policy buffer "
                          "in measured full-distance runs; 1e-4 is the safe "
                          "transfer default")
+    ap.add_argument("--critic-replay-games", type=int, default=0,
+                    help="historical complete games retained for critic-only, "
+                         "game-balanced replay; 0 reproduces on-policy fitting")
+    ap.add_argument("--critic-replay-frac", type=float, default=0.5,
+                    help="share of each critic minibatch drawn from replay once non-empty")
+    ap.add_argument("--lam", type=float, default=LAM,
+                    help="GAE TD/Monte-Carlo interpolation. 0.95 is historical; "
+                         "1.0 gives z-V(s) and relies least on critic bootstraps. "
+                         "The value is part of the resume identity")
+    ap.add_argument("--augment", action="store_true",
+                    help="one random dihedral transform per PPO minibatch; "
+                         "actions/masks are relabelled and old/ref log-probs "
+                         "are recomputed under frozen snapshots")
     ap.add_argument("--value-head", choices=("scalar", "hlgauss"), default="scalar",
                     help="scalar is tanh+MSE and is THE DEFAULT. hlgauss is a "
                          "distributional head; with our 3-atom return support it "
@@ -1441,6 +1496,9 @@ def main() -> None:
                          "tanh-MSE differ in effective critic step by 0.4x-12.6x "
                          "across the state space and a two-arm test cannot tell "
                          "the loss function from a critic-LR sweep")
+    ap.add_argument("--value-hidden", type=int, default=64,
+                    help="scalar critic residual-head width; 0 is the exact "
+                         "linear-head control. Ignored by hlgauss")
     ap.add_argument("--hl-bins", type=int, default=128,
                     help="AverageJoe's, lifted whole; not load-bearing, and "
                          "the arithmetic says so: the head is 32x128 = 4k "
@@ -1497,6 +1555,12 @@ def main() -> None:
                          "without letting the earlier distances vanish, which "
                          "is what sp8 lost after each of its two forced ones. "
                          "0.0 reproduces every run before 2026-08-05")
+    ap.add_argument("--restart-frac", type=float, default=0.0,
+                    help="CPU rollout share whose first recorded on-policy state "
+                         "comes after an exact policy/memory burn-in; evaluation "
+                         "always starts at turn 1")
+    ap.add_argument("--restart-min-turn", type=int, default=80)
+    ap.add_argument("--restart-max-turn", type=int, default=180)
     ap.add_argument("--frozen-kill", type=int, default=FROZEN_KILL, metavar="N",
                     help="consecutive low-evar iterations that END the run, or 0 "
                          "to never end it. The default exists because a critic "
@@ -1588,6 +1652,15 @@ def main() -> None:
     if args.selfcheck:
         selfcheck()
         return
+    if not 0.0 < args.lam <= 1.0:
+        raise SystemExit(f"--lam must be in (0, 1], got {args.lam}")
+    if args.critic_replay_games < 0:
+        raise SystemExit("--critic-replay-games must be non-negative")
+    if not 0.0 <= args.critic_replay_frac < 1.0:
+        raise SystemExit("--critic-replay-frac must be in [0, 1)")
+    if args.value_hidden < 0:
+        raise SystemExit("--value-hidden must be zero or positive")
+    effective_value_hidden = args.value_hidden if args.value_head == "scalar" else 0
     if not 0 <= args.start_stage < len(STAGES):
         raise SystemExit(f"--start-stage {args.start_stage} is not a stage "
                          f"(0..{len(STAGES) - 1})")
@@ -1615,8 +1688,21 @@ def main() -> None:
         # reading the mixed pool, so the flag would be silently ignored there.
         raise SystemExit("--dist-tail needs --backend gpu or scan; the cpu path "
                          "generates boards per job and never reads the pool")
+    if not 0.0 <= args.restart_frac <= 1.0:
+        raise SystemExit("--restart-frac must be in [0, 1]")
+    if not 1 <= args.restart_min_turn <= args.restart_max_turn <= args.max_turns:
+        raise SystemExit("restart turns must satisfy 1 <= min <= max <= max-turns")
+    if args.restart_frac and args.backend != "cpu":
+        raise SystemExit("--restart-frac currently needs --backend cpu so the "
+                         "simulator and TemporalMemory burn-in stay exact")
     if not 0.0 <= args.cf_frac <= 1.0:
         raise SystemExit(f"--cf-frac {args.cf_frac} must be in [0, 1]")
+    if args.augment and args.cf_frac:
+        raise SystemExit("--augment and --cf-frac are separate experimental arms; "
+                         "combining them would leave fork samples untransformed "
+                         "and confound the symmetry result")
+    if args.restart_frac and args.cf_frac:
+        raise SystemExit("--restart-frac and counterfactual forks are separate arms")
     if args.cf_frac and args.backend != "cpu":
         # THE failure this check exists for. Forks are generated in `_rollout`
         # mode 0, which is the `else` arm of the backend dispatch below; under
@@ -1740,12 +1826,13 @@ def main() -> None:
     if missing:
         raise SystemExit(f"{args.init} is not a policy checkpoint, missing {sorted(missing)}")
     z0 = {k: np.asarray(raw0[k]) for k in keys}
-    if z0["conv0_w"].shape[1] == features.BASE_C and features.C > features.BASE_C:
+    if (z0["conv0_w"].shape[1] in features.LEGACY_INPUT_CHANNELS
+            and features.C > z0["conv0_w"].shape[1]):
         old = z0["conv0_w"]
         stem = np.zeros((old.shape[0], features.C, 3, 3), np.float32)
-        stem[:, :features.BASE_C] = old
+        stem[:, :old.shape[1]] = old
         z0["conv0_w"] = stem
-        print(f"policy input migration: {features.BASE_C} -> {features.C} channels "
+        print(f"policy input migration: {old.shape[1]} -> {features.C} channels "
               "with zero temporal columns (function-preserving)")
     ch = arch["channels"]
     want = {"conv0_w": (ch, features.C, 3, 3),
@@ -1770,7 +1857,8 @@ def main() -> None:
     theta = {k: jnp.asarray(z0[k]) for k in keys}
     theta_ref = dict(theta)          # frozen; never rebound, never in a grad graph
     theta_init = {k: np.asarray(z0[k]) for k in keys}
-    phi = vt.init_params(jax.random.PRNGKey(args.seed), arch)   # critic, same trunk
+    phi = vt.init_params(jax.random.PRNGKey(args.seed), arch,
+                         effective_value_hidden)   # critic, same trunk
     if args.value_head == "hlgauss":
         # SAME KEYS, wider. `arch_of` run-length-scans conv*/res* only, so
         # reshaping v_w is invisible to it; `opt_v`, `_flat("phi", ...)` and the
@@ -1783,6 +1871,8 @@ def main() -> None:
             jax.random.PRNGKey(args.seed), 8),
             (ch * vt.VALUE_POOL, args.hl_bins)) * 0.01
         phi["v_b"] = jnp.zeros((args.hl_bins,))
+        for key in ("v_res1_w", "v_res1_b", "v_res2_w", "v_res2_b"):
+            phi.pop(key, None)       # residual scalar head is not an HL-Gauss head
     if args.init_critic:
         # AFTER the hlgauss reshape, so the shape check compares against the head
         # this run will actually use rather than the scalar one it started from.
@@ -1953,7 +2043,13 @@ def main() -> None:
                                  f"run started from ({k} differs). The anchor and "
                                  f"the paired gate would both silently change.")
         theta = {k: jnp.asarray(v) for k, v in _unflat("theta", a).items()}
-        phi = {k: jnp.asarray(v) for k, v in _unflat("phi", a).items()}
+        stored_phi = _unflat("phi", a)
+        # Exact schema migration for pre-residual scalar critics. The current
+        # template's W2 is zero, so these additions cannot move V(s).
+        if effective_value_hidden and "v_res1_w" not in stored_phi:
+            for key in ("v_res1_w", "v_res1_b", "v_res2_w", "v_res2_b"):
+                stored_phi[key] = np.asarray(phi[key])
+        phi = {k: jnp.asarray(v) for k, v in stored_phi.items()}
         # A --value-head mismatch here is a shape error deep inside a jitted
         # v_step, hours after the preemption this resume exists to survive.
         want_v = ((ch * vt.VALUE_POOL, args.hl_bins)
@@ -1967,9 +2063,14 @@ def main() -> None:
                  for k, v in _unflat("optp_m", a).items()}
         opt_v = {k: (jnp.asarray(v), jnp.asarray(_unflat("optv_v", a)[k]))
                  for k, v in _unflat("optv_m", a).items()}
+        for k in set(phi) - set(opt_v):
+            opt_v[k] = (jnp.zeros_like(phi[k]), jnp.zeros_like(phi[k]))
         best_theta = _unflat("best", a)
         stored_best_phi = _unflat("bestphi", a)
         if stored_best_phi:
+            if effective_value_hidden and "v_res1_w" not in stored_best_phi:
+                for key in ("v_res1_w", "v_res1_b", "v_res2_w", "v_res2_b"):
+                    stored_best_phi[key] = np.asarray(phi[key])
             best_phi = stored_best_phi
         else:
             # Backward compatibility for old runs. The final transfer probe is
@@ -1985,9 +2086,35 @@ def main() -> None:
         stage_theta = _unflat("stageref", a)
         publish(stage_theta, stage_ref)
         missing = RESUME_SCALARS - set(s)
+        # Compatibility with existing default-lambda runs. A non-default lambda
+        # may never be grafted onto an old resume whose credit setting is unknown.
+        if "lam" in missing and args.lam == LAM:
+            s["lam"] = LAM
+            missing.remove("lam")
+        # Symmetry augmentation changes the sampling distribution. Historical
+        # resumes are unambiguously the false/default arm and may migrate only
+        # when the caller also requests that arm.
+        if "augment" in missing and not args.augment:
+            s["augment"] = False
+            missing.remove("augment")
+        if "value_hidden" in missing and effective_value_hidden == 0:
+            s["value_hidden"] = 0
+            missing.remove("value_hidden")
         if missing:
             raise SystemExit(f"--resume: {resume_path} predates this build, "
                              f"missing scalars {sorted(missing)}. Start fresh.")
+        if float(s["lam"]) != float(args.lam):
+            raise SystemExit(f"--resume: checkpoint used --lam {s['lam']}, you "
+                             f"passed {args.lam}. Use the original value or a new --out.")
+        if bool(s["augment"]) != bool(args.augment):
+            raise SystemExit(f"--resume: checkpoint used --augment={s['augment']}, "
+                             f"you passed {args.augment}. Use the original setting "
+                             "or a new --out.")
+        if int(s["value_hidden"]) != int(effective_value_hidden):
+            raise SystemExit(f"--resume: checkpoint used value_hidden="
+                             f"{s['value_hidden']}, this run requests "
+                             f"{effective_value_hidden}. Use the original setting "
+                             "or a new --out.")
         start_it = s["it"] + 1
         stage, over, resident = s["stage"], s["over"], s["resident"]
         beta, lr_scale, t_p, t_v = s["beta"], s["lr_scale"], s["t_p"], s["t_v"]
@@ -2017,6 +2144,7 @@ def main() -> None:
     cf_ring: dict[str, np.ndarray] = {}
     cf_n, cf_seen = 0, 0          # rows currently valid, rows ever written
     cf_last: list[dict] = []      # this iteration's forks, for the log line
+    value_replay = GameBalancedReplay(2 * args.critic_replay_games)
 
     def play(jobs, weights):
         """Publish, then dispatch. Every sample comes from exactly one snapshot,
@@ -2112,8 +2240,13 @@ def main() -> None:
         t0 = time.time()
         dmin, dmax, _ = STAGES[stage]
         snapshot = {k: np.asarray(v) for k, v in theta.items()}
+        theta_old = ({k: jnp.asarray(v) for k, v in snapshot.items()}
+                     if args.augment else None)
         results = (play_train(it, stage) if vec_backend
-                   else play(build_jobs(it, args.games, stage, args.stage_replay),
+                   else play(build_jobs(
+                       it, args.games, stage, args.stage_replay,
+                       args.restart_frac, args.restart_min_turn,
+                       args.restart_max_turn),
                              snapshot))
         # WHERE THE ITERATION GOES, printed every iteration, because two
         # speedup attempts were designed against a guess about this and both
@@ -2143,6 +2276,13 @@ def main() -> None:
         if not results:
             print(f"iter {it:5d}  no usable games", flush=True)
             continue
+
+        # References survive the destructive packing below. They are copied
+        # into the critic-only ring after this iteration's updates, preventing
+        # one trajectory from appearing as both current and historical data in
+        # the same minibatch.
+        replay_pending = [(r["x"], float(r["z"]), f"stage-{stage}")
+                          for r in results if "x" in r]
 
         # Harvest the forks BEFORE the ingest block pops `x` and `mask`. A fork
         # rides as extra keys on a seat-0 trajectory (see `_pack`), so the test
@@ -2235,7 +2375,7 @@ def main() -> None:
         frac = np.empty(n, dtype=np.float32)   # position within the episode, 0..1
         k = 0
         for length, z in episodes:
-            adv[k:k + length] = gae(z, vals[k:k + length])
+            adv[k:k + length] = gae(z, vals[k:k + length], lam=args.lam)
             ret[k:k + length] = z           # MC return; see netoracle.gae
             frac[k:k + length] = np.arange(length, dtype=np.float32) / max(length - 1, 1)
             k += length
@@ -2358,7 +2498,26 @@ def main() -> None:
             order = rng.permutation(n)
             for s in range(0, n - mb + 1, mb):
                 sel = order[s:s + mb]
-                xb = to_x(xs[sel])
+                if args.augment:
+                    host_mask = np.unpackbits(
+                        packed[sel], axis=1)[:, :features.N_ACTIONS].astype(bool)
+                    host_x, host_mask, host_idx = bc.augment_ppo(
+                        xs[sel], host_mask, idxs[sel], int(rng.integers(8)))
+                    xb = to_x(host_x)
+                    maskb, idxb = jnp.asarray(host_mask), jnp.asarray(host_idx)
+                    # A transformed action has a different density under a
+                    # non-equivariant net. Reusing rollout log-probs poisons the
+                    # PPO ratio, so recompute both frozen-policy densities.
+                    if do_policy:
+                        oldb = ref_logp_of(theta_old, xb, maskb, idxb)
+                        refb = ref_logp_of(theta_ref, xb, maskb, idxb)
+                    else:
+                        oldb = refb = jnp.zeros(len(sel), jnp.float32)
+                else:
+                    xb = to_x(xs[sel])
+                    maskb, idxb = to_mask(packed[sel]), jnp.asarray(idxs[sel])
+                    oldb = jnp.asarray(old_logp[sel])
+                    refb = jnp.asarray(ref_logp[sel])
                 nb += 1
                 # ONE call shape whether or not the mechanism is on: with no ring
                 # the aux batch is a single row of the main batch at weight 0.0,
@@ -2375,12 +2534,11 @@ def main() -> None:
                             jnp.asarray(cf_ring["delta"][csel]))
                     cf_vb = (to_x(cf_ring["x"][csel]), jnp.asarray(cf_ring["z"][csel]))
                 else:
-                    cf_b = (xb[:1], to_mask(packed[sel[:1]]),
-                            jnp.asarray(idxs[sel[:1]]), jnp.zeros(1, jnp.float32))
+                    cf_b = (xb[:1], maskb[:1], idxb[:1],
+                            jnp.zeros(1, jnp.float32))
                     cf_vb = (xb[:1], jnp.zeros(1, jnp.float32))
                 if do_policy:
-                    batch = (xb, to_mask(packed[sel]), jnp.asarray(idxs[sel]),
-                             jnp.asarray(old_logp[sel]), jnp.asarray(ref_logp[sel]),
+                    batch = (xb, maskb, idxb, oldb, refb,
                              jnp.asarray(adv[sel]), *cf_b, cf_pw)
                     t_p += 1
                     theta, opt_p, _, aux, norm = p_step(theta, opt_p, t_p, beta,
@@ -2391,8 +2549,16 @@ def main() -> None:
                     kl_sum += ku
                     kl_u, kl_last, kl_a, ent, pg, gn = (
                         kl_sum / nb, ku, ka, en, pgv, float(norm))
+                vxb = xb
+                vret = np.asarray(ret[sel], np.float32)
+                if len(value_replay) and mb > 1 and args.critic_replay_frac > 0:
+                    nr = min(mb - 1, max(
+                        1, int(round(mb * args.critic_replay_frac))))
+                    rx, rz = value_replay.sample(rng, nr)
+                    vxb = jnp.concatenate([xb[:mb - nr], to_x(rx)], axis=0)
+                    vret = np.concatenate([vret[:mb - nr], rz])
                 t_v += 1
-                phi, opt_v, vl = v_step(phi, opt_v, t_v, xb, jnp.asarray(ret[sel]),
+                phi, opt_v, vl = v_step(phi, opt_v, t_v, vxb, jnp.asarray(vret),
                                         *cf_vb, cf_vw)
                 vloss = float(vl)
                 # Tested on the CURRENT minibatch, not the running mean: each
@@ -2404,6 +2570,9 @@ def main() -> None:
                     break
             if stop:
                 break
+
+        for replay_x, replay_z, replay_source in replay_pending:
+            value_replay.add(replay_x, replay_z, replay_source)
 
         if do_policy:
             if kl_a > ANCHOR_HI:
@@ -2663,6 +2832,9 @@ def main() -> None:
                          "best_score": float(best_score), "best_iter": best_iter,
                          "base_score": None if base_score is None else float(base_score),
                          "comp_low": comp_low,
+                         "lam": float(args.lam),
+                         "augment": bool(args.augment),
+                         "value_hidden": int(effective_value_hidden),
                          "rng_state": rng.bit_generator.state})
 
     if args.probe:

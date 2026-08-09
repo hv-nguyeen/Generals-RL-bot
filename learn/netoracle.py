@@ -35,12 +35,14 @@ FIVE PREVIOUS ATTEMPTS FAILED. EACH ONE HAS A MECHANISM HERE
    released the policy after 3 iterations with evar still at +0.02 and eval fell
    0.175 -> 0.000 by iteration 160), and the advantage is SCALED but not
    re-centred. Centring
-   was the bug, not the cure: with gamma=1, terminal-only reward and lam=0.95
-   every state more than ~60 plies from the end has a raw advantage of ~0, so
-   subtracting the buffer mean hands two thirds of the batch one identical
-   deterministic advantage whose sign is set by the batch win rate -- failure 4
-   verbatim, switching on exactly when the run starts winning. The baseline is
-   the critic; watch `evar`.
+   was the bug, not the cure. With gamma=1 and terminal-only reward, lambda
+   interpolates between critic-bootstrapped TD advantages and the Monte-Carlo
+   endpoint `z - V(s_t)`. At lam=0.95 a weak near-zero critic leaves states more
+   than ~60 plies from the end with raw advantage near 0, so subtracting the
+   buffer mean hands most of the batch one identical deterministic advantage
+   whose sign is set by the batch win rate -- failure 4 verbatim. Higher lambda
+   reduces that bootstrap bias but raises variance; critic quality and lambda
+   must be read together.
 5. The self-imitation exploiter started from random weights over a 3529-action
    space and never learned to play. This starts from clone.npz and is held there
    by three independent bounds: the PPO clip, a k3 KL anchor to the init with a
@@ -66,9 +68,10 @@ The `eval` line is the only progress number -- held-out boards, argmax play (the
 way a `clone:` archive member actually plays), raw sigma.
 
 `evar` is the critic's explained variance, 1 - Var(z - V)/Var(z), measured on
-the buffer BEFORE this iteration's critic updates. It is the only number that
-says whether GAE is producing signal or filtered noise; `v` is MSE against a
-target that is mostly 0 and reads healthy when the critic is useless.
+the buffer BEFORE this iteration's critic updates. It reports baseline quality,
+but its effect on GAE depends on lambda: low lambda relies strongly on the
+critic, while lambda=1 gives the Monte-Carlo advantage `z - V(s_t)`. `v` is MSE
+against the direct outcome target and can read healthy when the critic is useless.
 
 `dlp0` is max|logp_parent - logp_worker| over the first minibatch. It is a MAX,
 not a mean: a mean over per-sample noise averages back to 1.0000 and is blind to
@@ -86,9 +89,11 @@ KILL THE RUN IF:
                         a healthy run prints 1e-4..1e-3. A layout bug prints
                         O(1).
     evar <= 0 after iteration 10
-                        The critic explains nothing, so every advantage is a
-                        lam-filtered difference of critic noise. Nothing the
-                        policy learns after this point is credit assignment.
+                        At the default lam=0.95 the critic explains nothing, so
+                        most early advantages are bootstrap error plus a heavily
+                        attenuated terminal residual. At lam near 1 this is more
+                        a variance/baseline warning than a bias verdict; do not
+                        reuse the default evar gate without measuring that arm.
     W/D/L nearly all D  Every game is hitting --max-turns. train-wr reads 0.50,
                         which is indistinguishable from a healthy 50/50 split,
                         and every advantage is ~0. Eight hours of nothing.
@@ -146,8 +151,10 @@ from arena import agents
 from bot import features, rules
 from bot.memory import TemporalMemory
 from bot.policy.net import (DEFAULT_CHANNELS, DEFAULT_LAYERS, Net, arch_record,
-                            trunk_keys)
-from learn.league import allocate, dense, fictitious_play, stderr
+                            strategy_keys, trunk_keys)
+from learn.replay import GameBalancedReplay
+from learn.league import (PFSP_WEIGHTINGS, allocate, dense, fictitious_play,
+                          pfsp, stderr)
 from sim import engine, mapgen
 
 # Board origins. Training boards are GENERATED and there are 128 fresh ones per
@@ -158,7 +165,9 @@ NN_EVAL_SEED0 = 600_000
 NN_GATE_SEED0 = 700_000
 
 GAMMA = 1.0          # terminal-only reward; discounting a win 500 turns out is
-LAM = 0.95           # bias with no upside. lam caps credit at ~20 steps.
+LAM = 0.95           # historical TD/MC interpolation; 1.0 gives z - V(s_t).
+REWARD_MODES = ("terminal", "tempo")
+TEMPO_EPS = 0.03     # small terminal-only tie-break for an explicit exploiter arm
 CLIP = 0.2
 ENTROPY = 0.003
 ADV_CLIP = 5.0
@@ -212,6 +221,8 @@ def policy_keys(arch: dict) -> set:
              for s in "wb"} | {"head_w", "head_b", "pass_w", "pass_b"})
     if arch.get("context", False):
         keys |= {"context_global", "context_region"}
+    if arch.get("strategy", False):
+        keys |= strategy_keys()
     return keys
 
 
@@ -272,15 +283,17 @@ def gae(z: float, v: np.ndarray, gamma: float = GAMMA, lam: float = LAM):
     truncation boundary to bootstrap across -- `learn/rl.py`'s self-bootstrap at
     the window edge cannot happen here.
 
-    Advantages only. The critic's target is the MONTE-CARLO return, which with
-    gamma=1 and terminal-only reward is exactly z at every state -- unbiased, and
-    with no variance to trade away because there is no intermediate reward to
-    average over. It is literally the label `learn/valuedata.py` writes. The
-    lam-return `adv + v` is not usable here: the critic starts near 0, so the
-    target is 0.95^(T-1-t) * z ~ 0 for most of the game, the critic refits its
-    own zero, and the terminal signal creeps back 1/(1-lam) = 20 plies per
-    iteration -- twenty iterations to reach the opening of a 384-turn game, which
-    is the whole window in which the earlier runs collapsed.
+    Advantages only. The critic target is separately the MONTE-CARLO outcome z
+    at every state and is therefore independent of lambda. With gamma=1,
+    lambda interpolates between one-step critic bootstrapping and the exact
+    Monte-Carlo advantage: ``lam=1 => A_t = z - V(s_t)``. Moving lambda upward
+    reduces bias from an inaccurate critic but increases trajectory-level
+    variance; it does not change the critic's reward horizon.
+
+    Do not replace the critic target with ``adv + v``. At lam=0.95 and an
+    initially zero critic that lambda-return is ``0.95**(T-1-t) * z`` for most
+    of the game, so the critic would train on its own bootstrapped zero rather
+    than the direct outcome label that is already available from a complete game.
     """
     T = len(v)
     adv = np.zeros(T, dtype=np.float32)
@@ -291,6 +304,33 @@ def gae(z: float, v: np.ndarray, gamma: float = GAMMA, lam: float = LAM):
         last = (r + gamma * nxt - v[t]) + gamma * lam * last
         adv[t] = last
     return adv
+
+
+def episode_return(z: float, turns: int, max_turns: int,
+                   mode: str = "terminal", tempo_eps: float = TEMPO_EPS) -> float:
+    """Return used by the neural oracle's critic and GAE.
+
+    ``terminal`` is the historical objective and is exactly ``z``. ``tempo``
+    is an explicitly opt-in, terminal-only tie-break for a learned exploiter:
+    wins stay closer to +1 when they finish early, while losses are less
+    negative when the policy survives longer. The factor keeps the utility in
+    [-1, 1], so the tanh critic remains bounded, and every win still outranks
+    every draw, which outranks every loss. Evaluation and promotion always use
+    the raw W/D/L outcome, never this shaped value.
+    """
+    if mode not in REWARD_MODES:
+        raise ValueError(f"unknown reward mode {mode!r}; expected {REWARD_MODES}")
+    if not 0.0 <= float(tempo_eps) < 1.0:
+        raise ValueError(f"tempo_eps must be in [0, 1), got {tempo_eps}")
+    if mode == "terminal":
+        return float(z)
+    if max_turns <= 0:
+        raise ValueError(f"max_turns must be positive, got {max_turns}")
+    # A faster win stays closer to +1; a slower loss stays closer to zero.
+    # Clamp malformed turn counts at the rule boundary so a worker fault cannot
+    # manufacture a target outside the critic's representable range.
+    frac = min(max(float(turns), 0.0), float(max_turns)) / float(max_turns)
+    return float(z) * (1.0 - float(tempo_eps) * frac)
 
 
 def adam(p, opt, g, t, lr):
@@ -343,6 +383,28 @@ def effective(p) -> float:
     p = np.asarray(p, dtype=float)
     nz = p[p > 0]
     return float(np.exp(-(nz * np.log(nz)).sum()))
+
+
+def pfsp_for_checkpoint(state: dict, checkpoint: str,
+                        weighting: str) -> tuple[np.ndarray, int]:
+    """PFSP distribution for the archive member represented by checkpoint."""
+    target = Path(checkpoint).resolve()
+    found = []
+    for i, member in enumerate(state["archive"]):
+        kind, _, arg = member["spec"].partition(":")
+        arg = arg.partition("@")[0]
+        if kind in ("clone", "ship", "tta", "guard", "snipe") and arg:
+            try:
+                if Path(arg).resolve() == target:
+                    found.append(i)
+            except OSError:
+                pass
+    if len(found) != 1:
+        raise SystemExit(
+            f"--sampling pfsp needs --init to identify exactly one archive member; "
+            f"found indices {found} for {target}. Add clone:{target} once to the archive.")
+    i = found[0]
+    return pfsp(dense(state["payoff"])[i], weighting, exclude=i), i
 
 
 def sample_opponents(sigma, n: int, rng, floor: float = SIGMA_FLOOR) -> np.ndarray:
@@ -516,10 +578,19 @@ def selfcheck() -> None:
     # a perfect critic (V == the true return) leaves nothing to explain
     a = gae(1.0, np.ones(9, dtype=np.float32), 1.0, 1.0)
     assert np.abs(a).max() < 1e-6, a
+    # At the undiscounted Monte-Carlo endpoint all intermediate bootstrap terms
+    # telescope exactly, for an arbitrary imperfect critic.
+    v = np.array([0.2, -0.4, 0.7, 0.1], dtype=np.float32)
+    assert np.allclose(gae(-1.0, v, 1.0, 1.0), -1.0 - v)
     # the lam=0.95 default is why the critic target is NOT adv+v: 100 plies from
     # the end a zero critic would be asked to predict 0.006 for a won game.
     a = gae(1.0, np.zeros(101, dtype=np.float32))
     assert abs(a[0] - 0.95 ** 100) < 1e-6 and a[0] < 0.01, a[0]
+    # Reward shaping is explicitly opt-in and never leaves the critic's range.
+    assert episode_return(1, 1, 100) == 1.0
+    assert episode_return(1, 1, 100, "tempo") > episode_return(1, 100, 100, "tempo")
+    assert episode_return(-1, 1, 100, "tempo") < episode_return(-1, 100, 100, "tempo")
+    assert episode_return(0, 1, 100, "tempo") == 0.0
 
     # --- critic readiness is a standing gate, including NaN/all-draw buffers
     assert not critic_ready(WARMUP - 1, 1.0, 0.10)
@@ -677,6 +748,29 @@ def main() -> None:
                     help="critic Adam step. 1e-3 memorised the on-policy buffer "
                          "in measured full-distance runs; 1e-4 is the safe "
                          "transfer default")
+    ap.add_argument("--critic-replay-games", type=int, default=0,
+                    help="historical episodes retained for game-balanced critic replay")
+    ap.add_argument("--critic-replay-frac", type=float, default=0.5,
+                    help="share of critic minibatches drawn from replay")
+    ap.add_argument("--critic-replay-source-floor", type=float, default=0.25,
+                    help="uniform opponent-style mass inside critic replay")
+    ap.add_argument("--value-hidden", type=int, default=64,
+                    help="residual critic-head width; 0 is the linear control")
+    ap.add_argument("--lam", type=float, default=LAM,
+                    help="GAE TD/Monte-Carlo interpolation. 0.95 is historical; "
+                         "1.0 gives z-V(s) and relies least on critic bootstraps. "
+                         "The value is recorded in the run manifest")
+    ap.add_argument("--reward-mode", choices=REWARD_MODES, default="terminal",
+                    help="critic/GAE objective: terminal is the historical "
+                         "win/draw/loss reward; tempo is an explicit "
+                         "terminal-only fast-win/slow-loss tie-break for a "
+                         "learned exploiter. Evaluation remains raw W/D/L")
+    ap.add_argument("--tempo-eps", type=float, default=TEMPO_EPS,
+                    help="tempo tie-break strength in [0,1); ignored by the "
+                         "terminal reward mode")
+    ap.add_argument("--augment", action="store_true",
+                    help="random dihedral PPO minibatches with relabelled "
+                         "masks/actions and recomputed frozen-policy log-probs")
     ap.add_argument("--warm-evar", type=float, default=0.10,
                     help="hold the policy frozen until the critic explains this "
                          "much of the return; 0 restores the old fixed warmup")
@@ -691,6 +785,13 @@ def main() -> None:
                          "The default leaves a point-mass sigma sending 85%% of "
                          "games to one bot; raise it when the startup line says "
                          "fewer than two effective opponents")
+    ap.add_argument("--role", choices=("main", "main-exploiter", "league-exploiter"),
+                    default="league-exploiter",
+                    help="population role recorded in the artifact and logs")
+    ap.add_argument("--sampling", choices=("nash", "pfsp"), default="nash",
+                    help="training opponent distribution; gates remain on raw Nash")
+    ap.add_argument("--pfsp-weighting", choices=PFSP_WEIGHTINGS, default="variance",
+                    help="variance targets near-50%% games; linear/squared focus weaknesses")
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--channels", type=int, default=None)
     ap.add_argument("--residual", action=argparse.BooleanOptionalAction, default=None,
@@ -703,6 +804,20 @@ def main() -> None:
     if args.selfcheck:
         selfcheck()
         return
+    if not 0.0 < args.lam <= 1.0:
+        raise SystemExit(f"--lam must be in (0, 1], got {args.lam}")
+    if args.critic_replay_games < 0:
+        raise SystemExit("--critic-replay-games must be non-negative")
+    if not 0.0 <= args.critic_replay_frac < 1.0:
+        raise SystemExit("--critic-replay-frac must be in [0, 1)")
+    if not 0.0 <= args.critic_replay_source_floor <= 1.0:
+        raise SystemExit("--critic-replay-source-floor must be in [0, 1]")
+    if args.value_hidden < 0:
+        raise SystemExit("--value-hidden must be zero or positive")
+    if not 0.0 <= args.tempo_eps < 1.0:
+        raise SystemExit(f"--tempo-eps must be in [0, 1), got {args.tempo_eps}")
+    if args.role == "main" and args.reward_mode != "terminal":
+        raise SystemExit("the main agent must use terminal reward; tempo is exploiter-only")
     if not args.league:
         raise SystemExit("--league is required: sigma is not stored anywhere else")
 
@@ -722,6 +837,10 @@ def main() -> None:
     # sigma is NOT in the checkpoint (keys: iter/pending/params/archive/payoff);
     # it is a function of the payoff matrix and has to be recomputed here.
     sigma = fictitious_play(dense(state["payoff"]))
+    train_sigma, pfsp_index = sigma, None
+    if args.sampling == "pfsp":
+        train_sigma, pfsp_index = pfsp_for_checkpoint(
+            state, args.init, args.pfsp_weighting)
     boards = args.games // 2
     evals = args.iters // max(args.eval_every, 1) + 2
     if NN_TRAIN_SEED0 + args.iters * boards >= NN_EVAL_SEED0:
@@ -762,11 +881,14 @@ def main() -> None:
           f"{int((sigma > 0.01).sum())}: "
           + "  ".join(f"{s}={w:.2f}" for s, w in zip(specs, sigma) if w > 0.01)
           + f"  (raw Neff {raw_neff:.2f})")
+    if pfsp_index is not None:
+        print(f"role {args.role}: PFSP-{args.pfsp_weighting} from archive member "
+              f"{pfsp_index} ({specs[pfsp_index]}), Neff {effective(train_sigma):.2f}")
     # The single number that says whether this is a league or single-opponent
     # PPO, printed before a game is played. Nash on a transitive matrix -- which
     # is what an archive of config variants of one controller is -- is a point
     # mass, and the floor does not rescue it.
-    train_p = mixture(sigma, args.sigma_floor)
+    train_p = mixture(train_sigma, args.sigma_floor)
     neff = effective(train_p)
     print(f"training mixture: {neff:.2f} effective opponents over {len(specs)} "
           f"members (floor {args.sigma_floor:.2f})")
@@ -787,12 +909,13 @@ def main() -> None:
     if missing:
         raise SystemExit(f"{args.init} is not a policy checkpoint, missing {sorted(missing)}")
     z0 = {k: np.asarray(raw0[k]) for k in keys}
-    if z0["conv0_w"].shape[1] == features.BASE_C and features.C > features.BASE_C:
+    if (z0["conv0_w"].shape[1] in features.LEGACY_INPUT_CHANNELS
+            and features.C > z0["conv0_w"].shape[1]):
         old = z0["conv0_w"]
         stem = np.zeros((old.shape[0], features.C, 3, 3), np.float32)
-        stem[:, :features.BASE_C] = old
+        stem[:, :old.shape[1]] = old
         z0["conv0_w"] = stem
-        print(f"policy input migration: {features.BASE_C} -> {features.C} channels "
+        print(f"policy input migration: {old.shape[1]} -> {features.C} channels "
               "with zero temporal columns (function-preserving)")
     # Names and depth are not enough: an npz trained against a different
     # features.C passes both and then dies inside bc.forward at the first policy
@@ -809,13 +932,17 @@ def main() -> None:
     theta = {k: jnp.asarray(z0[k]) for k in keys}
     theta_ref = dict(theta)          # frozen; never rebound, never in a grad graph
     theta_init = {k: np.asarray(v) for k, v in theta.items()}
-    phi = vt.init_params(jax.random.PRNGKey(args.seed), arch)   # critic, same size
+    phi = vt.init_params(jax.random.PRNGKey(args.seed), arch,
+                         args.value_hidden)   # critic, same size
     if args.init_critic:
         from learn.selfplay import load_critic
         warm = load_critic(args.init_critic, arch,
                            {k: np.asarray(v) for k, v in phi.items()})
         phi = {k: jnp.asarray(v) for k, v in warm.items()}
         print(f"critic: warm start from {args.init_critic}", flush=True)
+    print(f"training reward: {args.reward_mode}"
+          f"{f' (tempo-eps {args.tempo_eps:.3f})' if args.reward_mode == 'tempo' else ''}; "
+          "gates/evaluation use raw W/D/L", flush=True)
     opt_p = {k: (jnp.zeros_like(v), jnp.zeros_like(v)) for k, v in theta.items()}
     opt_v = {k: (jnp.zeros_like(v), jnp.zeros_like(v)) for k, v in phi.items()}
 
@@ -889,11 +1016,14 @@ def main() -> None:
     rewinds = 0
     lr_scale = 1.0
     started = time.time()
+    value_replay = GameBalancedReplay(args.critic_replay_games)
 
     for it in range(args.iters):
         t0 = time.time()
         snapshot = {k: np.asarray(v) for k, v in theta.items()}
-        results = play(build_jobs(it, args.games, sigma, rng, args.sigma_floor),
+        theta_old = ({k: jnp.asarray(v) for k, v in snapshot.items()}
+                     if args.augment else None)
+        results = play(build_jobs(it, args.games, train_sigma, rng, args.sigma_floor),
                        snapshot)
         if not results:
             print(f"iter {it:4d}  no usable games", flush=True)
@@ -905,7 +1035,14 @@ def main() -> None:
         old_logp = np.concatenate([r["logp"] for r in results])
         # Drop the per-game copies: at 256 games the buffer is ~1 GB and keeping
         # both views of it doubles that for no reason.
-        episodes = [(len(r["idx"]), r["z"]) for r in results]
+        episodes = [
+            (len(r["idx"]), episode_return(r["z"], r["turns"], args.max_turns,
+                                            args.reward_mode, args.tempo_eps))
+            for r in results
+        ]
+        replay_pending = [
+            (r["x"], episodes[i][1], f"opponent-{int(r.get('opp', -1))}")
+            for i, r in enumerate(results)]
         for r in results:
             r.pop("x", None)
             r.pop("mask", None)
@@ -930,7 +1067,7 @@ def main() -> None:
         frac = np.empty(n, dtype=np.float32)
         k = 0
         for length, z in episodes:
-            adv[k:k + length] = gae(z, vals[k:k + length])
+            adv[k:k + length] = gae(z, vals[k:k + length], lam=args.lam)
             ret[k:k + length] = z           # MC return; see gae's docstring
             frac[k:k + length] = (
                 np.arange(length, dtype=np.float32) / max(length - 1, 1))
@@ -991,11 +1128,26 @@ def main() -> None:
             order = rng.permutation(n)
             for s in range(0, n - mb + 1, mb):
                 sel = order[s:s + mb]
-                xb = to_x(xs[sel])
+                if args.augment:
+                    host_mask = np.unpackbits(
+                        packed[sel], axis=1)[:, :features.N_ACTIONS].astype(bool)
+                    host_x, host_mask, host_idx = bc.augment_ppo(
+                        xs[sel], host_mask, idxs[sel], int(rng.integers(8)))
+                    xb = to_x(host_x)
+                    maskb, idxb = jnp.asarray(host_mask), jnp.asarray(host_idx)
+                    if do_policy:
+                        oldb = ref_logp_of(theta_old, xb, maskb, idxb)
+                        refb = ref_logp_of(theta_ref, xb, maskb, idxb)
+                    else:
+                        oldb = refb = jnp.zeros(len(sel), jnp.float32)
+                else:
+                    xb = to_x(xs[sel])
+                    maskb, idxb = to_mask(packed[sel]), jnp.asarray(idxs[sel])
+                    oldb = jnp.asarray(old_logp[sel])
+                    refb = jnp.asarray(ref_logp[sel])
                 nb += 1
                 if do_policy:
-                    batch = (xb, to_mask(packed[sel]), jnp.asarray(idxs[sel]),
-                             jnp.asarray(old_logp[sel]), jnp.asarray(ref_logp[sel]),
+                    batch = (xb, maskb, idxb, oldb, refb,
                              jnp.asarray(adv[sel]))
                     t_p += 1
                     theta, opt_p, _, aux, norm = p_step(theta, opt_p, t_p, beta,
@@ -1006,8 +1158,17 @@ def main() -> None:
                     kl_sum += ku
                     kl_u, kl_last, kl_a, ent, pg, gn = (
                         kl_sum / nb, ku, ka, en, pgv, float(norm))
+                vxb = xb
+                vret = np.asarray(ret[sel], np.float32)
+                if len(value_replay) and mb > 1 and args.critic_replay_frac > 0:
+                    nr = min(mb - 1, max(
+                        1, int(round(mb * args.critic_replay_frac))))
+                    rx, rz = value_replay.sample(
+                        rng, nr, source_floor=args.critic_replay_source_floor)
+                    vxb = jnp.concatenate([xb[:mb - nr], to_x(rx)], axis=0)
+                    vret = np.concatenate([vret[:mb - nr], rz])
                 t_v += 1
-                phi, opt_v, vl = v_step(phi, opt_v, t_v, xb, jnp.asarray(ret[sel]))
+                phi, opt_v, vl = v_step(phi, opt_v, t_v, vxb, jnp.asarray(vret))
                 vloss = float(vl)
                 # The clip bounds the ratio, not the step; this KL bounds it, and
                 # it is why the warm start is still there after 200 iterations.
@@ -1020,6 +1181,9 @@ def main() -> None:
                     break
             if stop:
                 break
+
+        for replay_x, replay_z, replay_source in replay_pending:
+            value_replay.add(replay_x, replay_z, replay_source)
 
         if do_policy:
             # A fixed beta either does nothing or freezes the policy. This is a
@@ -1127,7 +1291,9 @@ def main() -> None:
          "gate_games": len(gate), "gate_distinct": dg,
          "per_opponent": per, "init_per_opponent": init_per,
          "iters_done": args.iters, "best_iter": best_iter,
-         "best_eval": round(best_score, 4)}, indent=2) + "\n")
+         "best_eval": round(best_score, 4),
+         "reward_mode": args.reward_mode,
+         "tempo_eps": round(args.tempo_eps, 6)}, indent=2) + "\n")
 
     print(f"\ngate on {len(gate)} fresh games ({dg} distinct): trained {score:.3f} "
           f"vs init {init_score:.3f}, needs +{margin:.3f} -> "
@@ -1145,7 +1311,9 @@ def main() -> None:
                    extra={"kind": "population-ppo", "args": vars(args),
                           "gate": {"accepted": accepted, "score": score,
                                    "init_score": init_score, "margin": margin},
-                          "opponents": specs, "sigma": sigma.tolist()})
+                          "opponents": specs, "sigma": sigma.tolist(),
+                          "training_sigma": np.asarray(train_sigma).tolist(),
+                          "role": args.role, "sampling": args.sampling})
     if accepted:
         print("Confirm it before believing it:")
         print(f"  python -m arena.runner --a clone:{out} --b ours:configs/v16.json "

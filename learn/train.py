@@ -45,14 +45,17 @@ from pathlib import Path
 import numpy as np
 
 from bot import features
-from bot.policy.net import (DEFAULT_CHANNELS, DEFAULT_CONTEXT, DEFAULT_LAYERS, arch_of,
-                            arch_record, trunk_keys)
+from bot.policy.net import (DEFAULT_CHANNELS, DEFAULT_CONTEXT, DEFAULT_LAYERS,
+                            STRATEGY_OUTPUT_BLOCKS, STRATEGY_REGIONS,
+                            STRATEGY_TOKEN_BLOCKS, arch_of, arch_record,
+                            strategy_keys, trunk_keys)
 
 
 # --------------------------------------------------------------------------
 # architecture
 def resolve_arch(init: str | None, layers=None, channels=None, residual=None,
-                 context=None) -> dict:
+                 context=None, dense_context=None,
+                 strategy_hidden: int | None = None) -> dict:
     """The architecture for a run that may warm start from a checkpoint.
 
     A checkpoint's own shape wins, always. A flag that disagrees with it is a
@@ -62,16 +65,34 @@ def resolve_arch(init: str | None, layers=None, channels=None, residual=None,
     want = {"layers": layers, "channels": channels, "residual": residual,
             "context": context}
     if init:
-        have = arch_of(np.load(init))
+        loaded = np.load(init)
+        have = arch_of(loaded)
         bad = {k: f"flag {v} vs checkpoint {have[k]}"
                for k, v in want.items() if v is not None and v != have[k]}
+        have_dense = bool(have["context"] and loaded["context_global"].ndim == 2)
+        if dense_context is not None and bool(dense_context) != have_dense:
+            bad["dense_context"] = f"flag {dense_context} vs checkpoint {have_dense}"
+        have_strategy = int(have.get("strategy_hidden", 0))
+        if strategy_hidden is not None and int(strategy_hidden) != have_strategy:
+            bad["strategy_hidden"] = (
+                f"flag {strategy_hidden} vs checkpoint {have_strategy}")
         if bad:
             raise SystemExit(f"--init {init} disagrees with the flags: {bad}")
+        have["dense_context"] = have_dense
         return have
-    return {"layers": DEFAULT_LAYERS if layers is None else layers,
+    arch = {"layers": DEFAULT_LAYERS if layers is None else layers,
             "channels": DEFAULT_CHANNELS if channels is None else channels,
             "residual": bool(residual),
             "context": DEFAULT_CONTEXT if context is None else bool(context)}
+    arch["dense_context"] = bool(dense_context)
+    if dense_context:
+        if not arch["context"]:
+            raise SystemExit("--dense-context requires --context")
+    if strategy_hidden is not None and strategy_hidden < 0:
+        raise SystemExit("--strategy-hidden must be zero or positive")
+    if strategy_hidden:
+        arch.update(strategy=True, strategy_hidden=int(strategy_hidden))
+    return arch
 
 
 def init_params(key, arch: dict | None = None, cin: int = features.C):
@@ -104,8 +125,32 @@ def init_params(key, arch: dict | None = None, cin: int = features.C):
     if arch.get("context", False):
         # Small non-zero mixing lets the new path learn immediately without
         # overwhelming a local policy at initialisation.
-        params["context_global"] = jnp.full((ch,), 0.05)
-        params["context_region"] = jnp.full((ch,), 0.05)
+        shape = (ch, ch) if arch.get("dense_context", False) else (ch,)
+        if len(shape) == 2:
+            params["context_global"] = jnp.eye(ch) * 0.05
+            params["context_region"] = jnp.eye(ch) * 0.05
+        else:
+            params["context_global"] = jnp.full(shape, 0.05)
+            params["context_region"] = jnp.full(shape, 0.05)
+    hidden = int(arch.get("strategy_hidden", 0))
+    if hidden:
+        # The two outgoing layers are zero: adding this path to an incumbent is
+        # exactly function-preserving.  Their inputs are non-zero, so both paths
+        # start learning on the first optimiser step instead of becoming dead
+        # zero-on-zero branches.
+        params["strategy_w1"] = (
+            jax.random.normal(jax.random.fold_in(key, 101),
+                              (STRATEGY_TOKEN_BLOCKS * ch, hidden))
+            * np.sqrt(2.0 / (STRATEGY_TOKEN_BLOCKS * ch)))
+        params["strategy_b1"] = jnp.zeros((hidden,))
+        params["strategy_w2"] = jnp.zeros((hidden, STRATEGY_OUTPUT_BLOCKS * ch))
+        params["strategy_b2"] = jnp.zeros((STRATEGY_OUTPUT_BLOCKS * ch,))
+        params["strategy_ref1_w"] = (
+            jax.random.normal(jax.random.fold_in(key, 102), (ch, ch, 3, 3))
+            * np.sqrt(2.0 / (9 * ch)))
+        params["strategy_ref1_b"] = jnp.zeros((ch,))
+        params["strategy_ref2_w"] = jnp.zeros((ch, ch, 3, 3))
+        params["strategy_ref2_b"] = jnp.zeros((ch,))
     return params
 
 
@@ -152,9 +197,50 @@ def trunk(params, x):
                 d = jnp.maximum(v.sum(axis=(1, 2)), 1.0)
                 rmean = (q * v[:, None]).sum(axis=(2, 3)) / d[:, None]
                 regional = regional.at[:, :, rs, cs].set(rmean[:, :, None, None])
-        h = jax.nn.relu(h + params["context_global"][None, :, None, None]
-                        * mean[:, :, None, None]
-                        + params["context_region"][None, :, None, None] * regional)
+        if params["context_global"].ndim == 1:
+            global_term = params["context_global"][None, :] * mean
+            region_term = params["context_region"][None, :, None, None] * regional
+        else:
+            global_term = mean @ params["context_global"].T
+            region_term = jnp.einsum("oi,bihw->bohw",
+                                     params["context_region"], regional)
+        h = jax.nn.relu(h + global_term[:, :, None, None] + region_term)
+    if arch.get("strategy", False):
+        import jax.numpy as jnp
+        valid = x[:, features.VALID].astype(h.dtype)
+        den = jnp.maximum(valid.sum(axis=(1, 2)), 1.0)
+        mean = (h * valid[:, None]).sum(axis=(2, 3)) / den[:, None]
+        maximum = jnp.where(valid[:, None] > 0, h, -1e9).max(axis=(2, 3))
+        parts = [mean, maximum]
+        edges = (0, 7, 14, features.PAD)
+        for ri in range(STRATEGY_REGIONS):
+            for ci in range(STRATEGY_REGIONS):
+                rs, cs = slice(edges[ri], edges[ri + 1]), slice(edges[ci], edges[ci + 1])
+                v = valid[:, rs, cs]
+                q = h[:, :, rs, cs]
+                d = jnp.maximum(v.sum(axis=(1, 2)), 1.0)
+                parts.append((q * v[:, None]).sum(axis=(2, 3)) / d[:, None])
+        tokens = jnp.concatenate(parts, axis=1)
+        hidden = jax.nn.relu(tokens @ params["strategy_w1"]
+                             + params["strategy_b1"])
+        controls = (hidden @ params["strategy_w2"] + params["strategy_b2"]
+                    ).reshape(h.shape[0], STRATEGY_REGIONS * STRATEGY_REGIONS,
+                              2, h.shape[1])
+        conditioned = h
+        k = 0
+        for ri in range(STRATEGY_REGIONS):
+            for ci in range(STRATEGY_REGIONS):
+                rs, cs = slice(edges[ri], edges[ri + 1]), slice(edges[ci], edges[ci + 1])
+                scale, bias = controls[:, k, 0], controls[:, k, 1]
+                block = (h[:, :, rs, cs] * (1.0 + scale[:, :, None, None])
+                         + bias[:, :, None, None])
+                conditioned = conditioned.at[:, :, rs, cs].set(block)
+                k += 1
+        conditioned = jax.nn.relu(conditioned)
+        refine = jax.nn.relu(_conv(
+            conditioned, params["strategy_ref1_w"], params["strategy_ref1_b"]))
+        refine = _conv(refine, params["strategy_ref2_w"], params["strategy_ref2_b"])
+        h = jax.nn.relu(conditioned + refine)
     return h
 
 
@@ -262,6 +348,40 @@ def augment(x: np.ndarray, y: np.ndarray, g: int):
     return out.reshape(x.shape), y
 
 
+def augment_ppo(x: np.ndarray, mask: np.ndarray, idx: np.ndarray, g: int):
+    """Dihedral transform of PPO states, legal masks, and sampled actions.
+
+    `old_logp` and `ref_logp` are intentionally not accepted: a non-equivariant
+    network assigns a different density to the transformed action, so callers
+    must recompute both under their frozen snapshots after this relabeling.
+    """
+    if g % 8 == 0:
+        return x, mask, idx
+    if mask.shape != (len(x), features.N_ACTIONS):
+        raise ValueError(f"mask is {mask.shape}, expected {(len(x), features.N_ACTIONS)}")
+    hs = x[:, features.VALID, :, 0].sum(1).astype(int)
+    ws = x[:, features.VALID, 0, :].sum(1).astype(int)
+    flat = x.reshape(len(x), features.C, -1)
+    out = np.empty_like(flat)
+    moved_mask = np.zeros_like(mask, dtype=bool)
+    moved_idx = idx.copy()
+    for h, w in set(zip(hs.tolist(), ws.tolist())):
+        rows = np.flatnonzero((hs == h) & (ws == w))
+        cellmap, actmap = _dihedral_maps(h, w, g % 8)
+        out[rows] = flat[rows][:, :, cellmap]
+        moved_idx[rows] = actmap[moved_idx[rows]]
+        cells = ((np.arange(h)[:, None] * features.PAD
+                  + np.arange(w)[None, :]).reshape(-1))
+        active = np.concatenate([
+            (cells[:, None] * features.PER_CELL
+             + np.arange(features.PER_CELL)[None, :]).reshape(-1),
+            np.asarray([features.PASS_INDEX])])
+        moved_mask[np.ix_(rows, actmap[active])] = mask[np.ix_(rows, active)]
+    if not np.all(moved_mask[np.arange(len(x)), moved_idx]):
+        raise AssertionError("dihedral relabel made a sampled action illegal")
+    return out.reshape(x.shape), moved_mask, moved_idx
+
+
 # --------------------------------------------------------------------------
 # Validation split. Fixed and independent of --seed: every architecture in a
 # scaling study has to be scored on the SAME held-out games, or the comparison
@@ -298,7 +418,7 @@ def load_shard(path: Path):
     """One shard, kept float16 in host memory. The full set does not fit:
     2.2M examples of 12x21x21 float32 is ~46 GB."""
     z = np.load(path)
-    return z["x"], z["y"].astype(np.int32)
+    return features.ensure_channels(z["x"]), z["y"].astype(np.int32)
 
 
 def main() -> None:
@@ -318,6 +438,10 @@ def main() -> None:
                     help="pre-activation residual blocks; needs an odd --layers")
     ap.add_argument("--context", action=argparse.BooleanOptionalAction, default=True,
                     help="mix global and 3x3 regional summaries into local features")
+    ap.add_argument("--dense-context", action="store_true",
+                    help="replace channelwise context scales with CxC mixers")
+    ap.add_argument("--strategy-hidden", type=int, default=0,
+                    help="global 3x3 spatial-strategy MLP width; 0 disables it")
     ap.add_argument("--augment", action="store_true",
                     help="dihedral symmetry, 8x effective data")
     ap.add_argument("--selfcheck", action="store_true")
@@ -332,7 +456,8 @@ def main() -> None:
     import jax.numpy as jnp
 
     print("devices:", jax.devices())
-    arch = resolve_arch(None, args.layers, args.channels, args.residual, args.context)
+    arch = resolve_arch(None, args.layers, args.channels, args.residual,
+                        args.context, args.dense_context, args.strategy_hidden)
     shards = shard_list(Path(args.data))
     # Held out BY SHARD, and a shard is a run of whole replays, so this is a
     # split by game rather than by position — except for the one replay that
@@ -356,8 +481,11 @@ def main() -> None:
     key = jax.random.PRNGKey(args.seed)
     params = init_params(key, arch)
     n_par = sum(int(np.asarray(v).size) for v in params.values())
+    strategy_label = (f", strategy-{arch['strategy_hidden']}"
+                      if arch.get("strategy") else "")
     print(f"{arch['layers']}x{arch['channels']}"
           f"{' residual' if arch['residual'] else ''}, {n_par} parameters"
+          f"{strategy_label}"
           f"{', dihedral augmentation' if args.augment else ''}")
     m = {k: jnp.zeros_like(v) for k, v in params.items()}
     v = {k: jnp.zeros_like(p) for k, p in params.items()}
@@ -519,30 +647,55 @@ def selfcheck() -> None:
         p["pass_w"] = (rng.normal(size=prev) * 0.2).astype("f4")
         p["pass_b"] = np.float32(0.3)
         if arch.get("context", False):
-            p["context_global"] = (rng.normal(size=prev) * 0.1).astype("f4")
-            p["context_region"] = (rng.normal(size=prev) * 0.1).astype("f4")
+            shape = (prev, prev) if arch.get("dense_context", False) else (prev,)
+            p["context_global"] = (rng.normal(size=shape) * 0.1).astype("f4")
+            p["context_region"] = (rng.normal(size=shape) * 0.1).astype("f4")
+        hidden = int(arch.get("strategy_hidden", 0))
+        if hidden:
+            p["strategy_w1"] = (rng.normal(
+                size=(STRATEGY_TOKEN_BLOCKS * prev, hidden)) * 0.1).astype("f4")
+            p["strategy_b1"] = (rng.normal(size=hidden) * 0.1).astype("f4")
+            p["strategy_w2"] = (rng.normal(
+                size=(hidden, STRATEGY_OUTPUT_BLOCKS * prev)) * 0.03).astype("f4")
+            p["strategy_b2"] = (rng.normal(
+                size=STRATEGY_OUTPUT_BLOCKS * prev) * 0.03).astype("f4")
+            p["strategy_ref1_w"] = (rng.normal(
+                size=(prev, prev, 3, 3)) * 0.1).astype("f4")
+            p["strategy_ref1_b"] = (rng.normal(size=prev) * 0.1).astype("f4")
+            p["strategy_ref2_w"] = (rng.normal(
+                size=(prev, prev, 3, 3)) * 0.03).astype("f4")
+            p["strategy_ref2_b"] = (rng.normal(size=prev) * 0.03).astype("f4")
         return p
 
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
 
         # --- numpy and JAX agree at several shapes, residual on and off
-        for layers, channels, residual, context in (
-                (4, 32, False, False), (1, 8, False, False),
-                (6, 16, False, False), (3, 24, True, False),
-                (7, 16, True, False), (4, 12, False, True)):
+        for layers, channels, residual, context, dense, strategy_hidden in (
+                (4, 32, False, False, False, 0), (1, 8, False, False, False, 0),
+                (6, 16, False, False, False, 0), (3, 24, True, False, False, 0),
+                (7, 16, True, False, False, 0), (4, 12, False, True, False, 0),
+                (4, 12, False, True, True, 0), (4, 12, False, True, True, 7)):
             arch = {"layers": layers, "channels": channels,
-                    "residual": residual, "context": context}
+                    "residual": residual, "context": context,
+                    "dense_context": dense}
+            if strategy_hidden:
+                arch.update(strategy=True, strategy_hidden=strategy_hidden)
             p = rand_params(arch)
             ref = np.asarray(forward(p, jnp.asarray(x)))[0]
             path = td / f"a{layers}x{channels}{int(residual)}.npz"
             save(p, path)
             n = npnet.Net(str(path))
-            assert n.arch == arch, (n.arch, arch)
+            assert n.arch == {k: arch[k] for k in n.arch}, (n.arch, arch)
+            assert resolve_arch(str(path))["dense_context"] is dense
+            assert resolve_arch(str(path)).get("strategy_hidden", 0) == strategy_hidden
             got = _numpy_logits_of(n, x[0])
             scale = max(float(np.abs(ref).max()), 1.0)
-            assert np.abs(got - ref).max() < 1e-4 * scale, \
-                f"numpy/JAX disagree at {layers}x{channels} residual={residual} context={context}"
+            gap = float(np.abs(got - ref).max())
+            assert gap < 1e-4 * scale, \
+                f"numpy/JAX disagree at {layers}x{channels} residual={residual} " \
+                f"context={context} dense={dense} strategy={strategy_hidden}: " \
+                f"gap {gap:.3e}, tolerance {1e-4 * scale:.3e}"
 
         # --- an old-style 4x32 file, written before any of this existed, still
         #     loads and produces byte-identical logits to the old fixed loader
@@ -619,6 +772,17 @@ def selfcheck() -> None:
                                                      "residual": True,
                                                      "context": False}
 
+        # A function-preserving strategy init must not be a dead zero-on-zero
+        # branch. Its outgoing control and refinement layers both receive a
+        # gradient on the first update; the inner layers begin receiving one as
+        # soon as those outputs move off zero.
+        sp = init_params(jax.random.PRNGKey(9), {
+            "layers": 1, "channels": 4, "residual": False,
+            "context": False, "strategy": True, "strategy_hidden": 5})
+        sg = jax.grad(lambda q: jnp.mean(forward(q, jnp.asarray(x)) ** 2))(sp)
+        assert np.abs(np.asarray(sg["strategy_w2"])).max() > 0
+        assert np.abs(np.asarray(sg["strategy_ref2_w"])).max() > 0
+
     # --- dihedral augmentation moves the board and the label the same way
     for h, w in ((18, 21), (21, 21), (20, 18)):
         ty = rng.integers(0, 4, size=(h, w)).astype(np.int8)
@@ -636,6 +800,13 @@ def selfcheck() -> None:
             gx, _ = augment(enc.copy(), np.zeros(1, np.int64), g)
             assert np.array_equal(gx[0], features.encode(spun)), \
                 f"augmented tensor != encoding of the rotated board at g={g}"
+            legal = features.legal_mask(obs)
+            label = np.asarray([np.flatnonzero(legal)[0]], np.int64)
+            px, pm, py = augment_ppo(enc.copy(), legal[None], label, g)
+            assert np.array_equal(px, gx), f"PPO state transform drifted at g={g}"
+            assert np.array_equal(pm[0], features.legal_mask(spun)), \
+                f"PPO legal-mask relabel drifted at g={g}"
+            assert pm[0, py[0]], f"PPO sampled action became illegal at g={g}"
 
             # The cell map is now trusted (it reproduced encode()), so use it as
             # the ground truth for where a labelled move should have gone: the
@@ -673,6 +844,7 @@ def _numpy_logits_of(net, x):
     h = npnet._trunk(x.copy(), net.layers, net.arch["residual"])
     h = npnet._context_mix(h, x[features.VALID], net.context_global,
                            net.context_region)
+    h = npnet._strategy_mix(h, x[features.VALID], net.strategy)
     mv = npnet._conv3x3(h, net.head_w, net.head_b)
     return np.concatenate([np.transpose(mv, (1, 2, 0)).reshape(-1),
                            [float(net.pass_w @ h.mean(axis=(1, 2)) + net.pass_b)]])

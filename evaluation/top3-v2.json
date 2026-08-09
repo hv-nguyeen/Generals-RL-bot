@@ -1,39 +1,101 @@
 {
-  "schema_version": 2,
-  "games_per_bucket": 2000,
+  "schema_version": 5,
   "seed0": 8000000,
+  "confirmation_seed0": 100000000,
+  "attempt_stride": 1000000,
+  "max_attempts": 20,
   "elo_margin": 25.0,
   "max_turns": 1200,
   "max_move_ms": 125.0,
   "candidate_spec": "ship:{candidate}",
+  "required_style_roles": ["rush", "economy", "castle", "fog"],
+  "families": {
+    "style": {
+      "alpha": 0.05,
+      "method": "bonferroni"
+    }
+  },
+  "planning_notes": {
+    "fog_detectable_score": {
+      "games": 2000,
+      "independent_board_pairs": 1000,
+      "floor": 0.45,
+      "alpha": 0.05,
+      "worst_case_pair_variance": 0.25,
+      "approx_true_score_to_clear_on_expectation": 0.508,
+      "counterfactual_score_if_alpha_were_divided_by_four": 0.519,
+      "note": "Empirical-Bernstein planning approximation; observed variance determines the actual bound."
+    }
+  },
   "buckets": [
     {
       "name": "champion",
+      "games": 2000,
       "opponent": "ship:{reference}",
       "weight": 4.0,
       "min_lower_score": 0.5,
-      "requires_sprt": true
+      "requires_paired_superiority": true
     },
     {
-      "name": "sniper",
+      "name": "rush",
+      "games": 2000,
+      "family": "style",
+      "role": "signal",
+      "style_role": "rush",
+      "opponent": "hunter:2",
+      "weight": 3.0,
+      "min_lower_score": 0.75
+    },
+    {
+      "name": "economy",
+      "games": 2000,
+      "family": "style",
+      "role": "signal",
+      "style_role": "economy",
+      "opponent": "ours:configs/v16.json",
+      "weight": 2.0,
+      "min_lower_score": 0.5
+    },
+    {
+      "name": "castle",
+      "games": 2000,
+      "family": "style",
+      "role": "signal",
+      "style_role": "castle",
+      "opponent": "ours:configs/v18.json",
+      "weight": 2.0,
+      "min_lower_score": 0.5
+    },
+    {
+      "name": "fog",
+      "games": 2000,
+      "family": "style",
+      "role": "signal",
+      "style_role": "fog",
       "opponent": "snipe:{reference}@120",
       "weight": 3.0,
       "min_lower_score": 0.45
     },
     {
       "name": "hunter",
+      "games": 2000,
+      "role": "smoke",
       "opponent": "hunter",
       "weight": 1.0,
       "min_lower_score": 0.9
     },
     {
       "name": "greedy",
+      "games": 2000,
+      "role": "smoke",
       "opponent": "greedy",
       "weight": 1.0,
       "min_lower_score": 0.7
     },
     {
       "name": "expander",
+      "games": 2000,
+      "role": "smoke",
       "opponent": "expander",
       "weight": 0.5,
       "min_lower_score": 0.9

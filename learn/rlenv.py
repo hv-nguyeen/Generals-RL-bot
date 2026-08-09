@@ -31,6 +31,38 @@ sys.path.insert(0, str(REPO / "third_party" / "generals-bots"))
 from bot import features, rules                              # noqa: E402
 
 
+def _dilate4_jax(mask):
+    """No-wrap four-neighbour dilation over (..., H, W)."""
+    import jax.numpy as jnp
+
+    p = jnp.pad(mask, [(0, 0)] * (mask.ndim - 2) + [(1, 1), (1, 1)])
+    h, w = mask.shape[-2:]
+    return (mask | p[..., :h, 1:w + 1] | p[..., 2:h + 2, 1:w + 1]
+            | p[..., 1:h + 1, :w] | p[..., 1:h + 1, 2:w + 2])
+
+
+def _bfs_field_jax(passable, sources):
+    """Fixed-shape JAX mirror of ``bot.board.bfs_field``."""
+    import jax
+    import jax.numpy as jnp
+
+    # The exported feature clips distance at 2*PAD, and the spawn/fallback
+    # thresholds (17/8) are both below it. Computing past that cap cannot change
+    # any encoded value or candidate decision, but a 441-step loop made the
+    # first JAX memory update operationally unusable.
+    inf = 2 * features.PAD
+    reached = sources & passable
+    dist = jnp.where(reached, 0, inf).astype(jnp.int32)
+
+    def body(i, state):
+        reached, dist = state
+        grown = _dilate4_jax(reached) & passable
+        new = grown & ~reached
+        return grown, jnp.where(new, i + 1, dist)
+
+    return jax.lax.fori_loop(0, inf, body, (reached, dist))[1]
+
+
 def empty_memory_jax(batch: int):
     """Zero temporal state for ``batch`` observations."""
     import jax.numpy as jnp
@@ -41,6 +73,8 @@ def empty_memory_jax(batch: int):
         "initialised": jnp.zeros((batch,), jnp.bool_),
         "turn": jnp.full((batch,), -1, jnp.int32),
         "known_mountains": board_b,
+        "dist_home": jnp.full_like(board_i, features.PAD * features.PAD),
+        "general_candidates": board_b,
         "mem_owner": board_i,
         "mem_army": board_i,
         "mem_turn": jnp.full_like(board_i, -1),
@@ -63,6 +97,7 @@ def empty_memory_jax(batch: int):
 
 def update_memory_jax(memory, obs):
     """Unbatched JAX mirror of ``bot.memory.TemporalMemory.update``."""
+    import jax
     import jax.numpy as jnp
 
     visible = ~(obs.fog_cells | obs.structures_in_fog)
@@ -73,6 +108,25 @@ def update_memory_jax(memory, obs):
         obs.mountains | obs.structures_in_fog)
     known_mountains = ((known_mountains | obs.mountains)
                        & ~(visible & ~obs.mountains))
+
+    def bootstrap(_):
+        passable = ~known_mountains
+        general = obs.generals & mine
+        fallback_idx = jnp.argmax(mine.reshape(-1).astype(jnp.int32))
+        fallback = (jnp.arange(features.PAD * features.PAD) == fallback_idx).reshape(
+            features.PAD, features.PAD)
+        source = jnp.where(general.any(), general, fallback) & passable
+        dist = _bfs_field_jax(passable, source)
+        # A conservative superset of the generator prior. The full generator
+        # also matches radius-7 room counts; omitting that expensive all-source
+        # field never removes the true general and keeps vector rollout cheap.
+        candidates = passable & (dist >= rules.MIN_GENERALS_DISTANCE)
+        return dist, candidates
+
+    dist_home, general_candidates = jax.lax.cond(
+        memory["initialised"],
+        lambda _: (memory["dist_home"], memory["general_candidates"]),
+        bootstrap, operand=None)
     changed = visible & memory["ever_seen"]
     my_gained = changed & mine & (memory["mem_owner"] != 1)
     opp_gained = changed & opp & (memory["mem_owner"] != 2)
@@ -90,6 +144,13 @@ def update_memory_jax(memory, obs):
     mem_turn = jnp.where(visible, obs.timestep.astype(jnp.int32), memory["mem_turn"])
     ever_seen = memory["ever_seen"] | visible
     ever_enemy = memory["ever_enemy"] | (visible & opp)
+    seen_general = obs.generals & opp
+    general_candidates = jnp.where(
+        seen_general.any(), seen_general, general_candidates & ~visible)
+    fallback_candidates = (~known_mountains & ~ever_seen
+                           & (dist_home >= rules.MIN_GENERALS_DISTANCE // 2))
+    general_candidates = jnp.where(
+        general_candidates.any(), general_candidates, fallback_candidates)
     seen_before = memory["turn"] >= 0
     dma = jnp.where(seen_before, obs.owned_army_count - memory["my_army"], 0)
     doa = jnp.where(seen_before, obs.opponent_army_count - memory["opp_army"], 0)
@@ -101,6 +162,8 @@ def update_memory_jax(memory, obs):
         "initialised": jnp.bool_(True),
         "turn": obs.timestep.astype(jnp.int32),
         "known_mountains": known_mountains,
+        "dist_home": dist_home,
+        "general_candidates": general_candidates,
         "mem_owner": mem_owner,
         "mem_army": mem_army,
         "mem_turn": mem_turn,
@@ -145,6 +208,22 @@ def memory_planes_jax(obs, memory, valid):
         ones * jnp.tanh(memory["delta_land_adv"] / 10.0),
     ]).astype(jnp.float32)
     return out * valid[None]
+
+
+def strategic_planes_jax(obs, memory, valid):
+    """JAX mirror of ``features.strategic_planes``."""
+    import jax.numpy as jnp
+
+    zeros = jnp.zeros_like(valid)
+    prior = (memory["general_candidates"].astype(jnp.float32)
+             if memory is not None else zeros)
+    dist = (jnp.clip(memory["dist_home"].astype(jnp.float32)
+                     / (2.0 * features.PAD), 0.0, 1.0)
+            * (~memory["known_mountains"]).astype(jnp.float32)
+            if memory is not None else zeros)
+    structures = obs.owned_cells & (obs.generals | obs.castles)
+    cost = jnp.log1p(build_cost_grid_jax(structures).astype(jnp.float32)) / 6.0
+    return jnp.stack([prior, dist, cost]) * valid[None]
 
 
 def encode_jax(obs, valid_h, valid_w, memory=None):
@@ -202,7 +281,8 @@ def encode_jax(obs, valid_h, valid_w, memory=None):
                              jnp.float32)
     else:
         memory_x = memory_planes_jax(obs, memory, valid)
-    x = jnp.concatenate([x, memory_x])
+    strategy_x = strategic_planes_jax(obs, memory, valid)
+    x = jnp.concatenate([x, memory_x, strategy_x])
     # everything outside the real board is padding, not board state
     return x * valid[None]
 

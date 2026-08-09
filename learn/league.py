@@ -174,6 +174,9 @@ from bot.config import Config
 MATRIX_SEED0 = 50_000
 ORACLE_SEED0 = 200_000
 HOLDOUT_SEED0 = 900_000
+NN_REWARD_MODES = ("terminal", "tempo")
+NN_TEMPO_EPS = 0.03
+PFSP_WEIGHTINGS = ("variance", "linear", "squared")
 
 
 # --------------------------------------------------------------------------
@@ -361,6 +364,31 @@ def fictitious_play(payoff: np.ndarray, iters: int = 20_000) -> np.ndarray:
         counts[i] += 1
         total += payoff[:, i]
     return counts / counts.sum()
+
+
+def pfsp(win_rates: np.ndarray, weighting: str = "variance",
+         exclude: int | None = None) -> np.ndarray:
+    """Prioritised fictitious self-play distribution from matchup win rates.
+
+    ``variance`` targets informative near-50% opponents for the main agent;
+    ``linear`` and ``squared`` increasingly focus exploiters on weaknesses.
+    """
+    x = np.clip(np.asarray(win_rates, dtype=float), 0.0, 1.0)
+    if weighting == "variance":
+        w = x * (1.0 - x)
+    elif weighting == "linear":
+        w = 1.0 - x
+    elif weighting == "squared":
+        w = (1.0 - x) ** 2
+    else:
+        raise ValueError(f"unknown PFSP weighting {weighting!r}")
+    if exclude is not None:
+        w[int(exclude)] = 0.0
+    if not np.isfinite(w).all() or w.sum() <= 0:
+        w = np.ones_like(x)
+        if exclude is not None and len(w) > 1:
+            w[int(exclude)] = 0.0
+    return w / w.sum()
 
 
 # --------------------------------------------------------------------------
@@ -561,11 +589,24 @@ def net_oracle_command(args, npz: Path, ckpt: Path,
            "--minibatch", str(args.nn_minibatch),
            "--lr", str(args.nn_lr),
            "--critic-lr", str(args.nn_critic_lr),
+           "--critic-replay-games", str(getattr(args, "nn_critic_replay_games", 0)),
+           "--critic-replay-frac", str(getattr(args, "nn_critic_replay_frac", 0.5)),
+           "--critic-replay-source-floor",
+           str(getattr(args, "nn_critic_replay_source_floor", 0.25)),
+           "--value-hidden", str(args.nn_value_hidden),
+           "--lam", str(args.nn_lam),
+           "--reward-mode", str(args.nn_reward_mode),
+           "--tempo-eps", str(args.nn_tempo_eps),
            "--warm-evar", str(args.nn_warm_evar),
            "--sigma-floor", str(args.nn_sigma_floor),
+           "--role", str(getattr(args, "nn_role", "league-exploiter")),
+           "--sampling", str(getattr(args, "nn_sampling", "nash")),
+           "--pfsp-weighting", str(getattr(args, "nn_pfsp_weighting", "variance")),
            "--seed", str(args.seed + 1000 * it)]
     if args.nn_init_critic:
         cmd += ["--init-critic", args.nn_init_critic]
+    if args.nn_augment:
+        cmd += ["--augment"]
     if maps:
         cmd += ["--maps", maps]
     return cmd
@@ -751,6 +792,34 @@ def serialise_runoff(fresh: dict[int, float]) -> dict[str, float]:
     return {str(int(i)): float(score) for i, score in sorted(fresh.items())}
 
 
+def migrate_resume_params(saved: dict | None, current: dict) -> dict | None:
+    """Give old checkpoints only their unambiguous historical identities."""
+    if not isinstance(saved, dict):
+        return saved
+    out = saved
+    if "nn_lam" not in out and current.get("nn_lam") == 0.95:
+        out = {**out, "nn_lam": 0.95}
+    if "nn_value_hidden" not in out and current.get("nn_value_hidden") == 0:
+        out = {**out, "nn_value_hidden": 0}
+    if "nn_augment" not in out and current.get("nn_augment") is False:
+        out = {**out, "nn_augment": False}
+    if "nn_reward_mode" not in out and current.get("nn_reward_mode") == "terminal":
+        out = {**out, "nn_reward_mode": "terminal"}
+    if "nn_tempo_eps" not in out and current.get("nn_tempo_eps") == NN_TEMPO_EPS:
+        out = {**out, "nn_tempo_eps": NN_TEMPO_EPS}
+    for key, default in (("nn_critic_replay_games", 0),
+                         ("nn_critic_replay_frac", 0.5),
+                         ("nn_critic_replay_source_floor", 0.25)):
+        if key not in out and current.get(key) == default:
+            out = {**out, key: default}
+    for key, default in (("nn_role", "league-exploiter"),
+                         ("nn_sampling", "nash"),
+                         ("nn_pfsp_weighting", "variance")):
+        if key not in out and current.get(key) == default:
+            out = {**out, key: default}
+    return out
+
+
 # --------------------------------------------------------------------------
 def selfcheck() -> None:
     # Rock-paper-scissors: the unique Nash is uniform.
@@ -766,6 +835,13 @@ def selfcheck() -> None:
     w = fictitious_play(dom, 20_000)
     assert w[3] < 0.01, w
     assert np.abs(w[:3] - 1 / 3).max() < 0.03, w
+
+    near = pfsp(np.array([0.1, 0.5, 0.9]), "variance")
+    assert int(np.argmax(near)) == 1 and near[1] > near[0]
+    weak = pfsp(np.array([0.1, 0.5, 0.9]), "squared")
+    assert weak[0] > weak[1] > weak[2]
+    excluded = pfsp(np.array([0.5, 0.5, 0.5]), exclude=1)
+    assert excluded[1] == 0 and abs(excluded.sum() - 1.0) < 1e-12
 
     record = serialise_runoff({3: np.float64(0.625), 1: 0.5})
     assert record == {"1": 0.5, "3": 0.625}
@@ -929,6 +1005,21 @@ def main() -> None:
     ap.add_argument("--nn-critic-lr", type=float, default=1e-4,
                     help="neural-oracle critic learning rate. 1e-3 memorised "
                          "the buffer in measured full-distance runs")
+    ap.add_argument("--nn-critic-replay-games", type=int, default=0,
+                    help="historical neural-oracle episodes retained by its critic")
+    ap.add_argument("--nn-critic-replay-frac", type=float, default=0.5)
+    ap.add_argument("--nn-critic-replay-source-floor", type=float, default=0.25)
+    ap.add_argument("--nn-value-hidden", type=int, default=64,
+                    help="neural-oracle residual critic-head width; 0 is linear")
+    ap.add_argument("--nn-lam", type=float, default=0.95,
+                    help="GAE lambda forwarded to the neural oracle")
+    ap.add_argument("--nn-reward-mode", choices=NN_REWARD_MODES, default="terminal",
+                    help="neural-oracle reward: terminal for the ladder objective; "
+                         "tempo for an explicit fast-win/slow-loss exploiter")
+    ap.add_argument("--nn-tempo-eps", type=float, default=NN_TEMPO_EPS,
+                    help="tempo tie-break strength forwarded to netoracle")
+    ap.add_argument("--nn-augment", action="store_true",
+                    help="enable the neural oracle's PPO dihedral arm")
     ap.add_argument("--nn-warm-evar", type=float, default=0.10,
                     help="keep the neural-oracle policy frozen until its critic "
                          "reaches this explained variance")
@@ -938,6 +1029,12 @@ def main() -> None:
                          "the default still sends 85%% of its games to one bot, "
                          "which is frozen-opponent PPO; netoracle prints the "
                          "effective opponent count at startup")
+    ap.add_argument("--nn-role",
+                    choices=("main", "main-exploiter", "league-exploiter"),
+                    default="league-exploiter")
+    ap.add_argument("--nn-sampling", choices=("nash", "pfsp"), default="nash")
+    ap.add_argument("--nn-pfsp-weighting", choices=PFSP_WEIGHTINGS,
+                    default="variance")
     ap.add_argument("--nn-no-fallback", action="store_true",
                     help="if a neural oracle is rejected, do not spend this "
                          "iteration on the config CEM fallback; use for a pure "
@@ -963,6 +1060,10 @@ def main() -> None:
     if args.selfcheck:
         selfcheck()
         return
+    if args.nn_value_hidden < 0:
+        raise SystemExit("--nn-value-hidden must be zero or positive")
+    if not 0.0 <= args.nn_tempo_eps < 1.0:
+        raise SystemExit(f"--nn-tempo-eps must be in [0, 1), got {args.nn_tempo_eps}")
 
     if args.oracle != "config":
         if not args.nn_init:
@@ -996,17 +1097,29 @@ def main() -> None:
         "oracle", "group", "params", "gens", "pop", "elite", "spread",
         "floor", "base", "seed", "nn_init", "nn_init_critic", "nn_iters",
         "nn_games", "nn_epochs", "nn_minibatch", "nn_lr",
-        "nn_critic_lr", "nn_warm_evar", "nn_sigma_floor", "nn_no_fallback")}
+        "nn_critic_lr", "nn_critic_replay_games", "nn_critic_replay_frac",
+        "nn_critic_replay_source_floor", "nn_value_hidden", "nn_lam", "nn_reward_mode",
+        "nn_tempo_eps", "nn_augment",
+        "nn_warm_evar", "nn_sigma_floor",
+        "nn_role", "nn_sampling", "nn_pfsp_weighting",
+        "nn_no_fallback")}
 
     if args.resume:
         if not ckpt.exists():
             raise SystemExit(f"no checkpoint at {ckpt}")
         state = json.loads(ckpt.read_text())
         check_antisymmetry(state["payoff"])
-        if state.get("params") != params:
-            raise SystemExit(f"checkpoint was made with {state.get('params')}, "
+        original_params = state.get("params")
+        saved_params = migrate_resume_params(original_params, params)
+        # `nn_lam` was historically a hardcoded 0.95 inside the neural oracle.
+        # Permit an old checkpoint to acquire only that exact explicit identity;
+        # a non-default value is a different experiment and must start a new dir.
+        if saved_params != params:
+            raise SystemExit(f"checkpoint was made with {original_params}, "
                              f"you passed {params}; the payoff entries are not "
                              f"comparable. Use the original flags or a new --dir.")
+        if saved_params != original_params:
+            state["params"] = saved_params
         print(f"resumed at iteration {state['iter']} with {len(state['archive'])} members")
     else:
         specs = [s for s in args.seeds.split(",") if s]

@@ -53,7 +53,7 @@ def build_rows(shard: Path) -> tuple[np.ndarray, np.ndarray]:
     z = np.load(shard)
     y = z["y"]
     keep = (y % features.PER_CELL) == BUILD_SLOT
-    return z["x"][keep], y[keep]
+    return features.ensure_channels(z["x"][keep]), y[keep]
 
 
 def main() -> None:
@@ -128,7 +128,8 @@ def main() -> None:
         sel = order[cut:cut + per] if i in set(targets) else order[:0]
         if i in set(targets):
             cut += per
-        x = np.concatenate([z["x"], bx[sel]]) if len(sel) else z["x"]
+        base_x = features.ensure_channels(z["x"])
+        x = np.concatenate([base_x, bx[sel]]) if len(sel) else base_x
         y = np.concatenate([z["y"], by[sel]]) if len(sel) else z["y"]
         p = rng.permutation(len(y))
         np.savez_compressed(out / f"shard_{i:04d}.npz", x=x[p], y=y[p])

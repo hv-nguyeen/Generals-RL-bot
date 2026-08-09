@@ -36,6 +36,69 @@ DEFAULT_CHANNELS = 32
 DEFAULT_LAYERS = 4
 DEFAULT_CONTEXT = True
 
+# The strategy path keeps the board's coarse topology instead of averaging it
+# away.  Nine ordered regional means plus a global mean and maximum form the
+# token vector; the MLP emits a separate scale/bias pair for each target region.
+STRATEGY_REGIONS = 3
+STRATEGY_TOKEN_BLOCKS = 2 + STRATEGY_REGIONS * STRATEGY_REGIONS
+STRATEGY_OUTPUT_BLOCKS = 2 * STRATEGY_REGIONS * STRATEGY_REGIONS
+
+
+def strategy_keys() -> set[str]:
+    """All-or-nothing parameter set for the global spatial strategy path."""
+    return {
+        "strategy_w1", "strategy_b1", "strategy_w2", "strategy_b2",
+        "strategy_ref1_w", "strategy_ref1_b",
+        "strategy_ref2_w", "strategy_ref2_b",
+    }
+
+
+def strategy_spec(z) -> dict | None:
+    """Validate and describe an optional coarse-to-local strategy module.
+
+    This is separate from the convolutional trunk wiring so old checkpoints keep
+    their historical four-field ``arch_of`` result.  A strategy checkpoint adds
+    ``strategy`` and ``strategy_hidden`` to that result; absence adds nothing.
+    """
+    files = set(getattr(z, "files", z))
+    keys = strategy_keys()
+    present = keys & files
+    if present and present != keys:
+        raise ValueError(f"incomplete strategy module: found {sorted(present)}")
+    if not present:
+        if "strategy" in files and int(z["strategy"]) != 0:
+            raise ValueError("checkpoint says strategy=1 but has no strategy weights")
+        if "strategy_hidden" in files and int(z["strategy_hidden"]) != 0:
+            raise ValueError("checkpoint has strategy_hidden but no strategy weights")
+        return None
+
+    ch = int(z["conv0_w"].shape[0])
+    w1 = tuple(z["strategy_w1"].shape)
+    if len(w1) != 2 or w1[0] != STRATEGY_TOKEN_BLOCKS * ch or w1[1] < 1:
+        raise ValueError(
+            f"strategy_w1 must be ({STRATEGY_TOKEN_BLOCKS * ch}, hidden), found {w1}")
+    hidden = int(w1[1])
+    expected = {
+        "strategy_b1": (hidden,),
+        "strategy_w2": (hidden, STRATEGY_OUTPUT_BLOCKS * ch),
+        "strategy_b2": (STRATEGY_OUTPUT_BLOCKS * ch,),
+        "strategy_ref1_w": (ch, ch, 3, 3),
+        "strategy_ref1_b": (ch,),
+        "strategy_ref2_w": (ch, ch, 3, 3),
+        "strategy_ref2_b": (ch,),
+    }
+    bad = {k: (tuple(z[k].shape), shape) for k, shape in expected.items()
+           if tuple(z[k].shape) != shape}
+    if bad:
+        raise ValueError(f"invalid strategy shapes: {bad}")
+    if "strategy" in files and int(z["strategy"]) != 1:
+        raise ValueError("checkpoint has strategy weights but says strategy=0")
+    if "strategy_hidden" in files and int(z["strategy_hidden"]) != hidden:
+        raise ValueError(
+            f"checkpoint says strategy_hidden={int(z['strategy_hidden'])}, "
+            f"weights say {hidden}")
+    return {"hidden": hidden}
+
 
 def trunk_keys(layers: int, residual: bool) -> list[str]:
     """Trunk parameter prefixes, in evaluation order.
@@ -88,9 +151,20 @@ def arch_of(z) -> dict:
     present_context = context_keys & files
     if present_context and present_context != context_keys:
         raise ValueError(f"incomplete context mixer: found {sorted(present_context)}")
+    context_dense = False
+    if present_context:
+        shapes = {tuple(z[k].shape) for k in context_keys}
+        ch = int(z["conv0_w"].shape[0])
+        if len(shapes) != 1 or next(iter(shapes)) not in {(ch,), (ch, ch)}:
+            raise ValueError(f"context mixers must both be ({ch},) or ({ch},{ch}), "
+                             f"found {sorted(shapes)}")
+        context_dense = len(next(iter(shapes))) == 2
+    spec = strategy_spec(z)
     arch = {"layers": 1 + 2 * blocks if residual else convs,
             "channels": int(z["conv0_w"].shape[0]),
             "residual": residual, "context": bool(present_context)}
+    if spec is not None:
+        arch.update(strategy=True, strategy_hidden=spec["hidden"])
     # The key names cannot express a trunk truncated at the TAIL: drop conv4 and
     # conv5 from a 6-layer file and the scan simply stops at conv3, reports a
     # 4-layer net, and everything downstream still has valid shapes. The only
@@ -100,6 +174,9 @@ def arch_of(z) -> dict:
         if k in files and int(z[k]) != int(v):
             raise ValueError(f"checkpoint says {k}={int(z[k])} but the trunk keys "
                              f"say {k}={int(v)}; refusing to guess")
+    if "context_dense" in files and int(z["context_dense"]) != int(context_dense):
+        raise ValueError(f"checkpoint says context_dense={int(z['context_dense'])} "
+                         f"but context weights say {int(context_dense)}")
     if ("input_channels" in files
             and int(z["input_channels"]) != int(z["conv0_w"].shape[1])):
         raise ValueError(f"checkpoint says input_channels={int(z['input_channels'])} "
@@ -118,6 +195,10 @@ def arch_record(params: dict) -> dict:
     return {"residual": np.int8(a["residual"]), "layers": np.int16(a["layers"]),
             "channels": np.int16(a["channels"]),
             "context": np.int8(a["context"]),
+            "context_dense": np.int8(
+                a["context"] and np.ndim(params["context_global"]) == 2),
+            "strategy": np.int8(a.get("strategy", False)),
+            "strategy_hidden": np.int16(a.get("strategy_hidden", 0)),
             "input_channels": np.int16(params["conv0_w"].shape[1])}
 
 
@@ -177,9 +258,73 @@ def _context_mix(h: np.ndarray, valid: np.ndarray,
             vv = v[rs, cs]
             mean = (h[:, rs, cs] * vv[None]).sum(axis=(1, 2)) / max(float(vv.sum()), 1.0)
             regional[:, rs, cs] = mean[:, None, None]
-    out = h + global_scale[:, None, None] * global_mean[:, None, None]
-    out += region_scale[:, None, None] * regional
+    if global_scale.ndim == 1:
+        global_term = global_scale * global_mean
+        region_term = region_scale[:, None, None] * regional
+    else:
+        global_term = global_scale @ global_mean
+        region_term = np.einsum("oi,ihw->ohw", region_scale, regional)
+    out = h + global_term[:, None, None] + region_term
     return np.maximum(out, 0.0)
+
+
+def _strategy_tokens(h: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """Ordered global/region summary used by both policy and value trunks."""
+    v = valid.astype(np.float32)
+    den = max(float(v.sum()), 1.0)
+    mean = (h * v[None]).sum(axis=(1, 2)) / den
+    maximum = np.where(v[None] > 0, h, -1e9).max(axis=(1, 2))
+    parts = [mean, maximum]
+    edges = (0, 7, 14, features.PAD)
+    for ri in range(STRATEGY_REGIONS):
+        for ci in range(STRATEGY_REGIONS):
+            rs, cs = slice(edges[ri], edges[ri + 1]), slice(edges[ci], edges[ci + 1])
+            vv = v[rs, cs]
+            parts.append((h[:, rs, cs] * vv[None]).sum(axis=(1, 2))
+                         / max(float(vv.sum()), 1.0))
+    return np.concatenate(parts)
+
+
+def _strategy_mix(h: np.ndarray, valid: np.ndarray,
+                  params: dict | None) -> np.ndarray:
+    """Condition every region on all regions, then run residual refinement.
+
+    ``strategy_w2`` and ``strategy_ref2_w`` are zero in a migrated checkpoint.
+    Consequently this function is exactly the identity at migration time, while
+    both final layers receive gradients immediately through non-zero hidden and
+    first-refinement activations.
+    """
+    if params is None:
+        return h
+    tokens = _strategy_tokens(h, valid)
+    hidden = np.maximum(tokens @ params["strategy_w1"] + params["strategy_b1"], 0.0)
+    ch = h.shape[0]
+    controls = (hidden @ params["strategy_w2"] + params["strategy_b2"]
+                ).reshape(STRATEGY_REGIONS * STRATEGY_REGIONS, 2, ch)
+    conditioned = h.copy()
+    edges = (0, 7, 14, features.PAD)
+    k = 0
+    for ri in range(STRATEGY_REGIONS):
+        for ci in range(STRATEGY_REGIONS):
+            rs, cs = slice(edges[ri], edges[ri + 1]), slice(edges[ci], edges[ci + 1])
+            scale, bias = controls[k]
+            conditioned[:, rs, cs] = (
+                h[:, rs, cs] * (1.0 + scale[:, None, None])
+                + bias[:, None, None])
+            k += 1
+    np.maximum(conditioned, 0.0, out=conditioned)
+    refine = _conv3x3(conditioned, params["strategy_ref1_w"],
+                      params["strategy_ref1_b"])
+    np.maximum(refine, 0.0, out=refine)
+    refine = _conv3x3(refine, params["strategy_ref2_w"],
+                      params["strategy_ref2_b"])
+    return np.maximum(conditioned + refine, 0.0)
+
+
+def _load_strategy(z) -> dict | None:
+    if strategy_spec(z) is None:
+        return None
+    return {k: z[k].astype(np.float32) for k in strategy_keys()}
 
 
 def _load_trunk(z) -> tuple[list, dict]:
@@ -211,12 +356,12 @@ class Net:
         # different board. It would otherwise die in a BLAS shape error deep
         # inside _conv3x3, mid-match, naming neither the file nor the reason.
         stem_c = self.layers[0][0].shape[1]
-        if stem_c == features.BASE_C and features.C > features.BASE_C:
+        if stem_c in features.LEGACY_INPUT_CHANNELS and features.C > stem_c:
             # Function-preserving migration: the old policy ignores every new
             # temporal channel until training gives those zero columns weight.
             w, b = self.layers[0]
             grown = np.zeros((w.shape[0], features.C, 3, 3), np.float32)
-            grown[:, :features.BASE_C] = w
+            grown[:, :stem_c] = w
             self.layers[0] = (grown, b)
         elif stem_c != features.C:
             raise ValueError(
@@ -229,11 +374,13 @@ class Net:
                                if self.arch["context"] else None)
         self.context_region = (z["context_region"].astype(np.float32)
                                if self.arch["context"] else None)
+        self.strategy = _load_strategy(z)
 
     def _logits_from(self, enc: np.ndarray) -> np.ndarray:
         x = _trunk(enc, self.layers, self.arch["residual"])
         x = _context_mix(x, enc[features.VALID], self.context_global,
                          self.context_region)
+        x = _strategy_mix(x, enc[features.VALID], self.strategy)
         move = _conv3x3(x, self.head_w, self.head_b)   # (PER_CELL, H, W)
         # (H, W, PER_CELL) flattened must match features.action_to_index ordering
         flat = np.transpose(move, (1, 2, 0)).reshape(-1)
@@ -314,21 +461,31 @@ class ValueNet:
         z = np.load(path)
         self.layers, self.arch = _load_trunk(z)
         stem_c = self.layers[0][0].shape[1]
-        if stem_c == features.BASE_C and features.C > features.BASE_C:
+        if stem_c in features.LEGACY_INPUT_CHANNELS and features.C > stem_c:
             w, b = self.layers[0]
             grown = np.zeros((w.shape[0], features.C, 3, 3), np.float32)
-            grown[:, :features.BASE_C] = w
+            grown[:, :stem_c] = w
             self.layers[0] = (grown, b)
         elif stem_c != features.C:
             raise ValueError(f"{path}: critic stem has {stem_c} channels, expected "
                              f"{features.C}")
         self.head_w = z["v_w"].astype(np.float32)
         self.head_b = float(z["v_b"])
+        self.value_residual = None
+        residual_keys = {"v_res1_w", "v_res1_b", "v_res2_w", "v_res2_b"}
+        present = residual_keys & set(z.files)
+        if present and present != residual_keys:
+            raise ValueError(f"{path}: incomplete residual value head: {sorted(present)}")
+        if present:
+            self.value_residual = tuple(np.asarray(z[k], np.float32) for k in
+                                        ("v_res1_w", "v_res1_b",
+                                         "v_res2_w", "v_res2_b"))
         self.schema = int(z["value_schema"]) if "value_schema" in z.files else 1
         self.context_global = (z["context_global"].astype(np.float32)
                                if self.arch["context"] else None)
         self.context_region = (z["context_region"].astype(np.float32)
                                if self.arch["context"] else None)
+        self.strategy = _load_strategy(z)
         self.memory = None
 
     @staticmethod
@@ -359,12 +516,17 @@ class ValueNet:
         h = _trunk(enc, self.layers, self.arch["residual"])
         h = _context_mix(h, enc[features.VALID], self.context_global,
                          self.context_region)
+        h = _strategy_mix(h, enc[features.VALID], self.strategy)
         if self.schema >= 2:
             pooled = self._pooled(h, enc[features.VALID])
             if self.head_w.shape != pooled.shape:
                 raise ValueError(f"value head is {self.head_w.shape}, pooled state is "
                                  f"{pooled.shape}")
-            return float(np.tanh(self.head_w @ pooled + self.head_b))
+            logit = float(self.head_w @ pooled + self.head_b)
+            if self.value_residual is not None:
+                w1, b1, w2, b2 = self.value_residual
+                logit += float(np.maximum(pooled @ w1 + b1, 0.0) @ w2 + b2)
+            return float(np.tanh(logit))
         # Legacy value files were BCE logits over P(win).
         logit = float(self.head_w @ h.mean(axis=(1, 2)) + self.head_b)
         return float(2.0 / (1.0 + np.exp(-logit)) - 1.0)

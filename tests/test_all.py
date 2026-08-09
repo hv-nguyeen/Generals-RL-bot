@@ -205,6 +205,14 @@ def test_a_new_structure_in_fog_is_read_as_an_enemy_castle():
     assert b.enemy_castles.sum() == 1
 
 
+def test_competition_maps_strip_every_neutral_castle():
+    """The temporal castle inference is valid only under this ruleset invariant."""
+    for seed in range(32):
+        grid = mapgen.generate(seed)
+        assert not (grid > 2).any(), f"seed {seed} retained a neutral castle"
+        assert not engine.from_grid(grid).castles.any(), seed
+
+
 def test_temporal_enemy_history_survives_recapture():
     from bot.memory import TemporalMemory
     from bot.obs import Obs
@@ -283,6 +291,7 @@ def test_jax_temporal_new_structure_in_fog_does_not_need_stale_owner():
             owned_cells=zero,
             opponent_cells=zero,
             castles=zero,
+            generals=zero,
             armies=jnp.zeros((n, n), dtype=jnp.int32),
             timestep=jnp.asarray(turn, dtype=jnp.int32),
             owned_army_count=jnp.asarray(1, dtype=jnp.int32),
@@ -296,6 +305,38 @@ def test_jax_temporal_new_structure_in_fog_does_not_need_stale_owner():
     structures = zero.at[1, 1].set(True)
     mem = rlenv.update_memory_jax(mem, frame(2, structures))
     assert bool(np.asarray(mem["enemy_castles"])[1, 1])
+
+
+def test_neural_strategic_planes_contain_spawn_distance_and_build_price():
+    from bot import features
+    from bot.memory import TemporalMemory
+
+    for seed in range(8):
+        grid = mapgen.generate(seed)
+        st = engine.from_grid(grid)
+        obs = engine.observe(st, 0)
+        mem = TemporalMemory(*grid.shape)
+        mem.update(obs)
+        x = features.encode(obs, mem)
+        assert mem.general_candidates[st.gpos[1]], f"seed {seed} lost true general"
+        assert x[features.ENEMY_GENERAL_PRIOR, st.gpos[1][0], st.gpos[1][1]] == 1
+        assert x[features.DIST_HOME, st.gpos[0][0], st.gpos[0][1]] == 0
+        mine = obs.owner_grid == rules.OWNER_ME
+        structures = mine & ((obs.type_grid == rules.T_GENERAL)
+                              | (obs.type_grid == rules.T_CASTLE))
+        expected = np.log1p(rules.build_cost_grid(structures)) / 6.0
+        assert np.allclose(x[features.BUILD_COST, :obs.H, :obs.W], expected)
+
+
+def test_legacy_encoded_rows_zero_extend_without_inventing_history():
+    from bot import features
+
+    old = np.arange(2 * features.STRATEGIC_OFFSET * 3 * 4, dtype=np.float16).reshape(
+        2, features.STRATEGIC_OFFSET, 3, 4)
+    grown = features.ensure_channels(old)
+    assert grown.shape[-3] == features.C
+    assert np.array_equal(grown[:, :features.STRATEGIC_OFFSET], old)
+    assert not grown[:, features.STRATEGIC_OFFSET:].any()
 
 
 def test_temporal_memory_copy_is_independent():
@@ -374,6 +415,27 @@ def test_smoke_evaluation_can_never_approve_promotion():
     assert not approved and exit_ok
     approved, exit_ok = approval_status(True, True, smoke=False)
     assert approved and exit_ok
+
+
+def test_critic_replay_is_game_balanced_not_row_balanced():
+    from learn.replay import GameBalancedReplay
+
+    replay = GameBalancedReplay(2)
+    replay.add(np.zeros((100, 1, 1, 1), np.float16), 1.0, "long")
+    replay.add(np.zeros((2, 1, 1, 1), np.float16), -1.0, "short")
+    _, z = replay.sample(np.random.default_rng(4), 20_000)
+    assert abs(float(z.mean())) < 0.03, z.mean()
+
+
+def test_restart_curriculum_burns_in_without_changing_full_start_jobs():
+    from learn.selfplay import build_jobs
+
+    full = build_jobs(3, 12, 2, restart_frac=0.0)
+    focused = build_jobs(3, 12, 2, restart_frac=1.0,
+                         restart_min=91, restart_max=91)
+    assert all(len(j) == 5 for j in full)
+    assert all(len(j) == 6 and j[-1] == 91 for j in focused)
+    assert [j[:5] for j in focused] == full
 
 
 def test_neural_package_identity_is_fail_closed():
@@ -521,6 +583,36 @@ def test_a_checkpoint_states_its_own_architecture():
                                 "residual": residual, "context": False}
             assert net.logits(obs).shape == (features.N_ACTIONS,)
 
+        # Adding the spatial strategy path is an exact incumbent migration.
+        from tools.grow import grow as grow_net
+        p = weights(4, 8, False)
+        source = td / "strategy-source.npz"
+        target = td / "strategy-target.npz"
+        np.savez(source, **p, **npnet.arch_record(p))
+        strategic = grow_net(np.load(source), 4, 8, strategy_hidden=6)
+        np.savez(target, **strategic)
+        before, after = npnet.Net(str(source)), npnet.Net(str(target))
+        assert after.arch["strategy_hidden"] == 6
+        assert np.allclose(before.logits(obs), after.logits(obs), atol=1e-6)
+
+        # The same migration is valid for the separately checkpointed critic;
+        # tools.grow must not assume every trunk is followed by a policy head.
+        critic = {k: v for k, v in p.items()
+                  if k.startswith("conv")}
+        critic["v_w"] = rng.normal(size=11 * 8).astype("f4")
+        critic["v_b"] = np.float32(0.2)
+        critic["value_schema"] = np.int32(2)
+        critic.update(npnet.arch_record(critic))
+        critic_source = td / "critic-source.npz"
+        critic_target = td / "critic-target.npz"
+        np.savez(critic_source, **critic)
+        strategic_critic = grow_net(np.load(critic_source), 4, 8,
+                                    strategy_hidden=6)
+        np.savez(critic_target, **strategic_critic)
+        vb = npnet.ValueNet(str(critic_source)).value(obs)
+        va = npnet.ValueNet(str(critic_target)).value(obs)
+        assert np.isclose(vb, va, atol=1e-6)
+
         # a residual file whose keys were renamed into a plain stack has entirely
         # valid shapes; only the marker says it would compute the wrong thing
         p = weights(5, 8, True)
@@ -663,7 +755,9 @@ def test_league_forwards_safe_neural_optimizer_settings():
         nn_init="incumbent.npz", nn_init_critic="critic.npz",
         workers=60, nn_iters=200, nn_games=256, max_turns=1200,
         nn_epochs=1, nn_minibatch=2048, nn_lr=7e-5,
-        nn_critic_lr=1e-4, nn_warm_evar=0.12,
+        nn_critic_lr=1e-4, nn_value_hidden=64, nn_lam=0.99,
+        nn_reward_mode="terminal", nn_tempo_eps=0.03, nn_augment=False,
+        nn_warm_evar=0.12,
         nn_sigma_floor=0.25, seed=3)
     cmd = net_oracle_command(args, Path("oracle.npz"), Path("league.json"),
                              "maps.json", 2)
@@ -677,10 +771,53 @@ def test_league_forwards_safe_neural_optimizer_settings():
     assert value("--minibatch") == "2048"
     assert value("--lr") == "7e-05"
     assert value("--critic-lr") == "0.0001"
+    assert value("--value-hidden") == "64"
+    assert value("--lam") == "0.99"
+    assert value("--reward-mode") == "terminal"
+    assert value("--tempo-eps") == "0.03"
     assert value("--warm-evar") == "0.12"
     assert value("--sigma-floor") == "0.25"
     assert value("--seed") == "2003"
     assert value("--maps") == "maps.json"
+    args.nn_augment = True
+    assert "--augment" in net_oracle_command(
+        args, Path("oracle.npz"), Path("league.json"), "maps.json", 2)
+    args.nn_reward_mode, args.nn_tempo_eps = "tempo", 0.05
+    cmd = net_oracle_command(args, Path("oracle.npz"), Path("league.json"),
+                             "maps.json", 2)
+    assert value("--reward-mode") == "tempo"
+    assert value("--tempo-eps") == "0.05"
+
+
+def test_league_default_lambda_resume_migration_is_narrow():
+    from learn.league import migrate_resume_params
+
+    old = {"nn_lr": 1e-4}
+    default = {"nn_lr": 1e-4, "nn_lam": 0.95, "nn_value_hidden": 0,
+               "nn_augment": False, "nn_reward_mode": "terminal",
+               "nn_tempo_eps": 0.03}
+    experimental = {"nn_lr": 1e-4, "nn_lam": 0.99, "nn_value_hidden": 64,
+                    "nn_augment": True, "nn_reward_mode": "tempo",
+                    "nn_tempo_eps": 0.05}
+    assert migrate_resume_params(old, default) == default
+    assert migrate_resume_params(old, experimental) == old
+    assert migrate_resume_params(default, default) is default
+
+
+def test_netoracle_reward_mode_is_opt_in_and_bounded():
+    from learn.netoracle import episode_return
+
+    # Terminal mode is exactly the historical objective, independent of time.
+    assert episode_return(1, 1, 100) == 1.0
+    assert episode_return(-1, 100, 100, "terminal", 0.2) == -1.0
+    # Tempo is only a tie-break: faster wins and longer survival on losses.
+    assert episode_return(1, 1, 100, "tempo", 0.05) > episode_return(
+        1, 100, 100, "tempo", 0.05)
+    assert episode_return(-1, 1, 100, "tempo", 0.05) < episode_return(
+        -1, 100, 100, "tempo", 0.05)
+    assert episode_return(0, 1, 100, "tempo", 0.05) == 0.0
+    assert -1.0 <= episode_return(1, 100, 100, "tempo", 0.05) <= 1.0
+    assert -1.0 <= episode_return(-1, 1, 100, "tempo", 0.05) <= 1.0
 
 
 def test_league_runoff_manifest_value_is_json_safe():
@@ -694,16 +831,65 @@ def test_league_runoff_manifest_value_is_json_safe():
 
 
 def test_top3_promotion_suite_uses_fresh_seeds_and_a_sanity_greedy_floor():
-    from tools.evaluate import load_suite
+    from tools.evaluate import bucket_alphas, load_suite, planning_score_to_clear
 
     suite = load_suite("evaluation/top3-v2.json")
     assert suite["seed0"] == 8_000_000
-    assert suite["games_per_bucket"] == 2000
+    assert suite["confirmation_seed0"] != suite["seed0"]
+    assert suite["max_attempts"] >= 1
+    assert all(b["games"] == 2000 for b in suite["buckets"])
     greedy = next(b for b in suite["buckets"] if b["name"] == "greedy")
     assert greedy["min_lower_score"] <= 0.70
+    alphas = dict(zip((b["name"] for b in suite["buckets"]),
+                      bucket_alphas(suite, suite["buckets"])))
+    assert alphas["champion"] == 0.05
+    assert alphas["fog"] == 0.05 / 4
+    corrected = dict(zip((b["name"] for b in suite["buckets"]),
+                         bucket_alphas(suite, suite["buckets"],
+                                       repeated_blocks=2, attempt_correct=True)))
+    assert corrected["champion"] == 0.05 / 2 / suite["max_attempts"]
+    assert corrected["fog"] == 0.05 / 4 / 2 / suite["max_attempts"]
+    assert all(b.get("family") is None for b in suite["buckets"]
+               if b["name"] in {"hunter", "greedy", "expander"})
+    assert {b.get("style_role") for b in suite["buckets"] if b.get("role") == "signal"} \
+        == set(suite["required_style_roles"])
+    planning = suite["planning_notes"]["fog_detectable_score"]
+    assert planning["approx_true_score_to_clear_on_expectation"] == 0.508
+    estimate = planning_score_to_clear(
+        planning["games"], planning["alpha"], planning["floor"],
+        planning["worst_case_pair_variance"])
+    assert abs(estimate - planning["approx_true_score_to_clear_on_expectation"]) < 0.001
+    alpha4 = planning_score_to_clear(
+        planning["games"], planning["alpha"] / 4, planning["floor"],
+        planning["worst_case_pair_variance"])
+    assert abs(alpha4 - planning["counterfactual_score_if_alpha_were_divided_by_four"]) < 0.001
+    champion = next(b for b in suite["buckets"] if b["name"] == "champion")
+    assert champion["requires_paired_superiority"] is True
+    assert "requires_sprt" not in champion
 
 
-def test_value_validation_split_never_leaks_a_game():
+def test_promotion_registry_consumes_attempts_and_rejects_reuse():
+    import tempfile
+    from pathlib import Path
+
+    from tools.evaluate import load_suite, reserve_attempt
+
+    suite = load_suite("evaluation/top3-v2.json")
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        candidate, reference, registry = d / "candidate.npz", d / "reference.npz", d / "r.json"
+        candidate.write_bytes(b"candidate")
+        reference.write_bytes(b"reference")
+        index, attempt_id = reserve_attempt(registry, suite, candidate, reference, "test")
+        assert index == 0 and attempt_id.startswith("001-")
+        try:
+            reserve_attempt(registry, suite, candidate, reference, "duplicate")
+            raise AssertionError("duplicate candidate reused a promotion seed block")
+        except SystemExit:
+            pass
+
+
+def test_value_three_way_split_never_leaks_a_game():
     import tempfile
     from pathlib import Path
 
@@ -719,27 +905,58 @@ def test_value_validation_split_never_leaks_a_game():
                      game=np.asarray(games, np.int64), seat=np.zeros(n, np.int8),
                      t=np.arange(n))
             paths.append(path)
-        game_ids, _, _ = valuetrain.canonical_game_ids(paths)
-        _, yv, gv, held, val_games = valuetrain.split(
-            paths, .34, np.random.default_rng(2), game_ids)
-        assert set(np.unique(gv)) == val_games
-        assert 0.0 in set(yv), "draw targets were dropped"
-        for path in paths:
-            assert not (set(game_ids[path][~held[path]]) & val_games)
-
-        # Equal raw ids from independent generators are different games.
+        # A second generator has equal raw IDs and must contribute its own
+        # selection and test game instead of being swallowed by the larger set.
         other = Path(td) / "selfplay"
         other.mkdir()
-        path = other / "shard_0000.npz"
-        np.savez(path, x=np.zeros((2, 1, 1, 1), np.float16),
-                 y=np.asarray([-1, 1], np.float32),
-                 game=np.asarray([10, 40], np.int64), seat=np.zeros(2, np.int8),
-                 t=np.arange(2))
-        mixed, refs, _ = valuetrain.canonical_game_ids(paths + [path])
+        other_path = other / "shard_0000.npz"
+        np.savez(other_path, x=np.zeros((3, 1, 1, 1), np.float16),
+                 y=np.asarray([-1, 0, 1], np.float32),
+                 game=np.asarray([10, 40, 50], np.int64), seat=np.zeros(3, np.int8),
+                 t=np.arange(3))
+        all_paths = paths + [other_path]
+        game_ids, refs, _ = valuetrain.canonical_game_ids(all_paths)
+        selection, held, select_games, test_games = valuetrain.split_three_way(
+            all_paths, .34, .34, np.random.default_rng(2), game_ids, refs)
+        _, _, gs = selection
+        _, _, gt = valuetrain._materialize(all_paths, game_ids, test_games)
+        assert set(np.unique(gs)) == select_games
+        assert set(np.unique(gt)) == test_games
+        assert not (select_games & test_games)
+        assert {refs[g][0] for g in select_games} == {0, 1}
+        assert {refs[g][0] for g in test_games} == {0, 1}
+        for path in all_paths:
+            training_games = set(game_ids[path][~held[path]])
+            assert not (training_games & select_games)
+            assert not (training_games & test_games)
+
+        # Equal raw ids from independent generators are different games.
+        mixed, refs, _ = valuetrain.canonical_game_ids(all_paths)
         official_ten = mixed[paths[0]][0]
-        selfplay_ten = mixed[path][0]
+        selfplay_ten = mixed[other_path][0]
         assert official_ten != selfplay_ten
         assert refs[int(official_ten)] != refs[int(selfplay_ten)]
+
+
+def test_residual_value_head_is_an_exact_trainable_migration():
+    import jax
+    import jax.numpy as jnp
+
+    from bot import features
+    from learn import valuetrain
+
+    arch = {"layers": 1, "channels": 4, "residual": False, "context": False}
+    key = jax.random.PRNGKey(17)
+    linear = valuetrain.init_params(key, arch, value_hidden=0)
+    residual = valuetrain.init_params(key, arch, value_hidden=8)
+    x = np.random.default_rng(3).normal(
+        size=(3, features.C, features.PAD, features.PAD)).astype(np.float32)
+    x[:, features.VALID] = 1.0
+    before = np.asarray(valuetrain.forward(linear, jnp.asarray(x)))
+    after = np.asarray(valuetrain.forward(residual, jnp.asarray(x)))
+    assert np.array_equal(before, after), "W2=0 migration moved critic predictions"
+    grad = jax.grad(lambda p: valuetrain.forward(p, jnp.asarray(x)).sum())(residual)
+    assert np.any(np.asarray(grad["v_res2_w"]) != 0), "new residual branch is dead"
 
 
 def test_dataset_rebuild_removes_only_stale_artifacts():
@@ -1020,6 +1237,54 @@ def test_dihedral_averaging_is_exact_on_an_equivariant_function():
     x[0, :21, :21] = rng.normal(size=(21, 21))
     assert np.array_equal(symmetry.average_logits(x, 21, 21, equivariant, elements=(0,)),
                           equivariant(x))
+
+
+def test_ppo_dihedral_observation_and_action_relabel_commute():
+    """Catch a self-consistent but inverse/wrong observation gather.
+
+    Mask/action consistency alone cannot do this: both can share one wrong map.
+    An explicitly equivariant function couples board content to action geometry,
+    so f(g.x)[g.a] must equal f(x)[a] for every active action and every g.
+    """
+    from bot import features, symmetry
+    from learn import train
+
+    pad, per, splits = features.PAD, features.PER_CELL, features.SPLITS
+
+    def equivariant(x):
+        v = x[0]
+        out = np.zeros(features.N_ACTIONS, np.float64)
+        vp = np.pad(v, 1, constant_values=0.0)
+        for direction, (dr, dc) in enumerate(symmetry.DIRS):
+            delta = (v - vp[1 + dr:1 + dr + pad,
+                            1 + dc:1 + dc + pad]).reshape(-1)
+            for split in range(splits):
+                out[np.arange(pad * pad) * per + direction * splits + split] = (
+                    delta * (split + 1))
+        out[np.arange(pad * pad) * per + features.BUILD_OFFSET] = 2.0 * v.reshape(-1)
+        out[features.PASS_INDEX] = 7.0
+        return out
+
+    rng = np.random.default_rng(20260809)
+    for h, w in ((21, 21), (18, 21), (9, 12)):
+        x = np.zeros((features.C, pad, pad), np.float32)
+        x[0, :h, :w] = rng.normal(size=(h, w))
+        x[features.VALID, :h, :w] = 1.0
+        cells = (np.arange(h)[:, None] * pad + np.arange(w)[None, :]).reshape(-1)
+        active = np.concatenate([
+            (cells[:, None] * per + np.arange(per)[None, :]).reshape(-1),
+            np.asarray([features.PASS_INDEX])])
+        mask = np.zeros(features.N_ACTIONS, bool)
+        mask[active] = True
+        base = equivariant(x)
+        for g in range(8):
+            moved_x, moved_mask, moved_idx = train.augment_ppo(
+                x[None], mask[None], np.asarray([active[len(active) // 3]]), g)
+            _, actmap = train._dihedral_maps(h, w, g)
+            mapped = actmap[active]
+            assert np.array_equal(equivariant(moved_x[0])[mapped], base[active]), \
+                f"observation gather and action relabel disagree at {h}x{w}, g={g}"
+            assert moved_mask[0, moved_idx[0]], f"sampled action illegal at g={g}"
 
 
 def main() -> None:

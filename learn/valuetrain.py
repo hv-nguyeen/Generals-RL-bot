@@ -1,4 +1,4 @@
-"""Fit a calibrated game-value model on complete-game train/validation splits.
+"""Fit a calibrated game-value model on complete-game train/select/test splits.
 
 Same trunk as the policy so `bot/policy/net.py` can run it on one CPU core; only
 the head differs. The trunk builder is `learn.train`'s, so `--layers`,
@@ -24,18 +24,44 @@ from learn import train as bc
 
 VALUE_REGIONS = 3
 VALUE_POOL = 2 + VALUE_REGIONS * VALUE_REGIONS   # mean, max, 3x3 regional means
+TEMPERATURES = (0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0)
 
 
-def init_params(key, arch: dict | None = None):
-    """Same trunk builder as the policy, a scalar head instead of the move head."""
+def scale_value_output(params: dict, scale: float) -> dict:
+    """Scale the complete scalar logit, including the residual output layer."""
+    out = {k: np.asarray(v) for k, v in params.items()}
+    for key in ("v_w", "v_b", "v_res2_w", "v_res2_b"):
+        if key in out:
+            out[key] = np.asarray(out[key], np.float32) * np.float32(scale)
+    return out
+
+
+def init_params(key, arch: dict | None = None, value_hidden: int = 64):
+    """Same trunk as policy, with a linear value plus a zero-output residual MLP.
+
+    The linear branch is retained so historical critics migrate exactly.  The
+    residual branch starts with W2=0, hence adding it changes no prediction at
+    initialisation while still giving W2 a gradient on the first update.
+    """
     import jax
+    import jax.numpy as jnp
 
     p = bc.init_params(key, arch)
     for k in ("head_w", "head_b", "pass_w", "pass_b"):
         del p[k]
     p["v_w"] = jax.random.normal(jax.random.fold_in(key, 7),
                                  (p["conv0_w"].shape[0] * VALUE_POOL,)) * 0.01
-    p["v_b"] = jax.numpy.zeros(())
+    p["v_b"] = jnp.zeros(())
+    if value_hidden:
+        if value_hidden < 1:
+            raise ValueError("value_hidden must be zero or positive")
+        width = int(p["v_w"].shape[0])
+        p["v_res1_w"] = (jax.random.normal(jax.random.fold_in(key, 8),
+                                            (width, value_hidden))
+                            * np.sqrt(2.0 / width))
+        p["v_res1_b"] = jnp.zeros((value_hidden,))
+        p["v_res2_w"] = jnp.zeros((value_hidden,))
+        p["v_res2_b"] = jnp.zeros(())
     return p
 
 
@@ -61,7 +87,14 @@ def pooled(h, valid):
 
 def forward(p, x):
     h = bc.trunk(p, x)
-    return pooled(h, x[:, features.VALID]) @ p["v_w"] + p["v_b"]
+    q = pooled(h, x[:, features.VALID])
+    value = q @ p["v_w"] + p["v_b"]
+    if "v_res1_w" in p:
+        import jax
+        value = (value
+                 + jax.nn.relu(q @ p["v_res1_w"] + p["v_res1_b"])
+                 @ p["v_res2_w"] + p["v_res2_b"])
+    return value
 
 
 def canonical_game_ids(shards):
@@ -87,25 +120,57 @@ def canonical_game_ids(shards):
     return ids, reverse, source_dirs
 
 
-def split(shards, frac: float, rng, game_ids=None):
-    """Hold out whole games. Positions from one game never cross the boundary."""
-    if game_ids is None:
-        game_ids, _, _ = canonical_game_ids(shards)
-    games = np.unique(np.concatenate([game_ids[f] for f in shards]))
-    if len(games) < 2:
-        raise ValueError("value data needs at least two distinct game ids")
-    nval = min(len(games) - 1, max(1, int(round(len(games) * frac))))
-    val_games = set(int(x) for x in rng.choice(games, nval, replace=False))
-    xs, ys, gs, held = [], [], [], {}
+def _materialize(shards, game_ids, chosen):
+    xs, ys, gs = [], [], []
     for f in shards:
         z = np.load(f)
-        m = np.isin(game_ids[f], list(val_games))
-        held[f] = m
-        if m.any():
-            xs.append(z["x"][m]); ys.append(z["y"][m])
-            gs.append(game_ids[f][m])
+        mask = np.isin(game_ids[f], list(chosen))
+        if mask.any():
+            xs.append(features.ensure_channels(z["x"][mask]))
+            ys.append(z["y"][mask]); gs.append(game_ids[f][mask])
+    if not xs:
+        raise ValueError("value split selected no rows")
     return (np.concatenate(xs).astype(np.float32), np.concatenate(ys),
-            np.concatenate(gs), held, val_games)
+            np.concatenate(gs))
+
+
+def split_three_way(shards, select_frac: float, test_frac: float, rng,
+                    game_ids=None, game_refs=None):
+    """Source-stratified complete-game train/select/test partition.
+
+    Selection games choose the epoch (and later the temperature). Test games
+    are untouched until the chosen checkpoint is gated. Each source contributes
+    at least one game to every split, preventing a large generator from hiding
+    failure on a smaller but strategically important source.
+    """
+    if not (0.0 < select_frac < 1.0 and 0.0 < test_frac < 1.0):
+        raise ValueError("select/test fractions must be in (0, 1)")
+    if game_ids is None:
+        game_ids, game_refs, _ = canonical_game_ids(shards)
+    if game_refs is None:
+        _, game_refs, _ = canonical_game_ids(shards)
+    by_source: dict[int, list[int]] = {}
+    for gid, (source, _) in game_refs.items():
+        by_source.setdefault(int(source), []).append(int(gid))
+    select_games, test_games = set(), set()
+    for source, source_games in sorted(by_source.items()):
+        games = np.asarray(sorted(source_games), np.int64)
+        if len(games) < 3:
+            raise ValueError(f"value source {source} needs at least three complete "
+                             f"games for train/select/test, found {len(games)}")
+        order = rng.permutation(games)
+        ntest = min(len(games) - 2, max(1, int(round(len(games) * test_frac))))
+        nselect = min(len(games) - ntest - 1,
+                      max(1, int(round(len(games) * select_frac))))
+        select_games.update(int(g) for g in order[:nselect])
+        test_games.update(int(g) for g in order[nselect:nselect + ntest])
+    if select_games & test_games:
+        raise AssertionError("selection/test game overlap")
+    held = {f: np.isin(game_ids[f], list(select_games | test_games)) for f in shards}
+    # Deliberately do not materialize test rows here. The caller receives only
+    # their game IDs until model and temperature selection are finished.
+    return (_materialize(shards, game_ids, select_games), held,
+            select_games, test_games)
 
 
 def _scalar_columns(x):
@@ -149,28 +214,28 @@ def metrics(y, pred, game) -> dict:
             "sign_acc": sign, "ece": ece}
 
 
-def scalar_control(shards, held, xv, yv, gv) -> tuple[np.ndarray, dict]:
-    """Least-squares baseline on broadcast scalars, scored on unseen games.
+def scalar_control(shards, held, xv, yv, gv, game_ids) -> tuple[np.ndarray, dict]:
+    """Game-balanced scalar baseline fitted on train and scored on one split.
 
-    The scalars are the clock, the parity and the ten counting channels -- every
-    number the encoder hands the net without it having to look at the board. A
-    linear fit on those is the bar the trunk has to clear, because a critic that
-    only ties win probability to "it is turn 300 and I have more land" has
-    learned nothing a single matrix could not.
-
-    This is the same control as `sc` in `learn.selfplay`, and it is here because
-    the critic has lost to it before. Fitted on the training rows, scored on the
-    identical held-out rows the net is scored on, so neither gets an advantage.
+    The scalar-only control is deliberately denied both held-out partitions.
+    Weighting each complete training game equally also prevents long games from
+    dominating its fit while the critic is judged by game-balanced metrics.
     """
     d = (features.BASE_C - features.CLOCK) + 3 + 1
     a = np.zeros((d, d), np.float64)
     b = np.zeros(d, np.float64)
+    counts = {}
+    for f in shards:
+        for g in game_ids[f][~held[f]]:
+            counts[int(g)] = counts.get(int(g), 0) + 1
     for f in shards:
         z = np.load(f)
         keep = ~held[f]
-        s = np.c_[_scalar_columns(z["x"][keep]), np.ones(int(keep.sum()))]
-        a += s.T @ s
-        b += s.T @ z["y"][keep].astype(np.float64)
+        s = np.c_[_scalar_columns(features.ensure_channels(z["x"][keep])),
+                  np.ones(int(keep.sum()))]
+        weights = np.asarray([1.0 / counts[int(g)] for g in game_ids[f][keep]])
+        a += s.T @ (weights[:, None] * s)
+        b += s.T @ (weights * z["y"][keep].astype(np.float64))
     w = np.linalg.solve(a + 1e-6 * np.eye(d), b)
     sv = np.c_[_scalar_columns(xv), np.ones(len(yv))]
     pred = np.clip(sv @ w, -1.0, 1.0)
@@ -190,11 +255,21 @@ def main() -> None:
     ap.add_argument("--channels", type=int, default=None)
     ap.add_argument("--residual", action="store_true", default=None)
     ap.add_argument("--context", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--dense-context", action="store_true",
+                    help="use CxC global/regional context mixers")
+    ap.add_argument("--strategy-hidden", type=int, default=0,
+                    help="global 3x3 spatial-strategy MLP width; 0 disables it")
+    ap.add_argument("--value-hidden", type=int, default=64,
+                    help="residual value-head width; 0 reproduces the linear head")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--val-frac", type=float, default=0.02,
-                    help="fraction of complete games held out")
+    ap.add_argument("--select-frac", "--val-frac", dest="select_frac", type=float,
+                    default=0.02,
+                    help="complete games used only for epoch/temperature selection")
+    ap.add_argument("--test-frac", type=float, default=0.02,
+                    help="complete games touched only once by the final gate")
     args = ap.parse_args()
-    arch = bc.resolve_arch(None, args.layers, args.channels, args.residual, args.context)
+    arch = bc.resolve_arch(None, args.layers, args.channels, args.residual,
+                           args.context, args.dense_context, args.strategy_hidden)
 
     import jax
     import jax.numpy as jnp
@@ -215,16 +290,20 @@ def main() -> None:
         if not set(np.unique(z["y"])) <= {-1.0, 0.0, 1.0}:
             raise SystemExit(f"{f}: targets must be direct values -1/0/+1")
     game_ids, game_refs, source_dirs = canonical_game_ids(shards)
-    xv, yv, gv, held, val_games = split(shards, args.val_frac, rng, game_ids)
+    selection, held, select_games, test_games = split_three_way(
+        shards, args.select_frac, args.test_frac, rng, game_ids, game_refs)
+    xselect, yselect, gselect = selection
     print(f"{len(shards)} shards from {len(source_dirs)} source(s), "
-          f"{len(val_games)} held-out complete games, "
-          f"{len(yv)} validation rows ({args.val_frac:.0%})")
+          f"{len(select_games)} selection games/{len(yselect)} rows, "
+          f"{len(test_games)} sealed test games")
 
-    _, control = scalar_control(shards, held, xv, yv, gv)
-    print(f"scalar control: evar {control['evar']:.3f}  mae {control['mae']:.3f}  "
-          f"ece {control['ece']:.3f}\n", flush=True)
+    _, select_control = scalar_control(
+        shards, held, xselect, yselect, gselect, game_ids)
+    print(f"selection scalar control: evar {select_control['evar']:.3f}  "
+          f"mae {select_control['mae']:.3f}  ece {select_control['ece']:.3f}\n",
+          flush=True)
 
-    params = init_params(jax.random.PRNGKey(args.seed), arch)
+    params = init_params(jax.random.PRNGKey(args.seed), arch, args.value_hidden)
     m = {k: jnp.zeros_like(v) for k, v in params.items()}
     v = {k: jnp.zeros_like(x) for k, x in params.items()}
 
@@ -250,13 +329,15 @@ def main() -> None:
         for g in game_ids[f][~held[f]]:
             game_counts[int(g)] = game_counts.get(int(g), 0) + 1
 
-    best, best_metrics, t = -np.inf, None, 0
+    best, best_metrics, best_arrays, best_temperature, t = (
+        -np.inf, None, None, None, 0)
     for epoch in range(args.epochs):
         started, run, nb = time.time(), 0.0, 0
         for si in rng.permutation(len(train)):
             z = np.load(train[si])
-            keep = ~held[train[si]]           # never train on a validation row
-            xs, ys, gs = z["x"][keep], z["y"][keep], game_ids[train[si]][keep]
+            keep = ~held[train[si]]           # never train on selection/test rows
+            xs = features.ensure_channels(z["x"][keep])
+            ys, gs = z["y"][keep], game_ids[train[si]][keep]
             order = rng.permutation(len(ys))
             for i in range(0, len(order) - args.batch + 1, args.batch):
                 sel = order[i:i + args.batch]
@@ -268,38 +349,64 @@ def main() -> None:
                                           jnp.asarray(ys[sel]), jnp.asarray(wb))
                 run += float(loss); nb += 1
             del xs, ys, gs
-        pred = np.concatenate([
-            np.asarray(jnp.tanh(forward(params, jnp.asarray(xv[i:i + 1024]))))
-            for i in range(0, len(yv), 1024)])
-        met = metrics(yv, pred, gv)
+        logit = np.concatenate([
+            np.asarray(forward(params, jnp.asarray(xselect[i:i + 1024])))
+            for i in range(0, len(yselect), 1024)])
+        choices = [(metrics(yselect, np.tanh(logit / temp), gselect), temp)
+                   for temp in TEMPERATURES]
+        met, temperature = max(
+            choices, key=lambda q: q[0]["evar"] - 0.1 * q[0]["ece"])
         score = met["evar"] - 0.1 * met["ece"]
         mark = ""
         if score > best:
-            best, best_metrics, mark = score, met, "  <- kept"
-            arrays = {k: np.asarray(v) for k, v in params.items()}
-            np.savez_compressed(args.out, **arrays, **bc.arch_record(arrays),
-                                value_schema=np.int16(2),
-                                value_pool=np.int16(VALUE_POOL))
+            best, best_metrics, best_temperature, mark = (
+                score, met, temperature, "  <- kept")
+            best_arrays = {k: np.asarray(v) for k, v in params.items()}
         print(f"epoch {epoch}  loss {run / max(nb, 1):.4f}  "
               f"evar {met['evar']:.3f}  mae {met['mae']:.3f}  "
               f"ece {met['ece']:.3f}  sign {met['sign_acc']:.3f}  "
+              f"T {temperature:g}  "
               f"{time.time() - started:.0f}s{mark}", flush=True)
 
-    gate_passed = bool(best_metrics["target_var"] > 0.05
-                       and best_metrics["decided_frac"] > 0.1
-                       and best_metrics["evar"] - control["evar"] >= 0.02
-                       and best_metrics["ece"] <= 0.15)
-    validation_keys = [{"source": game_refs[g][0], "game": game_refs[g][1]}
-                       for g in sorted(val_games)]
+    if best_arrays is None:
+        raise SystemExit("no complete training batch; lower --batch or add data")
+    # First and only use of the sealed test partition: it cannot select an
+    # epoch, temperature, architecture, or any other hyperparameter.
+    best_arrays = scale_value_output(best_arrays, 1.0 / best_temperature)
+    chosen = {k: jnp.asarray(v) for k, v in best_arrays.items()}
+    xtest, ytest, gtest = _materialize(shards, game_ids, test_games)
+    test_pred = np.concatenate([
+        np.asarray(jnp.tanh(forward(chosen, jnp.asarray(xtest[i:i + 1024]))))
+        for i in range(0, len(ytest), 1024)])
+    test_metrics = metrics(ytest, test_pred, gtest)
+    _, test_control = scalar_control(shards, held, xtest, ytest, gtest, game_ids)
+    gate_passed = bool(test_metrics["target_var"] > 0.05
+                       and test_metrics["decided_frac"] > 0.1
+                       and test_metrics["evar"] - test_control["evar"] >= 0.02
+                       and test_metrics["ece"] <= 0.15)
+    np.savez_compressed(args.out, **best_arrays, **bc.arch_record(best_arrays),
+                        value_schema=np.int16(3), value_pool=np.int16(VALUE_POOL),
+                        value_hidden=np.int16(args.value_hidden))
+    game_keys = lambda games: [                                           # noqa: E731
+        {"source": game_refs[g][0], "game": game_refs[g][1]}
+        for g in sorted(games)]
+    selection_keys, test_keys = game_keys(select_games), game_keys(test_games)
     Path(args.out).with_suffix(".json").write_text(
-        json.dumps({"schema_version": 2, "validation_games": len(val_games),
-                    "validation_game_keys": validation_keys,
+        json.dumps({"schema_version": 3,
+                    "selection_games": len(select_games),
+                    "selection_game_keys": selection_keys,
+                    "test_games": len(test_games), "test_game_keys": test_keys,
                     "data_sources": [str(p) for p in source_dirs],
-                    "metrics": best_metrics, "control": control,
+                    "selection_metrics": best_metrics,
+                    "selection_control": select_control,
+                    "temperature": best_temperature,
+                    "metrics": test_metrics, "control": test_control,
                     "gate_passed": gate_passed, **arch}, indent=2))
-    print(f"\nwrote {args.out} (best evar {best_metrics['evar']:.3f})")
-    print(f"scalar evar {control['evar']:.3f}, net {best_metrics['evar']:.3f}, "
-          f"gain {best_metrics['evar'] - control['evar']:+.3f}")
+    print(f"\nwrote {args.out} (selection evar {best_metrics['evar']:.3f}, "
+          f"sealed-test evar {test_metrics['evar']:.3f})")
+    print(f"test scalar evar {test_control['evar']:.3f}, net "
+          f"{test_metrics['evar']:.3f}, "
+          f"gain {test_metrics['evar'] - test_control['evar']:+.3f}")
     from tools import manifest
     artifacts = [args.out]
     artifacts.extend(d / "meta.json" for d in data_dirs if (d / "meta.json").is_file())
@@ -307,14 +414,15 @@ def main() -> None:
                    artifacts=artifacts,
                    extra={"kind": "value-training", "args": vars(args),
                           "gate_passed": gate_passed,
-                          "validation_games": validation_keys,
+                          "selection_games": selection_keys,
+                          "test_games": test_keys,
                           "data_sources": [str(p) for p in source_dirs]})
     if not gate_passed:
         print("GATE FAILED: insufficient board gain or poor calibration.")
         print("Do not spend a training run on this critic.")
         raise SystemExit(1)
     else:
-        print("Gate passed on complete held-out games.")
+        print("Gate passed once on sealed complete test games.")
 
 
 if __name__ == "__main__":
