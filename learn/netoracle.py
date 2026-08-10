@@ -152,6 +152,7 @@ runs this for you (`--oracle net`).
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import multiprocessing as mp
 import os
@@ -205,6 +206,11 @@ DEFENSE_TAIL_TURNS = 60
 DEFENSE_HIDDEN_RATIO = 2.5
 DEFENSE_MARGIN = 0.05
 DEFENSE_OPPONENT = "snipe"
+DEFENSE_CF_TOPK = 8
+DEFENSE_CF_HORIZON = 32
+DEFENSE_CF_STRIDE = 8
+DEFENSE_CF_MIN_TURN = 80
+DEFENSE_CF_RISK_RATIO = 1.25
 
 
 def critic_ready(it: int, evar: float, threshold: float) -> bool:
@@ -566,13 +572,120 @@ def _defense_safe_index(obs, mask, logits, idx: int, hidden_ratio: float) -> int
     return -1
 
 
+def _defense_risk(obs, ratio: float) -> bool:
+    """Whether the current observation is an actionable hidden-army risk."""
+    if ratio <= 0.0:
+        return False
+    gen = _my_general(obs)
+    if gen is None:
+        return False
+    gr, gc = gen
+    garrison = max(int(obs.army_grid[gr, gc]), 1)
+    visible_opp = int(obs.army_grid[obs.owner_grid == rules.OWNER_OPP].sum())
+    hidden = max(int(obs.opp_army) - visible_opp, 0)
+    return hidden >= ratio * garrison
+
+
+def _branch_score(st, seat: int) -> float:
+    """Score a short engine branch from the learner's perspective.
+
+    A resolved win/loss dominates the shaped continuation score.  Unresolved
+    branches are ranked by the two quantities the counterexample is about:
+    general safety versus hidden army, then army/land advantage.  This score is
+    used only to choose a label; PPO/evaluation still use terminal W/D/L.
+    """
+    if st.winner >= 0:
+        return 2.0 if st.winner == seat else -2.0
+    obs = engine.observe(st, seat)
+    gr, gc = st.gpos[seat]
+    garrison = int(st.armies[gr, gc])
+    visible_opp = int(obs.army_grid[obs.owner_grid == rules.OWNER_OPP].sum())
+    hidden = max(int(obs.opp_army) - visible_opp, 0)
+    safety = np.tanh((garrison - hidden) / 40.0)
+    army_adv = np.tanh((int(obs.my_army) - int(obs.opp_army)) / 80.0)
+    land_adv = np.tanh((int(obs.my_land) - int(obs.opp_land)) / 10.0)
+    return float(0.60 * safety + 0.25 * army_adv + 0.15 * land_adv)
+
+
+def _counterfactual_score(st, memory, foe, net, seat: int, first_action,
+                          foe_action, horizon: int) -> float:
+    """Play one candidate action through a short, isolated engine branch."""
+    branch = st.copy()
+    branch_memory = memory.copy()
+    branch_foe = copy.deepcopy(foe)
+    acts = [None, None]
+    acts[seat] = first_action
+    acts[1 - seat] = foe_action
+    if engine.step(branch, acts[0], acts[1]):
+        return _branch_score(branch, seat)
+    for _ in range(max(int(horizon) - 1, 0)):
+        obs = engine.observe(branch, seat)
+        branch_memory.update(obs)
+        mask = features.legal_mask(obs)
+        logits = np.where(mask, net.logits(obs, memory=branch_memory), -np.inf)
+        idx = int(np.argmax(logits))
+        try:
+            other = branch_foe.act(engine.observe(branch, 1 - seat))
+        except Exception:                         # noqa: BLE001
+            other = rules.PASS_ACTION
+        acts = [None, None]
+        acts[seat] = features.index_to_action(idx)
+        acts[1 - seat] = other
+        if engine.step(branch, acts[0], acts[1]):
+            break
+    return _branch_score(branch, seat)
+
+
+def _counterfactual_label(st, obs, memory, foe, net, seat: int, mask,
+                          logits, idx: int, foe_action, topk: int,
+                          horizon: int, risk_ratio: float) -> tuple[int, float]:
+    """Return (better action, positive branch margin), or (-1, 0)."""
+    if not _defense_risk(obs, risk_ratio):
+        return -1, 0.0
+    legal = np.flatnonzero(mask)
+    order = legal[np.argsort(np.asarray(logits)[legal])[-max(1, int(topk)):]]
+    candidates = {int(x) for x in order}
+    candidates.add(int(idx))                 # sampled action is the baseline
+    scored = []
+    for candidate in candidates:
+        action = features.index_to_action(candidate)
+        try:
+            score = _counterfactual_score(
+                st, memory, foe, net, seat, action, foe_action, horizon)
+        except Exception:                     # noqa: BLE001
+            continue                           # one bad branch cannot poison a batch
+        scored.append((score, candidate))
+    if not scored:
+        return -1, 0.0
+    current = next((s for s, c in scored if c == int(idx)), None)
+    if current is None:
+        return -1, 0.0
+    best, candidate = max(scored)
+    margin = float(best - current)
+    if candidate == int(idx) or margin < 0.10:
+        return -1, 0.0
+    return int(candidate), min(max(margin, 0.0), 1.0)
+
+
 def _init(live: str, specs: tuple, maps: str | None, max_turns: int,
           defense_tail_turns: int = 0, defense_hidden_ratio: float = 0.0,
-          defense_opponent: str = DEFENSE_OPPONENT) -> None:
+          defense_opponent: str = DEFENSE_OPPONENT,
+          defense_counterfactual: bool = False,
+          defense_cf_topk: int = DEFENSE_CF_TOPK,
+          defense_cf_horizon: int = DEFENSE_CF_HORIZON,
+          defense_cf_stride: int = DEFENSE_CF_STRIDE,
+          defense_cf_min_turn: int = DEFENSE_CF_MIN_TURN,
+          defense_cf_risk_ratio: float = DEFENSE_CF_RISK_RATIO) -> None:
     _CTX.update(live=live, specs=specs, maps=maps, max_turns=max_turns,
                 defense_tail_turns=defense_tail_turns,
                 defense_hidden_ratio=defense_hidden_ratio,
-                defense_opponent=defense_opponent)
+                defense_opponent=defense_opponent,
+                defense_counterfactual=defense_counterfactual,
+                defense_cf_topk=defense_cf_topk,
+                defense_cf_horizon=defense_cf_horizon,
+                defense_cf_stride=defense_cf_stride,
+                defense_cf_min_turn=defense_cf_min_turn,
+                defense_cf_risk_ratio=defense_cf_risk_ratio)
 
 
 def _rollout(job):
@@ -589,7 +702,8 @@ def _rollout(job):
     foe = agents.make(_CTX["specs"][opp], 1 - seat, *grid.shape, seed)
     rng = np.random.default_rng(seed * 2 + seat)
 
-    xs, ids, masks, lps, defense_safe = [], [], [], [], []
+    xs, ids, masks, lps = [], [], [], []
+    defense_safe, defense_weight = [], []
     turns, faults = 0, 0
     for turns in range(1, _CTX["max_turns"] + 1):
         obs = engine.observe(st, seat)
@@ -611,9 +725,13 @@ def _rollout(job):
             # the correct winning action.
             target = _CTX.get("defense_opponent", DEFENSE_OPPONENT)
             is_target = _CTX["specs"][opp].partition(":")[0] == target
-            defense_safe.append(_defense_safe_index(
+            safe_idx = (_defense_safe_index(
                 obs, mask, lg, idx,
-                _CTX.get("defense_hidden_ratio", 0.0)) if is_target else -1)
+                _CTX.get("defense_hidden_ratio", 0.0))
+                        if is_target and not _CTX.get("defense_counterfactual", False)
+                        else -1)
+            defense_safe.append(safe_idx)
+            defense_weight.append(1.0 if safe_idx >= 0 else 0.0)
         # engine.step is positional by seat. Placing these the wrong way round
         # trains the policy on its opponent's rewards and looks like slow noise.
         acts = [None, None]
@@ -633,6 +751,17 @@ def _rollout(job):
             if faults >= rules.MAX_FAULTS:
                 return None
             acts[1 - seat] = rules.PASS_ACTION
+        if (not greedy and _CTX.get("defense_counterfactual", False)
+                and is_target
+                and turns >= _CTX.get("defense_cf_min_turn", DEFENSE_CF_MIN_TURN)
+                and turns % max(_CTX.get("defense_cf_stride", DEFENSE_CF_STRIDE), 1) == 0):
+            safe_idx, margin = _counterfactual_label(
+                st, obs, memory, foe, net, seat, mask, lg, idx,
+                acts[1 - seat], _CTX.get("defense_cf_topk", DEFENSE_CF_TOPK),
+                _CTX.get("defense_cf_horizon", DEFENSE_CF_HORIZON),
+                _CTX.get("defense_cf_risk_ratio", DEFENSE_CF_RISK_RATIO))
+            defense_safe[-1] = safe_idx
+            defense_weight[-1] = margin
         if engine.step(st, acts[0], acts[1]):
             break
 
@@ -645,15 +774,21 @@ def _rollout(job):
     if not ids:
         return None
     safe = np.full(len(ids), -1, dtype=np.int32)
-    if z < 0.0 and _CTX.get("defense_tail_turns", 0) > 0:
-        tail = int(_CTX["defense_tail_turns"])
-        safe[max(0, len(ids) - tail):] = np.asarray(
-            defense_safe[max(0, len(ids) - tail):], dtype=np.int32)
+    weights = np.zeros(len(ids), dtype=np.float32)
+    if z < 0.0:
+        if _CTX.get("defense_counterfactual", False):
+            safe[:] = np.asarray(defense_safe, dtype=np.int32)
+            weights[:] = np.asarray(defense_weight, dtype=np.float32)
+        elif _CTX.get("defense_tail_turns", 0) > 0:
+            tail = int(_CTX["defense_tail_turns"])
+            start = max(0, len(ids) - tail)
+            safe[start:] = np.asarray(defense_safe[start:], dtype=np.int32)
+            weights[start:] = np.asarray(defense_weight[start:], dtype=np.float32)
     out.update(x=np.stack(xs), idx=np.asarray(ids, dtype=np.int32),
                mask=np.packbits(np.stack(masks), axis=1),
                logp=np.asarray(lps, dtype=np.float32),
                defense_safe=safe,
-               defense_w=(safe >= 0).astype(np.float32))
+               defense_w=weights)
     return out
 
 
@@ -916,6 +1051,17 @@ def main() -> None:
                     help="safe-over-unsafe log-probability ranking margin")
     ap.add_argument("--defense-opponent", default=DEFENSE_OPPONENT,
                     help="archive agent kind supplying defensive counterexamples")
+    ap.add_argument("--defense-counterfactual", action="store_true",
+                    help="rank alternatives with short real-engine branches "
+                         "instead of the old second-choice label")
+    ap.add_argument("--defense-cf-topk", type=int, default=DEFENSE_CF_TOPK)
+    ap.add_argument("--defense-cf-horizon", type=int, default=DEFENSE_CF_HORIZON)
+    ap.add_argument("--defense-cf-stride", type=int, default=DEFENSE_CF_STRIDE)
+    ap.add_argument("--defense-cf-min-turn", type=int, default=DEFENSE_CF_MIN_TURN)
+    ap.add_argument("--defense-cf-risk-ratio", type=float,
+                    default=DEFENSE_CF_RISK_RATIO)
+    ap.add_argument("--policy-scope", choices=("all", "head"), default="all",
+                    help="train all policy weights or only the action/pass head")
     ap.add_argument("--warm-evar", type=float, default=0.10,
                     help="hold the policy frozen until the critic explains this "
                          "much of the return; 0 restores the old fixed warmup")
@@ -969,6 +1115,14 @@ def main() -> None:
         raise SystemExit("--defense-hidden-ratio must be non-negative")
     if args.defense_margin < 0.0:
         raise SystemExit("--defense-margin must be non-negative")
+    if args.defense_counterfactual and args.defense_aux_weight <= 0.0:
+        raise SystemExit("--defense-counterfactual needs --defense-aux-weight > 0")
+    if args.defense_cf_topk < 1 or args.defense_cf_horizon < 1:
+        raise SystemExit("counterfactual topk/horizon must be positive")
+    if args.defense_cf_stride < 1 or args.defense_cf_min_turn < 0:
+        raise SystemExit("counterfactual stride must be positive and min-turn non-negative")
+    if args.defense_cf_risk_ratio < 0.0:
+        raise SystemExit("--defense-cf-risk-ratio must be non-negative")
     if args.defense_aux_weight > 0.0 and args.augment:
         raise SystemExit("--defense-aux-weight cannot be combined with --augment: "
                          "action labels need an explicit dihedral transform")
@@ -1121,6 +1275,10 @@ def main() -> None:
     @jax.jit
     def p_step(p, opt, t, beta, lr, batch):
         (loss, aux), g = jax.value_and_grad(p_objective, has_aux=True)(p, beta, *batch)
+        if args.policy_scope == "head":
+            trainable = {"head_w", "head_b", "pass_w", "pass_b"}
+            g = {k: (v if k in trainable else jnp.zeros_like(v))
+                 for k, v in g.items()}
         g, norm = clip_grads(g, 0.5)
         # lr is traced, not closed over: the collapse guard halves it at runtime
         # and a closed-over python float would silently keep the original.
@@ -1164,7 +1322,13 @@ def main() -> None:
                                          args.max_turns,
                                          args.defense_tail_turns if args.defense_aux_weight else 0,
                                          args.defense_hidden_ratio if args.defense_aux_weight else 0.0,
-                                         args.defense_opponent))
+                                         args.defense_opponent,
+                                         args.defense_counterfactual,
+                                         args.defense_cf_topk,
+                                         args.defense_cf_horizon,
+                                         args.defense_cf_stride,
+                                         args.defense_cf_min_turn,
+                                         args.defense_cf_risk_ratio))
 
     def play(jobs, weights):
         """Publish, then dispatch. Every sample comes from exactly one snapshot,
@@ -1479,7 +1643,14 @@ def main() -> None:
          "defense_tail_turns": args.defense_tail_turns,
          "defense_hidden_ratio": round(args.defense_hidden_ratio, 6),
          "defense_margin": round(args.defense_margin, 6),
-         "defense_opponent": args.defense_opponent}, indent=2) + "\n")
+         "defense_opponent": args.defense_opponent,
+         "defense_counterfactual": args.defense_counterfactual,
+         "defense_cf_topk": args.defense_cf_topk,
+         "defense_cf_horizon": args.defense_cf_horizon,
+         "defense_cf_stride": args.defense_cf_stride,
+         "defense_cf_min_turn": args.defense_cf_min_turn,
+         "defense_cf_risk_ratio": round(args.defense_cf_risk_ratio, 6),
+         "policy_scope": args.policy_scope}, indent=2) + "\n")
 
     print(f"\ngate on {len(gate)} fresh games ({dg} distinct): trained {score:.3f} "
           f"vs init {init_score:.3f}, needs +{margin:.3f} -> "

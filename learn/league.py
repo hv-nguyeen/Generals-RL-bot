@@ -604,10 +604,18 @@ def net_oracle_command(args, npz: Path, ckpt: Path,
            "--defense-hidden-ratio", str(getattr(args, "nn_defense_hidden_ratio", 2.5)),
            "--defense-margin", str(getattr(args, "nn_defense_margin", 0.05)),
            "--defense-opponent", str(getattr(args, "nn_defense_opponent", "snipe")),
+           "--policy-scope", str(getattr(args, "nn_policy_scope", "all")),
            "--role", str(getattr(args, "nn_role", "league-exploiter")),
            "--sampling", str(getattr(args, "nn_sampling", "nash")),
            "--pfsp-weighting", str(getattr(args, "nn_pfsp_weighting", "variance")),
            "--seed", str(args.seed + 1000 * it)]
+    if getattr(args, "nn_defense_counterfactual", False):
+        cmd += ["--defense-counterfactual",
+                "--defense-cf-topk", str(getattr(args, "nn_defense_cf_topk", 8)),
+                "--defense-cf-horizon", str(getattr(args, "nn_defense_cf_horizon", 32)),
+                "--defense-cf-stride", str(getattr(args, "nn_defense_cf_stride", 8)),
+                "--defense-cf-min-turn", str(getattr(args, "nn_defense_cf_min_turn", 80)),
+                "--defense-cf-risk-ratio", str(getattr(args, "nn_defense_cf_risk_ratio", 1.25))]
     if args.nn_init_critic:
         cmd += ["--init-critic", args.nn_init_critic]
     if args.nn_augment:
@@ -826,7 +834,14 @@ def migrate_resume_params(saved: dict | None, current: dict) -> dict | None:
                          ("nn_defense_tail_turns", 60),
                          ("nn_defense_hidden_ratio", 2.5),
                          ("nn_defense_margin", 0.05),
-                         ("nn_defense_opponent", "snipe")):
+                         ("nn_defense_opponent", "snipe"),
+                         ("nn_defense_counterfactual", False),
+                         ("nn_defense_cf_topk", 8),
+                         ("nn_defense_cf_horizon", 32),
+                         ("nn_defense_cf_stride", 8),
+                         ("nn_defense_cf_min_turn", 80),
+                         ("nn_defense_cf_risk_ratio", 1.25),
+                         ("nn_policy_scope", "all")):
         if key not in out and current.get(key) == default:
             out = {**out, key: default}
     return out
@@ -1043,6 +1058,15 @@ def main() -> None:
                     help="safe-over-unsafe log-probability ranking margin")
     ap.add_argument("--nn-defense-opponent", default="snipe",
                     help="archive agent kind supplying defensive counterexamples")
+    ap.add_argument("--nn-defense-counterfactual", action="store_true",
+                    help="use short real-engine branches to rank defensive actions")
+    ap.add_argument("--nn-defense-cf-topk", type=int, default=8)
+    ap.add_argument("--nn-defense-cf-horizon", type=int, default=32)
+    ap.add_argument("--nn-defense-cf-stride", type=int, default=8)
+    ap.add_argument("--nn-defense-cf-min-turn", type=int, default=80)
+    ap.add_argument("--nn-defense-cf-risk-ratio", type=float, default=1.25)
+    ap.add_argument("--nn-policy-scope", choices=("all", "head"), default="all",
+                    help="neural-oracle policy weights to update")
     ap.add_argument("--nn-warm-evar", type=float, default=0.10,
                     help="keep the neural-oracle policy frozen until its critic "
                          "reaches this explained variance")
@@ -1097,6 +1121,14 @@ def main() -> None:
         raise SystemExit("--nn-defense-margin must be non-negative")
     if args.nn_defense_aux_weight > 0.0 and args.nn_augment:
         raise SystemExit("--nn-defense-aux-weight cannot be combined with --nn-augment")
+    if args.nn_defense_counterfactual and args.nn_defense_aux_weight <= 0.0:
+        raise SystemExit("--nn-defense-counterfactual needs --nn-defense-aux-weight > 0")
+    if args.nn_defense_cf_topk < 1 or args.nn_defense_cf_horizon < 1:
+        raise SystemExit("counterfactual topk/horizon must be positive")
+    if args.nn_defense_cf_stride < 1 or args.nn_defense_cf_min_turn < 0:
+        raise SystemExit("counterfactual stride must be positive and min-turn non-negative")
+    if args.nn_defense_cf_risk_ratio < 0.0:
+        raise SystemExit("--nn-defense-cf-risk-ratio must be non-negative")
 
     if args.oracle != "config":
         if not args.nn_init:
@@ -1134,7 +1166,9 @@ def main() -> None:
         "nn_critic_replay_source_floor", "nn_value_hidden", "nn_lam", "nn_reward_mode",
         "nn_tempo_eps", "nn_augment", "nn_defense_aux_weight",
         "nn_defense_tail_turns", "nn_defense_hidden_ratio", "nn_defense_margin",
-        "nn_defense_opponent",
+        "nn_defense_opponent", "nn_defense_counterfactual", "nn_defense_cf_topk",
+        "nn_defense_cf_horizon", "nn_defense_cf_stride", "nn_defense_cf_min_turn",
+        "nn_defense_cf_risk_ratio", "nn_policy_scope",
         "nn_warm_evar", "nn_sigma_floor",
         "nn_role", "nn_sampling", "nn_pfsp_weighting",
         "nn_no_fallback")}
