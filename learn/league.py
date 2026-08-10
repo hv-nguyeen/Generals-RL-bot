@@ -599,6 +599,11 @@ def net_oracle_command(args, npz: Path, ckpt: Path,
            "--tempo-eps", str(args.nn_tempo_eps),
            "--warm-evar", str(args.nn_warm_evar),
            "--sigma-floor", str(args.nn_sigma_floor),
+           "--defense-aux-weight", str(getattr(args, "nn_defense_aux_weight", 0.0)),
+           "--defense-tail-turns", str(getattr(args, "nn_defense_tail_turns", 60)),
+           "--defense-hidden-ratio", str(getattr(args, "nn_defense_hidden_ratio", 2.5)),
+           "--defense-margin", str(getattr(args, "nn_defense_margin", 0.05)),
+           "--defense-opponent", str(getattr(args, "nn_defense_opponent", "snipe")),
            "--role", str(getattr(args, "nn_role", "league-exploiter")),
            "--sampling", str(getattr(args, "nn_sampling", "nash")),
            "--pfsp-weighting", str(getattr(args, "nn_pfsp_weighting", "variance")),
@@ -817,6 +822,13 @@ def migrate_resume_params(saved: dict | None, current: dict) -> dict | None:
                          ("nn_pfsp_weighting", "variance")):
         if key not in out and current.get(key) == default:
             out = {**out, key: default}
+    for key, default in (("nn_defense_aux_weight", 0.0),
+                         ("nn_defense_tail_turns", 60),
+                         ("nn_defense_hidden_ratio", 2.5),
+                         ("nn_defense_margin", 0.05),
+                         ("nn_defense_opponent", "snipe")):
+        if key not in out and current.get(key) == default:
+            out = {**out, key: default}
     return out
 
 
@@ -1020,6 +1032,17 @@ def main() -> None:
                     help="tempo tie-break strength forwarded to netoracle")
     ap.add_argument("--nn-augment", action="store_true",
                     help="enable the neural oracle's PPO dihedral arm")
+    ap.add_argument("--nn-defense-aux-weight", type=float, default=0.0,
+                    help="opt-in loss-conditioned defensive action ranking "
+                         "weight forwarded to netoracle")
+    ap.add_argument("--nn-defense-tail-turns", type=int, default=60,
+                    help="late loss tail eligible for defensive labels")
+    ap.add_argument("--nn-defense-hidden-ratio", type=float, default=2.5,
+                    help="hidden enemy army/garrison threshold for labels")
+    ap.add_argument("--nn-defense-margin", type=float, default=0.05,
+                    help="safe-over-unsafe log-probability ranking margin")
+    ap.add_argument("--nn-defense-opponent", default="snipe",
+                    help="archive agent kind supplying defensive counterexamples")
     ap.add_argument("--nn-warm-evar", type=float, default=0.10,
                     help="keep the neural-oracle policy frozen until its critic "
                          "reaches this explained variance")
@@ -1064,6 +1087,16 @@ def main() -> None:
         raise SystemExit("--nn-value-hidden must be zero or positive")
     if not 0.0 <= args.nn_tempo_eps < 1.0:
         raise SystemExit(f"--nn-tempo-eps must be in [0, 1), got {args.nn_tempo_eps}")
+    if args.nn_defense_aux_weight < 0.0:
+        raise SystemExit("--nn-defense-aux-weight must be non-negative")
+    if args.nn_defense_tail_turns < 0:
+        raise SystemExit("--nn-defense-tail-turns must be non-negative")
+    if args.nn_defense_hidden_ratio < 0.0:
+        raise SystemExit("--nn-defense-hidden-ratio must be non-negative")
+    if args.nn_defense_margin < 0.0:
+        raise SystemExit("--nn-defense-margin must be non-negative")
+    if args.nn_defense_aux_weight > 0.0 and args.nn_augment:
+        raise SystemExit("--nn-defense-aux-weight cannot be combined with --nn-augment")
 
     if args.oracle != "config":
         if not args.nn_init:
@@ -1099,7 +1132,9 @@ def main() -> None:
         "nn_games", "nn_epochs", "nn_minibatch", "nn_lr",
         "nn_critic_lr", "nn_critic_replay_games", "nn_critic_replay_frac",
         "nn_critic_replay_source_floor", "nn_value_hidden", "nn_lam", "nn_reward_mode",
-        "nn_tempo_eps", "nn_augment",
+        "nn_tempo_eps", "nn_augment", "nn_defense_aux_weight",
+        "nn_defense_tail_turns", "nn_defense_hidden_ratio", "nn_defense_margin",
+        "nn_defense_opponent",
         "nn_warm_evar", "nn_sigma_floor",
         "nn_role", "nn_sampling", "nn_pfsp_weighting",
         "nn_no_fallback")}

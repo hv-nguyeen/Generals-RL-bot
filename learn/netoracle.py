@@ -117,6 +117,21 @@ KILL THE RUN IF:
                         No best response in this class either. That is a real
                         result; stop and write it down.
 
+DEFENSIVE COUNTEREXAMPLE ARM
+----------------------------
+The default remains unchanged. With ``--defense-aux-weight > 0`` the rollout
+workers record only losses to the named ``--defense-opponent`` (normally the
+randomized ``snipe:`` member). In the final ``--defense-tail-turns`` decisions,
+when the sampled action drains our general while hidden enemy army exceeds the
+configured garrison ratio, the worker records the current policy's best legal
+non-draining alternative. PPO receives a small pairwise ranking loss for that
+measured counterexample. This is not the shipped hidden-army veto: wins, draws,
+non-target opponents, and ordinary attack states get no auxiliary label.
+``defense-labels`` in the iteration line must be nonzero before this arm can be
+judged; a zero count means the experiment is not collecting its intended data.
+The arm is incompatible with ``--augment`` until action labels are transformed
+through the same dihedral map.
+
 A COLLAPSE is caught rather than watched: an eval 2 se below the `eval 0`
 baseline rewinds to the best checkpoint, halves the learning rate and doubles
 the anchor. Three of those and the run stops -- the schedule is wrong, not
@@ -179,6 +194,17 @@ WARMUP = 3           # minimum critic-only iterations; --warm-evar is the real g
 REFREEZE_AFTER = 5   # consecutive stale-critic buffers before actor updates stop
 MAX_REWINDS = 3      # collapses tolerated before the schedule is declared wrong
 CHUNK = 8192         # ingest forward chunk, no-grad, outside value_and_grad
+
+# Defensive action ranking is deliberately opt-in.  The ordinary terminal PPO
+# objective must remain byte-for-byte compatible when its weight is zero; this
+# arm exists to put a little supervised signal exactly where the snipe
+# counterexample is observed instead of asking a sparse terminal reward to
+# assign credit over hundreds of actions.
+DEFENSE_AUX_WEIGHT = 0.0
+DEFENSE_TAIL_TURNS = 60
+DEFENSE_HIDDEN_RATIO = 2.5
+DEFENSE_MARGIN = 0.05
+DEFENSE_OPPONENT = "snipe"
 
 
 def critic_ready(it: int, evar: float, threshold: float) -> bool:
@@ -274,6 +300,32 @@ def policy_loss(logits, mask, idx, old_logp, ref_logp, adv, beta, xp=np,
     # the averaging, and gross errors are not the ones worth a diagnostic.
     dlp = xp.max(xp.abs(logp - old_logp))
     return loss, (dlp, kl_update, kl_anchor, ent, pg)
+
+
+def defense_pairwise_loss(logits, mask, unsafe_idx, safe_idx, weights,
+                          xp=np, margin: float = DEFENSE_MARGIN):
+    """Rank a measured safe alternative above the action that lost the game.
+
+    ``safe_idx`` is -1 for rows without a counterexample.  Invalid rows are
+    excluded rather than manufacturing a PASS target, so a batch with no loss
+    evidence contributes exactly zero.  This is a ranking *auxiliary* only:
+    terminal W/D/L remains the objective and the caller controls its weight.
+    ``xp`` is numpy or jax.numpy, matching :func:`policy_loss`.
+    """
+    n = unsafe_idx.shape[0]
+    lp = _log_softmax(xp.where(mask, logits, -1e9), xp)
+    safe = xp.maximum(safe_idx, 0)
+    unsafe = xp.maximum(unsafe_idx, 0)
+    safe_lp = lp[xp.arange(n), safe]
+    unsafe_lp = lp[xp.arange(n), unsafe]
+    valid = (safe_idx >= 0) & (unsafe_idx >= 0) & (safe_idx != unsafe_idx)
+    # softplus(margin - (safe - unsafe)); stable for the small margin used here
+    # and differentiable even when the current policy already ranks safely.
+    delta = margin - (safe_lp - unsafe_lp)
+    per = xp.logaddexp(0.0, delta)
+    w = xp.where(valid, weights, 0.0)
+    denom = xp.maximum(xp.sum(w), 1.0)
+    return xp.sum(w * per) / denom
 
 
 def gae(z: float, v: np.ndarray, gamma: float = GAMMA, lam: float = LAM):
@@ -472,8 +524,55 @@ def tally(results: list[dict], specs: list[str]) -> tuple[float, dict]:
 _CTX: dict = {}
 
 
-def _init(live: str, specs: tuple, maps: str | None, max_turns: int) -> None:
-    _CTX.update(live=live, specs=specs, maps=maps, max_turns=max_turns)
+def _my_general(obs):
+    hit = np.argwhere((obs.type_grid == rules.T_GENERAL)
+                      & (obs.owner_grid == rules.OWNER_ME))
+    return (int(hit[0][0]), int(hit[0][1])) if len(hit) else None
+
+
+def _hidden_general_drain(obs, idx: int, hidden_ratio: float) -> bool:
+    """Whether ``idx`` empties our general while hidden army is threatening it.
+
+    This is intentionally a *training label*, not the shipped GuardedPolicy
+    veto.  The latter's unconditional hidden-army trigger was measured at
+    strongly negative Elo because it fires in most wins too.  Restricting this
+    predicate to the terminal tail of games the policy actually lost keeps the
+    signal counterexample-conditioned and avoids turning a noisy correlate into
+    a hard rule.
+    """
+    if hidden_ratio <= 0.0:
+        return False
+    gen = _my_general(obs)
+    if gen is None:
+        return False
+    act = features.index_to_action(int(idx))
+    if act is None or act[0] != rules.MOVE or (int(act[1]), int(act[2])) != gen:
+        return False
+    gr, gc = gen
+    garrison = max(int(obs.army_grid[gr, gc]), 1)
+    visible_opp = int(obs.army_grid[obs.owner_grid == rules.OWNER_OPP].sum())
+    hidden = max(int(obs.opp_army) - visible_opp, 0)
+    return hidden >= hidden_ratio * garrison
+
+
+def _defense_safe_index(obs, mask, logits, idx: int, hidden_ratio: float) -> int:
+    """Return the current policy's best legal non-draining alternative, or -1."""
+    if not _hidden_general_drain(obs, idx, hidden_ratio):
+        return -1
+    for alt in np.argsort(-np.asarray(logits)):
+        alt = int(alt)
+        if mask[alt] and not _hidden_general_drain(obs, alt, hidden_ratio):
+            return alt
+    return -1
+
+
+def _init(live: str, specs: tuple, maps: str | None, max_turns: int,
+          defense_tail_turns: int = 0, defense_hidden_ratio: float = 0.0,
+          defense_opponent: str = DEFENSE_OPPONENT) -> None:
+    _CTX.update(live=live, specs=specs, maps=maps, max_turns=max_turns,
+                defense_tail_turns=defense_tail_turns,
+                defense_hidden_ratio=defense_hidden_ratio,
+                defense_opponent=defense_opponent)
 
 
 def _rollout(job):
@@ -490,7 +589,7 @@ def _rollout(job):
     foe = agents.make(_CTX["specs"][opp], 1 - seat, *grid.shape, seed)
     rng = np.random.default_rng(seed * 2 + seat)
 
-    xs, ids, masks, lps = [], [], [], []
+    xs, ids, masks, lps, defense_safe = [], [], [], [], []
     turns, faults = 0, 0
     for turns in range(1, _CTX["max_turns"] + 1):
         obs = engine.observe(st, seat)
@@ -506,6 +605,15 @@ def _rollout(job):
             ids.append(idx)
             masks.append(mask)
             lps.append(np.log(p[idx]))
+            # Only collect this auxiliary's evidence against the named
+            # counterexample opponent.  Applying it to ordinary losses would
+            # teach the policy to preserve its general even when an attack is
+            # the correct winning action.
+            target = _CTX.get("defense_opponent", DEFENSE_OPPONENT)
+            is_target = _CTX["specs"][opp].partition(":")[0] == target
+            defense_safe.append(_defense_safe_index(
+                obs, mask, lg, idx,
+                _CTX.get("defense_hidden_ratio", 0.0)) if is_target else -1)
         # engine.step is positional by seat. Placing these the wrong way round
         # trains the policy on its opponent's rewards and looks like slow noise.
         acts = [None, None]
@@ -536,9 +644,16 @@ def _rollout(job):
         return out
     if not ids:
         return None
+    safe = np.full(len(ids), -1, dtype=np.int32)
+    if z < 0.0 and _CTX.get("defense_tail_turns", 0) > 0:
+        tail = int(_CTX["defense_tail_turns"])
+        safe[max(0, len(ids) - tail):] = np.asarray(
+            defense_safe[max(0, len(ids) - tail):], dtype=np.int32)
     out.update(x=np.stack(xs), idx=np.asarray(ids, dtype=np.int32),
                mask=np.packbits(np.stack(masks), axis=1),
-               logp=np.asarray(lps, dtype=np.float32))
+               logp=np.asarray(lps, dtype=np.float32),
+               defense_safe=safe,
+               defense_w=(safe >= 0).astype(np.float32))
     return out
 
 
@@ -681,6 +796,22 @@ def selfcheck() -> None:
     # d = 0: the anchor exerts no pull on the first update, only on drift.
     assert float(-(np.exp(0.0) - 1.0)) == 0.0
 
+    # --- defensive ranking is a no-op without labels and prefers the target
+    # when one is present. The invalid row exercises the fail-closed path used
+    # by ordinary wins, draws, and non-snipe opponents.
+    dm = np.ones((2, 5), dtype=bool)
+    du = np.array([0, 2], dtype=np.int32)
+    ds = np.array([1, -1], dtype=np.int32)
+    dw = np.array([1.0, 0.0], dtype=np.float32)
+    d0 = defense_pairwise_loss(np.zeros((2, 5), np.float32), dm, du, ds, dw)
+    assert d0 > 0.0
+    assert defense_pairwise_loss(
+        np.zeros((2, 5), np.float32), dm, du,
+        np.full(2, -1, np.int32), np.zeros(2, np.float32)) == 0.0
+    boosted = np.zeros((2, 5), np.float32)
+    boosted[0, 1] = 2.0
+    assert defense_pairwise_loss(boosted, dm, du, ds, dw) < d0
+
     # --- a checkpoint round-trips into the loader the submission uses. Not the
     #     4x32 default: a residual trunk is what would break the key plumbing.
     arch = {"layers": 5, "channels": DEFAULT_CHANNELS, "residual": True,
@@ -771,6 +902,20 @@ def main() -> None:
     ap.add_argument("--augment", action="store_true",
                     help="random dihedral PPO minibatches with relabelled "
                          "masks/actions and recomputed frozen-policy log-probs")
+    ap.add_argument("--defense-aux-weight", type=float,
+                    default=DEFENSE_AUX_WEIGHT,
+                    help="opt-in loss-conditioned defensive action ranking "
+                         "weight; 0 keeps historical PPO unchanged")
+    ap.add_argument("--defense-tail-turns", type=int,
+                    default=DEFENSE_TAIL_TURNS,
+                    help="late loss tail eligible for defensive labels")
+    ap.add_argument("--defense-hidden-ratio", type=float,
+                    default=DEFENSE_HIDDEN_RATIO,
+                    help="hidden enemy army / garrison threshold for labels")
+    ap.add_argument("--defense-margin", type=float, default=DEFENSE_MARGIN,
+                    help="safe-over-unsafe log-probability ranking margin")
+    ap.add_argument("--defense-opponent", default=DEFENSE_OPPONENT,
+                    help="archive agent kind supplying defensive counterexamples")
     ap.add_argument("--warm-evar", type=float, default=0.10,
                     help="hold the policy frozen until the critic explains this "
                          "much of the return; 0 restores the old fixed warmup")
@@ -816,6 +961,17 @@ def main() -> None:
         raise SystemExit("--value-hidden must be zero or positive")
     if not 0.0 <= args.tempo_eps < 1.0:
         raise SystemExit(f"--tempo-eps must be in [0, 1), got {args.tempo_eps}")
+    if args.defense_aux_weight < 0.0:
+        raise SystemExit("--defense-aux-weight must be non-negative")
+    if args.defense_tail_turns < 0:
+        raise SystemExit("--defense-tail-turns must be non-negative")
+    if args.defense_hidden_ratio < 0.0:
+        raise SystemExit("--defense-hidden-ratio must be non-negative")
+    if args.defense_margin < 0.0:
+        raise SystemExit("--defense-margin must be non-negative")
+    if args.defense_aux_weight > 0.0 and args.augment:
+        raise SystemExit("--defense-aux-weight cannot be combined with --augment: "
+                         "action labels need an explicit dihedral transform")
     if args.role == "main" and args.reward_mode != "terminal":
         raise SystemExit("the main agent must use terminal reward; tempo is exploiter-only")
     if not args.league:
@@ -834,6 +990,11 @@ def main() -> None:
         name, _, arg = s.partition(":")
         if name in ("ours", "clone") and not Path(arg).exists():
             raise SystemExit(f"archive member {s} points at a missing file")
+    if args.defense_aux_weight > 0.0:
+        kinds = {s.partition(":")[0] for s in specs}
+        if args.defense_opponent not in kinds:
+            raise SystemExit(f"--defense-aux-weight needs an archive member of "
+                             f"kind {args.defense_opponent!r}; found {sorted(kinds)}")
     # sigma is NOT in the checkpoint (keys: iter/pending/params/archive/payoff);
     # it is a function of the payoff matrix and has to be recomputed here.
     sigma = fictitious_play(dense(state["payoff"]))
@@ -946,9 +1107,16 @@ def main() -> None:
     opt_p = {k: (jnp.zeros_like(v), jnp.zeros_like(v)) for k, v in theta.items()}
     opt_v = {k: (jnp.zeros_like(v), jnp.zeros_like(v)) for k, v in phi.items()}
 
-    def p_objective(p, beta, x, mask, idx, old_logp, ref_logp, adv):
-        return policy_loss(bc.forward(p, x), mask, idx, old_logp, ref_logp, adv,
-                           beta, xp=jnp)
+    def p_objective(p, beta, x, mask, idx, old_logp, ref_logp, adv,
+                    defense_safe, defense_w):
+        logits = bc.forward(p, x)
+        loss, aux = policy_loss(logits, mask, idx, old_logp, ref_logp, adv,
+                                beta, xp=jnp)
+        if args.defense_aux_weight:
+            loss = loss + args.defense_aux_weight * defense_pairwise_loss(
+                logits, mask, idx, defense_safe, defense_w,
+                xp=jnp, margin=args.defense_margin)
+        return loss, aux
 
     @jax.jit
     def p_step(p, opt, t, beta, lr, batch):
@@ -992,7 +1160,11 @@ def main() -> None:
     pool = ProcessPoolExecutor(max_workers=args.workers,
                                mp_context=mp.get_context("spawn"),
                                initializer=_init,
-                               initargs=(str(live), tuple(specs), args.maps, args.max_turns))
+                               initargs=(str(live), tuple(specs), args.maps,
+                                         args.max_turns,
+                                         args.defense_tail_turns if args.defense_aux_weight else 0,
+                                         args.defense_hidden_ratio if args.defense_aux_weight else 0.0,
+                                         args.defense_opponent))
 
     def play(jobs, weights):
         """Publish, then dispatch. Every sample comes from exactly one snapshot,
@@ -1033,6 +1205,12 @@ def main() -> None:
         idxs = np.concatenate([r["idx"] for r in results])
         packed = np.concatenate([r["mask"] for r in results])
         old_logp = np.concatenate([r["logp"] for r in results])
+        defense_safe = np.concatenate([r.get(
+            "defense_safe", np.full(len(r["idx"]), -1, dtype=np.int32))
+            for r in results]).astype(np.int32, copy=False)
+        defense_w = np.concatenate([r.get(
+            "defense_w", np.zeros(len(r["idx"]), dtype=np.float32))
+            for r in results]).astype(np.float32, copy=False)
         # Drop the per-game copies: at 256 games the buffer is ~1 GB and keeping
         # both views of it doubles that for no reason.
         episodes = [
@@ -1148,7 +1326,9 @@ def main() -> None:
                 nb += 1
                 if do_policy:
                     batch = (xb, maskb, idxb, oldb, refb,
-                             jnp.asarray(adv[sel]))
+                             jnp.asarray(adv[sel]),
+                             jnp.asarray(defense_safe[sel]),
+                             jnp.asarray(defense_w[sel]))
                     t_p += 1
                     theta, opt_p, _, aux, norm = p_step(theta, opt_p, t_p, beta,
                                                         args.lr * lr_scale, batch)
@@ -1203,7 +1383,8 @@ def main() -> None:
         tag = "  [critic warmup]" if not do_policy else ""
         print(f"iter {it:4d}  games {len(results)}  W/D/L {w}/{d}/"
               f"{len(results) - w - d}  samp {n // 1000:3d}k  turns {turns:.0f}  "
-              f"train-wr {wr:.2f}{tag}\n"
+              f"train-wr {wr:.2f}  defense-labels {int(defense_w.sum())}"
+              f"{tag}\n"
               f"          pg {pg:+.4f}  v {vloss:.3f}  evar {evar:+.2f} "
               f"(e{evar_e:+.2f} m{evar_m:+.2f} l{evar_l:+.2f} "
               f"sc m{sc_m:+.2f} l{sc_l:+.2f})  "
@@ -1293,7 +1474,12 @@ def main() -> None:
          "iters_done": args.iters, "best_iter": best_iter,
          "best_eval": round(best_score, 4),
          "reward_mode": args.reward_mode,
-         "tempo_eps": round(args.tempo_eps, 6)}, indent=2) + "\n")
+         "tempo_eps": round(args.tempo_eps, 6),
+         "defense_aux_weight": round(args.defense_aux_weight, 6),
+         "defense_tail_turns": args.defense_tail_turns,
+         "defense_hidden_ratio": round(args.defense_hidden_ratio, 6),
+         "defense_margin": round(args.defense_margin, 6),
+         "defense_opponent": args.defense_opponent}, indent=2) + "\n")
 
     print(f"\ngate on {len(gate)} fresh games ({dg} distinct): trained {score:.3f} "
           f"vs init {init_score:.3f}, needs +{margin:.3f} -> "

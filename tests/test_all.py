@@ -777,6 +777,11 @@ def test_league_forwards_safe_neural_optimizer_settings():
     assert value("--tempo-eps") == "0.03"
     assert value("--warm-evar") == "0.12"
     assert value("--sigma-floor") == "0.25"
+    assert value("--defense-aux-weight") == "0.0"
+    assert value("--defense-tail-turns") == "60"
+    assert value("--defense-hidden-ratio") == "2.5"
+    assert value("--defense-margin") == "0.05"
+    assert value("--defense-opponent") == "snipe"
     assert value("--seed") == "2003"
     assert value("--maps") == "maps.json"
     args.nn_augment = True
@@ -787,6 +792,18 @@ def test_league_forwards_safe_neural_optimizer_settings():
                              "maps.json", 2)
     assert value("--reward-mode") == "tempo"
     assert value("--tempo-eps") == "0.05"
+    args.nn_augment = False
+    args.nn_defense_aux_weight = 0.05
+    args.nn_defense_tail_turns = 48
+    args.nn_defense_hidden_ratio = 3.0
+    args.nn_defense_margin = 0.10
+    args.nn_defense_opponent = "snipe"
+    cmd = net_oracle_command(args, Path("oracle.npz"), Path("league.json"),
+                             "maps.json", 2)
+    assert value("--defense-aux-weight") == "0.05"
+    assert value("--defense-tail-turns") == "48"
+    assert value("--defense-hidden-ratio") == "3.0"
+    assert value("--defense-margin") == "0.1"
 
 
 def test_league_default_lambda_resume_migration_is_narrow():
