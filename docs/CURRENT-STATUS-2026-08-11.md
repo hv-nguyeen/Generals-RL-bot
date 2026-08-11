@@ -111,17 +111,17 @@ Use Node 2 for a separate seed/algorithm arm if more compute is available. Do
 not run two trainers on one L4, and do not copy venvs or replay lakes through
 shared home.
 
-The next Node 2 arm should use the already-verified strategic module:
-`tools.grow --strategy-hidden 64` adds global/3x3 region interactions and
-residual spatial refinement while preserving the accepted 8x32 policy at
-initialization. First train this pair with ordinary staged `learn.selfplay`
-using the same curriculum and evaluation protocol as the accepted champion.
-That isolates the architecture change. Only if that candidate passes the fresh
-incumbent test should it enter `learn.league --oracle net` against the accepted
-champion, previous incumbent, and generated hunter/greedy/expander anchors. In
-that second phase set `--nn-sigma-floor 0.50`; raw support 1 means single-
-opponent PPO and should not be trusted. Keep terminal reward and the matched
-critic in both phases.
+The next Node 2 arm is a genuine depth experiment:
+`tools.grow --layers 12 --channels 32` adds four identity-initialized 3x3
+layers to the accepted plain 8x32 trunk. It preserves the initial function,
+keeps width and optimizer settings fixed, and expands the local receptive-field
+radius from 8 to 12, covering most of a 21x21 board. First train this pair with
+ordinary staged `learn.selfplay` using the same curriculum and evaluation
+protocol as the accepted champion. That isolates depth. Only if it passes the
+fresh incumbent test should it enter `learn.league --oracle net` against the
+accepted champion and generated style anchors. The global/regional strategy
+module remains a separate later ablation; do not combine it with this depth
+test.
 
 ## Promotion rule
 
