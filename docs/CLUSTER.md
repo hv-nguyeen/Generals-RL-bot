@@ -2,6 +2,37 @@
 
 Everything here was learned the hard way. Follow it in order.
 
+## Live runbook — 2026-08-11
+
+The accepted local champion is
+/local/data/vng205/top3-v3/selfplay-stage4-1000-node1/selfplay.npz with policy
+SHA-256 3b3b707fc064635ae0448f021e0e0bef8136d963369b09caffe0c1aed637c028.
+The active experiment is the function-preserving 8x64 arm in
+/local/data/vng205/top3-v3/selfplay-8x64-stage4-1500-node1-g256. It uses 256
+games per iteration and minibatch 4096. The champion is immutable until the
+candidate passes fresh direct games and the promotion suite.
+
+Every fresh shell on the compute node should set:
+
+    export PY=/local/data/vng205/venv/bin/python
+    export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+    export XLA_PYTHON_CLIENT_PREALLOCATE=false
+    unset JAX_PLATFORMS
+
+Monitor the trainer and the actual GPU scheduler utilization:
+
+    tail -f "$RUN.log"
+    nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,power.draw --format=csv,noheader
+
+On the observed 8x64 run, 89% GPU utilization, 16,621/23,034 MiB VRAM, and
+69.64 W are healthy. Do not start a second JAX trainer on one L4. Keep games
+256 and minibatch 4096 while stable; if a new run gets CUDA OOM, lower its
+minibatch to 2048 in a new run directory. Do not change the running job's
+memory shape.
+
+For the complete current status, including promotion and installation
+invariants, read [docs/CURRENT-STATUS-2026-08-11.md](CURRENT-STATUS-2026-08-11.md).
+
 ## Getting on
 
 Compute nodes are not reachable directly — jump through the data host. The MOTD
@@ -52,7 +83,7 @@ that has touched JAX holds GPU memory that `nvidia-smi` reports with **"No
 running processes found"**, because it cannot see across containers — so do not
 train from the Hub, and stop the server when a node looks mysteriously full.
 
-## Install the verified r3 tarball
+## Historical r3 installation (preserved for reproducibility)
 
 Upload `generals-bot-top3-v2-r3.tar.gz` to the shared home directory. If you used
 the Hub, `ls ~` from the SSH shell FIRST and confirm the file is actually there —

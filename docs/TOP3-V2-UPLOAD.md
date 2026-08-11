@@ -1,4 +1,9 @@
-# Top-3 v2 r3 cluster upload and first start
+# Top-3 v2 r3 cluster upload and first start (historical)
+
+> **Current status (2026-08-11):** this is the r3 install record, not the live
+> champion runbook. The accepted 8x32 champion, active 8x64 arm, monitoring
+> commands, and safe install invariants are in
+> [docs/CURRENT-STATUS-2026-08-11.md](CURRENT-STATUS-2026-08-11.md).
 
 The source archive deliberately contains no `.git`, virtual environment,
 `runs/`, weights, replay data, or old packages. Extracting it over

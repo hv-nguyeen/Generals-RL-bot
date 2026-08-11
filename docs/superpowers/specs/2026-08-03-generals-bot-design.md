@@ -3,11 +3,15 @@
 Date: 2026-08-03
 Target: top 10 on the generals.bot leaderboard (Sprint checkpoint Aug 8, Marathon after).
 
-> **Status 2026-08-09:** this is the original rules/design specification, not the
+> **Status 2026-08-11:** this is the original rules/design specification, not the
 > current training recipe. Operational instructions and verified implementation
-> status live in `README.md`, `docs/TOP3-V2-HANDOFF.md`, `docs/STATE.md`, and
-> `docs/CLUSTER.md`. The current incumbent is a C=40/context temporal neural
+> status live in `docs/CURRENT-STATUS-2026-08-11.md`, `README.md`,
+> `docs/TOP3-V2-HANDOFF.md`, `docs/STATE.md`, and `docs/CLUSTER.md`. The
+> current incumbent is a C=40/context temporal neural
 > policy; the active experiments split mirror self-play from neural league PPO.
+> The accepted local checkpoint and active 8x64 capacity arm are recorded in
+> `docs/CURRENT-STATUS-2026-08-11.md`; this specification is not a claim that
+> learned belief search or the Ataraxos method is implemented.
 
 ## 1. Ruleset (ground truth, read from the engine source, not the rules page)
 

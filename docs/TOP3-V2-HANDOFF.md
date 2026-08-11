@@ -1,10 +1,20 @@
 # Top-3 v2 implementation and verification handoff
 
-Date: 2026-08-09
+Date: 2026-08-11 (implementation handoff; see current-status for live runs)
 Target: a reproducible training and promotion pipeline capable of producing a
 materially stronger generals.bot submission.
 Review owner: Fable (independent verification)
 Implementation owner: Codex
+
+> **Live status:** the accepted local champion is the 8x32 checkpoint
+> /local/data/vng205/top3-v3/selfplay-stage4-1000-node1/selfplay.npz
+> (SHA-256 3b3b707fc064635ae0448f021e0e0bef8136d963369b09caffe0c1aed637c028).
+> It passed its 1,600-game gate at 0.588 versus 0.500 initialization and beat
+> the previous incumbent by +54.6 Elo in a fresh 2,000-game arena comparison.
+> The active experiment is a function-preserving 8x64 growth arm, started from
+> stage 4 for 1,500 iterations and 256 games per iteration. It is not promoted.
+> For commands, current paths, resource limits, and monitoring, read
+> [docs/CURRENT-STATUS-2026-08-11.md](CURRENT-STATUS-2026-08-11.md).
 
 ## Executive verdict
 
@@ -34,10 +44,11 @@ failed neural oracles do not enter the archive, and candidates cannot be called
 promoted without passing the defined statistical, fault, runtime, and artifact
 gates.
 
-The r3 source bundle has now been installed and verified on the VU cluster. The
-current neural weights remain external to git: use the immutable
-`incumbent-refresh-onpolicy.npz` plus its matching `.critic.npz` as the starting
-pair. The repository is not a random-weight or fresh-BC training recipe.
+At the time of the 2026-08-09 handoff, the r3 source bundle had been installed
+and verified on the VU cluster. Those paths are retained for reproducibility;
+the current accepted pair and active run are listed in the live-status block
+above and in [docs/CURRENT-STATUS-2026-08-11.md](CURRENT-STATUS-2026-08-11.md).
+The repository is not a random-weight or fresh-BC training recipe.
 
 Current continuation arms are deliberately different:
 
@@ -48,9 +59,10 @@ Current continuation arms are deliberately different:
 
 The Node 2 `ceiling-r2` pilot completed 300 neural iterations but failed its
 fresh gate (`0.539` trained versus `0.504` init; `+0.071` required). Keep its
-logs and checkpoints as negative evidence only. Node 1 also has no acceptance
-result; its Stage-5 transition was forced at the stage cap rather than earned
-by two passing stage evaluations.
+logs and checkpoints as negative evidence only. The 2026-08-09 Node 1 arm had
+no acceptance result and reached Stage 5 by a forced cap; the later
+`selfplay-stage4-1000-node1` continuation is the accepted local champion
+recorded in the live-status block above.
 
 The old ladder ZIP is iteration 150 and the current incumbent is the later local
 continuation. No new candidate is a champion until it beats the immutable

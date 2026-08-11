@@ -1,6 +1,10 @@
-# Top-3 v3 implementation and two-L4 runbook
+# Top-3 v3 implementation and two-L4 runbook (historical)
 
 Date: 2026-08-09
+
+> The strategic-module design and first-run measurements below are retained as
+> history. The accepted 8x32 champion and active 8x64 capacity arm are tracked
+> in [docs/CURRENT-STATUS-2026-08-11.md](CURRENT-STATUS-2026-08-11.md).
 
 This iteration is implemented and locally verified. It does not claim that an
 untrained architecture is stronger, and it does not call a checkpoint improved

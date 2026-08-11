@@ -1,10 +1,12 @@
-# Competitive RL architecture review — 2026-08-09
+# Competitive RL architecture review — 2026-08-09 (historical)
 
 > **Execution update:** the Node 2 `ceiling-r2` neural-league pilot completed
 > 300 PPO iterations but failed its fresh gate (`0.539` trained versus `0.504`
 > init; `+0.071` required). It is negative evidence for that mixture and
-> hyperparameter setting, not a candidate. Node 1 remains unaccepted; keep the
-> immutable C=40/context incumbent as the reference.
+> hyperparameter setting, not a candidate. The later 8x32 self-play champion
+> and active 8x64 capacity arm supersede the run state below. Read
+> [docs/CURRENT-STATUS-2026-08-11.md](CURRENT-STATUS-2026-08-11.md) before
+> launching anything.
 
 ## Decision
 

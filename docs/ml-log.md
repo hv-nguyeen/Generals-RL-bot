@@ -3,10 +3,29 @@
 Running log so nothing gets tried twice. Every entry needs a measured number, not
 an impression. If an entry has no number it does not belong here.
 
-Last updated 2026-08-09.
+Last updated 2026-08-11.
 
-**For the current state and what to do next, read `docs/STATE.md`.** This file is
-the full measured history and the reasoning; that one is the short version.
+**For live operations, read `docs/CURRENT-STATUS-2026-08-11.md`.** This file is
+the full measured history and reasoning; `docs/STATE.md` is the historical
+summary.
+
+## CURRENT CHECKPOINT — 2026-08-11
+
+The first continuation arm that cleared the direct incumbent test is the
+stage-4-to-5 self-play run
+`/local/data/vng205/top3-v3/selfplay-stage4-1000-node1/selfplay.npz`.
+Its policy SHA-256 is
+`3b3b707fc064635ae0448f021e0e0bef8136d963369b09caffe0c1aed637c028`.
+The final gate was `0.588` trained versus `0.500` initialization over 1,600
+fresh competition-distance games. A separate 2,000-game arena comparison
+against the previous incumbent returned `1145W 22D 833L`, score `0.578`, and
+`+54.6 Elo` (95% CI `[+24.6,+85.5]`).
+
+The active follow-up is a function-preserving 8x64 width arm initialized from
+the accepted policy and matched critic. It starts at stage 4, uses 256 games
+per iteration and minibatch 4096, and is not a promoted candidate until the
+fresh incumbent and promotion gates pass. This entry records a local result,
+not a ladder claim.
 
 ## SOLVED 2026-08-08: self-play does NOT unlearn castles. The critic did.
 

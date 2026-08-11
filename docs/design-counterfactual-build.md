@@ -1,9 +1,11 @@
 # Final design review: counterfactual build supervision mixed into PPO
 
-> **Status 2026-08-09:** deferred research design. The current r3 training arms
+> **Status 2026-08-11:** deferred research design. The current training arms
 > do not use this term. The measured incumbent/critic continuation and neural
 > league should be evaluated first; do not add counterfactual build shaping to a
 > live run without repeating the pre-flight sign test and a matched ablation.
+> The accepted champion and active capacity run are tracked in
+> [docs/CURRENT-STATUS-2026-08-11.md](CURRENT-STATUS-2026-08-11.md).
 
 ## 1. Verdict
 

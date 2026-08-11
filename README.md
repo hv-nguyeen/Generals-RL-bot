@@ -9,33 +9,38 @@ observation-only temporal memory. The heuristic remains in
 `bot/policy/controller.py` as a fallback and benchmark opponent
 (`ours:configs/v16.json`), but is not the submission.
 
-## Current training status — 2026-08-09
+## Current training status — 2026-08-11
 
-The verified source bundle is r3 (`5997415`). The immutable strong starting
-policy is `runs/top3-v2/incumbent-refresh-onpolicy.npz` with its matched
-`incumbent-refresh-onpolicy.critic.npz`; the policy hash is
-`cb8d2bfa9cff1f03f6b6f67245e322f149bf7e958a03e0c1c489e7fd4099f386`.
-It beat the archived sp16 incumbent by +106 Elo over 2,000 local games, but
-that is not a ladder or top-three claim.
+The accepted local champion is the stage-4-to-5 self-play checkpoint
+`/local/data/vng205/top3-v3/selfplay-stage4-1000-node1/selfplay.npz`
+(8x32, about 80k policy parameters), with its matched critic. Its policy
+SHA-256 is
+`3b3b707fc064635ae0448f021e0e0bef8136d963369b09caffe0c1aed637c028`.
+It passed a 1,600-game final gate at `0.588` versus `0.500` initialization
+and then beat the previous incumbent in 2,000 games at `0.578`
+(`+54.6 Elo`, 95% CI `[+24.6,+85.5]`). This is local evidence, not a live
+ladder or top-three claim.
 
-Two deliberately different continuation arms were launched from that same
-pair:
+The active experiment is a function-preserving 8x64 growth arm, initialized
+from that accepted policy/critic:
 
-- **Node 1:** `learn.selfplay` at competition distance. `--opp` is evaluation
-  only; the training seats are mirror self-play. It has not passed its stage
-  gate; its latest observed Stage-5 transition was forced at the iteration cap.
-- **Node 2:** `learn.league --oracle net`, which actually samples the opponent
-  archive (including `clone:$P`) during training. Its final gate was rejected:
-  trained `0.539` versus init `0.504`, below the required `+0.071`.
+- policy: `/local/data/vng205/top3-v3/champion-8x64.npz`
+- critic: `/local/data/vng205/top3-v3/champion-8x64.critic.npz`
+- run: `/local/data/vng205/top3-v3/selfplay-8x64-stage4-1500-node1-g256`
+- recipe: stage 4 start, 1,500 iterations, 256 games/iteration, minibatch 4096
 
-Neither run overwrote the incumbent, and Node 2 produced no promotable candidate.
-A candidate is promotable only after a fresh direct `ship:candidate` versus
-`ship:incumbent` test, pinned rush tests, and the unchanged promotion suite.
-`eval` or `comp-eval` against weak bots is not sufficient evidence of a higher
-ceiling.
+The 8x64 arm is not promoted yet. Keep the accepted champion immutable until a
+candidate passes a fresh direct incumbent test, pinned snipe checks, and the
+versioned promotion suite. `comp-eval` against weak bots is a progress signal,
+not a promotion decision.
 
-**Read [`docs/TOP3-V2-HANDOFF.md`](docs/TOP3-V2-HANDOFF.md) first.** It is the
-current implementation, gates, exact training sequence, and verification handoff.
+The complete current state, monitoring commands, memory policy, installation
+invariant, and search limitations are in
+[`docs/CURRENT-STATUS-2026-08-11.md`](docs/CURRENT-STATUS-2026-08-11.md).
+
+**Read [`docs/CURRENT-STATUS-2026-08-11.md`](docs/CURRENT-STATUS-2026-08-11.md)**
+first for operations, then [`docs/TOP3-V2-HANDOFF.md`](docs/TOP3-V2-HANDOFF.md)
+for implementation and gate details.
 [`docs/STATE.md`](docs/STATE.md) remains the measured history. This README is the
 map of the tooling. [`docs/CLUSTER.md`](docs/CLUSTER.md) is how to run anything on
 the VU box. [`docs/ml-log.md`](docs/ml-log.md) is the full measured history.
@@ -256,8 +261,9 @@ digest-pinned command above.
 
 The last recorded leaderboard snapshot is historical, not a live claim. Keep the
 leaderboard JSON and exact submitted ZIP with every release; local arena Elo does
-not substitute for a fresh ladder sample. The current v2 work has a strong local
-incumbent and two in-progress continuation arms, but no new candidate has yet
+not substitute for a fresh ladder sample. The current work has one accepted local
+8x32 champion and one active 8x64 capacity arm; the latter is not a promoted
+candidate until it passes the direct incumbent and promotion gates.
 passed the full promotion suite.
 
 Two things worth knowing before running anything:

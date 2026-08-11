@@ -1,6 +1,19 @@
-# Where the project is — 2026-08-09
+# Where the project is — 2026-08-11
 
-## Current operational state
+> **Current operational state:** read [CURRENT-STATUS-2026-08-11.md](CURRENT-STATUS-2026-08-11.md)
+> first. The older operational paragraphs below are retained as 2026-08-09
+> experiment history and are not the current champion/run description.
+
+The accepted local champion is
+/local/data/vng205/top3-v3/selfplay-stage4-1000-node1/selfplay.npz with policy
+SHA-256 3b3b707fc064635ae0448f021e0e0bef8136d963369b09caffe0c1aed637c028.
+It passed the final gate at 0.588 versus 0.500 initialization and beat the
+previous incumbent by +54.6 Elo in a fresh 2,000-game arena comparison.
+The active experiment is a function-preserving 8x64 growth arm from that pair,
+started at stage 4 for 1,500 iterations with 256 games per iteration. It is
+not promoted yet.
+
+## 2026-08-09 operational state (historical)
 
 The verified r3 source is committed at `5997415` and installed on two compute
 nodes. The immutable local starting policy is

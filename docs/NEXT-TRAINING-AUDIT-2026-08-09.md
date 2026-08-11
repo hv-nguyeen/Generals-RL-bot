@@ -1,5 +1,14 @@
 # Next-training audit and continuation experiments — 2026-08-09
 
+> **Superseded operational state (2026-08-11):** the accepted local champion is
+> /local/data/vng205/top3-v3/selfplay-stage4-1000-node1/selfplay.npz
+> (policy SHA-256 3b3b707fc064635ae0448f021e0e0bef8136d963369b09caffe0c1aed637c028).
+> It passed its final gate at 0.588 versus 0.500 initialization and beat the
+> previous incumbent by +54.6 Elo over 2,000 fresh games. The active experiment
+> is a function-preserving 8x64 growth arm from stage 4, 1,500 iterations,
+> 256 games/iteration. Use [CURRENT-STATUS-2026-08-11.md](CURRENT-STATUS-2026-08-11.md)
+> for current commands; this file remains the 2026-08-09 audit record.
+
 This is the verification handoff for the source after checkpoint commit
 `5997415` (`fix: harden neural training and promotion`). It separates reproduced
 correctness defects from strategic hypotheses. None of the code changes below

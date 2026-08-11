@@ -1,12 +1,15 @@
 # generals.bot competition bot
 
-Read `README.md` first, then `docs/superpowers/specs/2026-08-03-generals-bot-design.md`
-for the rules analysis. `third_party/generals-bots` is the official starter kit —
-it is the ground truth for every rule; read the engine source, not the rules page.
+Read `README.md` first and then
+`docs/CURRENT-STATUS-2026-08-11.md` for the live operational state.
+`docs/superpowers/specs/2026-08-03-generals-bot-design.md` contains the rules
+analysis. `third_party/generals-bots` is the official starter kit — it is the
+ground truth for every rule; read the engine source, not the rules page.
 
-**Start with `docs/TOP3-V2-HANDOFF.md`**, then `docs/STATE.md` for the measured
-history and non-starters. `docs/CLUSTER.md` is how to install and run on the VU
-box.
+**Start with `docs/CURRENT-STATUS-2026-08-11.md`**, then
+`docs/TOP3-V2-HANDOFF.md` for implementation gates and `docs/STATE.md` for
+the measured history and non-starters. `docs/CLUSTER.md` is how to install
+and run on the VU box.
 
 Three things that cost the most time when forgotten:
 
@@ -48,12 +51,18 @@ richer heuristic belief. `tools.evaluate.py` owns promotion.
 
 ## Current training split
 
-The current incumbent is the C=40/context continuation checkpoint
-`runs/top3-v2/incumbent-refresh-onpolicy.npz` with its matching critic. Node 1's
-`learn.selfplay` run is a mirror-self-play/economy arm; its `--opp` list is
-measurement-only. Node 2's `learn.league --oracle net` run is the adversarial
-mixture arm; its `clone:` archive members affect training. Do not confuse a high
-win rate against weak heuristic opponents with a higher ceiling, and do not
-replace the incumbent before fresh direct tests. The `ceiling-r2` pilot completed
-and failed its gate (`0.539` trained vs `0.504` init; `+0.071` required), so it is
-not a candidate.
+The accepted local champion is
+`/local/data/vng205/top3-v3/selfplay-stage4-1000-node1/selfplay.npz` with its
+matched critic (policy SHA-256
+`3b3b707fc064635ae0448f021e0e0bef8136d963369b09caffe0c1aed637c028`). The
+active arm grows that pair function-preservingly to 8x64 and trains from stage 4
+for 1,500 iterations with 256 games per iteration. It is a capacity experiment,
+not a replacement yet.
+
+`learn.selfplay --opp` is evaluation-only; the training seats are mirror
+self-play. `learn.league --oracle net` is the separate adversarial-mixture arm
+where `clone:` archive members affect rollouts. Do not confuse a high win rate
+against weak heuristic opponents with a higher ceiling, and do not replace the
+accepted champion before fresh direct tests and the promotion suite pass. The
+shallow `SearchPolicy` and heuristic belief are research scaffolding; no learned
+belief-network or multi-ply search is shipped by default.

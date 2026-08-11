@@ -1,6 +1,6 @@
 # Brief for Codex: architecture review and redesign of the training stack
 
-> **Status 2026-08-09:** this is an architecture-review prompt and historical
+> **Status 2026-08-11:** this is an architecture-review prompt and historical
 > backlog, not a current runbook. The verified implementation is commit
 > `5997415`; read `README.md`, `docs/STATE.md`, `docs/TOP3-V2-HANDOFF.md`, and
 > `docs/CLUSTER.md` for the current two-node training arms. Re-check every
@@ -8,7 +8,12 @@
 > fixes described below have since landed, while the research proposals remain
 > intentionally deferred. The Node 2 `ceiling-r2` pilot is now a completed,
 > rejected experiment (`0.539` trained vs `0.504` init; `+0.071` required), and
-> Node 1 has no promotion result.
+> The 2026-08-09 Node 1 arm had no promotion result; the later accepted 8x32
+> self-play checkpoint is recorded in the live-status document below.
+>
+> The live operational state is in
+> `docs/CURRENT-STATUS-2026-08-11.md`. The accepted 8x32 self-play champion is
+> the immutable baseline for an active function-preserving 8x64 capacity arm.
 
 Paste this whole file as the prompt. It is self-contained: it carries the
 measurements you need so you do not re-derive them, and the list of things this
@@ -23,14 +28,16 @@ then implementing the changes you can justify. The repository is at the path you
 have been given. Read in this order before writing anything:
 
 1. `CLAUDE.md` — the non-negotiables. They override anything in this brief.
-2. `docs/ml-log.md` — every ML attempt and local instrument that has failed, each
+2. `docs/CURRENT-STATUS-2026-08-11.md` — the live checkpoint, run, and
+   monitoring state.
+3. `docs/ml-log.md` — every ML attempt and local instrument that has failed, each
    with the measured reason. **This is the single most important file.** Six ML
    attempts and nine evaluation instruments have failed here. The log exists so
    none of them gets tried a seventh time.
-3. `docs/STATE.md` — measured history and non-starters.
-4. `docs/TOP3-V2-HANDOFF.md` — the current pipeline design.
-5. `docs/NEXT-TRAINING-AUDIT-2026-08-09.md` — the most recent verification pass.
-6. `docs/CLUSTER.md` — how to run anything expensive.
+4. `docs/STATE.md` — measured history and non-starters.
+5. `docs/TOP3-V2-HANDOFF.md` — the current pipeline design.
+6. `docs/NEXT-TRAINING-AUDIT-2026-08-09.md` — the most recent verification pass.
+7. `docs/CLUSTER.md` — how to run anything expensive.
 
 Then read the code: `bot/policy/net.py`, `bot/features.py`, `bot/memory.py`,
 `learn/train.py`, `learn/selfplay.py`, `learn/netoracle.py`, `learn/valuetrain.py`,
