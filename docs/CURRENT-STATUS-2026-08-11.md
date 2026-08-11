@@ -111,6 +111,16 @@ Use Node 2 for a separate seed/algorithm arm if more compute is available. Do
 not run two trainers on one L4, and do not copy venvs or replay lakes through
 shared home.
 
+The next Node 2 arm should use the already-verified strategic module:
+`tools.grow --strategy-hidden 64` adds global/3x3 region interactions and
+residual spatial refinement while preserving the accepted 8x32 policy at
+initialization. Train that pair with `learn.league --oracle net` against at
+least the accepted champion, the previous incumbent, and generated hunter/
+greedy/expander anchors. Set `--nn-sigma-floor 0.50`; a startup line reporting
+raw support 1 means the run has collapsed to single-opponent PPO and should not
+be trusted. Use terminal reward and the matched critic, then require the same
+fresh direct incumbent test before promotion.
+
 ## Promotion rule
 
 For every candidate, first run a fresh direct test against the accepted
