@@ -114,12 +114,14 @@ shared home.
 The next Node 2 arm should use the already-verified strategic module:
 `tools.grow --strategy-hidden 64` adds global/3x3 region interactions and
 residual spatial refinement while preserving the accepted 8x32 policy at
-initialization. Train that pair with `learn.league --oracle net` against at
-least the accepted champion, the previous incumbent, and generated hunter/
-greedy/expander anchors. Set `--nn-sigma-floor 0.50`; a startup line reporting
-raw support 1 means the run has collapsed to single-opponent PPO and should not
-be trusted. Use terminal reward and the matched critic, then require the same
-fresh direct incumbent test before promotion.
+initialization. First train this pair with ordinary staged `learn.selfplay`
+using the same curriculum and evaluation protocol as the accepted champion.
+That isolates the architecture change. Only if that candidate passes the fresh
+incumbent test should it enter `learn.league --oracle net` against the accepted
+champion, previous incumbent, and generated hunter/greedy/expander anchors. In
+that second phase set `--nn-sigma-floor 0.50`; raw support 1 means single-
+opponent PPO and should not be trusted. Keep terminal reward and the matched
+critic in both phases.
 
 ## Promotion rule
 
