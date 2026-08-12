@@ -458,7 +458,21 @@ class ValueNet:
     """
 
     def __init__(self, path: str):
-        z = np.load(path)
+        raw = np.load(path)
+        files = set(raw.files)
+        bare = "conv0_w" in files
+        prefixed = "phi__conv0_w" in files
+        if bare and prefixed:
+            raise ValueError(f"{path}: contains both bare and phi__ critic arrays")
+        if not bare and prefixed:
+            # PPO saves its matched critic under ``phi__*`` so policy and value
+            # arrays cannot be confused in a resume file.  Deployment search
+            # historically accepted only standalone valuetrain checkpoints,
+            # which made the accepted policy's actual matched critic impossible
+            # to audit.  Strip the namespace in memory; never rewrite the source.
+            z = {k[5:]: raw[k] for k in raw.files if k.startswith("phi__")}
+        else:
+            z = raw
         self.layers, self.arch = _load_trunk(z)
         stem_c = self.layers[0][0].shape[1]
         if stem_c in features.LEGACY_INPUT_CHANNELS and features.C > stem_c:
@@ -473,14 +487,27 @@ class ValueNet:
         self.head_b = float(z["v_b"])
         self.value_residual = None
         residual_keys = {"v_res1_w", "v_res1_b", "v_res2_w", "v_res2_b"}
-        present = residual_keys & set(z.files)
+        value_files = set(getattr(z, "files", z))
+        present = residual_keys & value_files
         if present and present != residual_keys:
             raise ValueError(f"{path}: incomplete residual value head: {sorted(present)}")
         if present:
             self.value_residual = tuple(np.asarray(z[k], np.float32) for k in
                                         ("v_res1_w", "v_res1_b",
                                          "v_res2_w", "v_res2_b"))
-        self.schema = int(z["value_schema"]) if "value_schema" in z.files else 1
+        if "value_schema" in value_files:
+            self.schema = int(z["value_schema"])
+        else:
+            # Online PPO critics predate the standalone value-schema marker but
+            # use valuetrain's 11-block (mean, max, 3x3 means) pooled head.  Its
+            # width is unambiguous, so infer it instead of misreading a 352-wide
+            # 32-channel head as the legacy 32-wide global-mean head.
+            pooled_width = self.arch["channels"] * (2 + 3 * 3)
+            self.schema = 2 if self.head_w.shape[0] == pooled_width else 1
+        if self.schema >= 2 and self.head_w.ndim != 1:
+            raise ValueError(
+                f"{path}: distributional PPO critic head {self.head_w.shape} "
+                "cannot be used as a scalar ValueNet")
         self.context_global = (z["context_global"].astype(np.float32)
                                if self.arch["context"] else None)
         self.context_region = (z["context_region"].astype(np.float32)

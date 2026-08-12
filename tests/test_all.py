@@ -1017,6 +1017,66 @@ def test_value_pooling_matches_numpy_and_jax():
     assert np.max(np.abs(got - want)) < 2e-6
 
 
+def test_searchprobe_uses_paired_uncertainty_and_real_critic_layout():
+    """A noisy candidate is not a target; matched phi__ critics remain auditable."""
+    import tempfile
+    from pathlib import Path
+
+    from bot import features
+    from bot.policy.net import ValueNet, arch_record
+    from tools.searchprobe import _summary, pair_accuracy, robust_slot
+
+    z = np.asarray([
+        [0.0, 0.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0, 1.0],
+        [1.0, -1.0, 1.0, -1.0],
+    ], np.float32)
+    slot, mean, lower = robust_slot(z, confidence=2.0)
+    assert slot == 1 and mean[1] == lower[1] == 1.0
+    assert lower[2] < 0.0, "paired variance must reject the noisy apparent gain"
+    assert robust_slot(z[:, :1], confidence=0.0)[0] == 1
+    assert robust_slot(z[:, :1], confidence=2.0)[0] == 0
+    assert pair_accuracy([0.8, 0.1, -0.5], [0.2, 0.0, -0.1]) == (3, 3)
+    rows = [
+        {"actions": np.arange(3), "returns": z, "selected": 1,
+         "lower": np.asarray([0.0, 1.0, -0.1]), "seed": 10},
+        {"actions": np.arange(3), "returns": z[[0, 2, 1]], "selected": 2,
+         "lower": np.asarray([0.0, -0.1, 1.0]), "seed": 11},
+    ]
+    summary = _summary(rows, critic=False, topk=3)
+    assert summary["schema_version"] == 2
+    assert summary["robust_lcb_gain"] == 1.0
+    assert summary["oracle_best_at_topk_boundary_frac"] == 0.5
+    assert "robust_gain_same_samples" in summary and "robust_gain" not in summary
+    # The second row's noisy candidate ties on one selection half and loses on
+    # its untouched half, so cross-fitting correctly cuts the apparent gain.
+    assert summary["crossfit_robust_gain"] == 0.5
+    assert summary["crossfit_greedy_gain"] == 0.5
+
+    # selfplay saves the matched critic under phi__* and without value_schema.
+    # Its 11*C head identifies the pooled schema unambiguously.
+    rng = np.random.default_rng(81)
+    ch = 3
+    p = {
+        "conv0_w": rng.normal(size=(ch, features.C, 3, 3)).astype(np.float32) * .01,
+        "conv0_b": np.zeros(ch, np.float32),
+        "v_w": rng.normal(size=11 * ch).astype(np.float32) * .01,
+        "v_b": np.float32(0.0),
+    }
+    p.update(arch_record(p))
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "matched.critic.npz"
+        # Resume files contain only optimiser/model arrays under phi__; arch
+        # metadata is not part of phi and must not be required for inference.
+        np.savez(path, **{f"phi__{k}": v for k, v in p.items()
+                         if k not in arch_record(p)})
+        critic = ValueNet(str(path))
+        assert critic.schema == 2
+        x = np.zeros((features.C, features.PAD, features.PAD), np.float32)
+        x[features.VALID, :18, :19] = 1.0
+        assert np.isfinite(critic.value_encoded(x))
+
+
 def test_the_training_seam_matches_the_submission():
     """Step both engines in lockstep and compare what a JAX rollout would feed a
     policy: the observation, the encoder, the legal mask and the flat action map.
@@ -1202,7 +1262,9 @@ def test_the_trainers_check_themselves():
         print("  SKIPPED (no jax): the trainer and the vectorised rollout are "
               "UNCHECKED in this run")
         return
-    from learn import train, vecroll
+    from learn import qdistil, qrank, train, vecroll
+    qrank.selfcheck()
+    qdistil.selfcheck()
     train.selfcheck()
     vecroll.selfcheck()
 
