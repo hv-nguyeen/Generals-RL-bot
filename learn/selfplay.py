@@ -972,6 +972,21 @@ def load_critic(path: str, arch: dict, blank: dict) -> dict:
     residual_keys = {"v_res1_w", "v_res1_b", "v_res2_w", "v_res2_b"}
     if not (residual_keys & set(got)) and residual_keys <= set(blank):
         got.update({k: np.asarray(blank[k]) for k in residual_keys})
+    # Grow conv0's INPUT channels when the observation width changed (a new input
+    # plane was added). Zero-pad the new channels so the critic's value function
+    # is preserved bit-for-bit and learns the new plane from the next update --
+    # the same migration the policy stem gets in netoracle, and the reason the
+    # prior width lives in features.LEGACY_INPUT_CHANNELS. Without this a
+    # champion critic one plane behind cannot warm-start a wider-input run, and
+    # --oracle net refuses to start without a matching critic.
+    if ("conv0_w" in got and "conv0_w" in blank
+            and np.shape(got["conv0_w"])[1] != np.shape(blank["conv0_w"])[1]
+            and np.shape(got["conv0_w"])[1] in features.LEGACY_INPUT_CHANNELS
+            and np.shape(blank["conv0_w"])[1] == features.C):
+        old = np.asarray(got["conv0_w"], dtype=np.float32)
+        grown = np.zeros_like(blank["conv0_w"], dtype=np.float32)
+        grown[:, :old.shape[1]] = old
+        got["conv0_w"] = grown
     if set(got) != set(blank):
         missing = sorted(set(blank) - set(got)) or None
         extra = sorted(set(got) - set(blank)) or None

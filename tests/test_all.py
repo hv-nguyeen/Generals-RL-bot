@@ -1396,6 +1396,34 @@ def test_topology_teaching_flags_trapped_stack():
     assert not netoracle._topology_risk(won, min_trapped=0.05, min_army=15)
 
 
+def test_critic_warm_start_migrates_input_channels():
+    """A champion critic one observation-plane behind must zero-pad its stem to
+    the current width, exactly like the policy, so --oracle net can warm-start
+    it (it refuses to run without a matching critic)."""
+    import tempfile
+    from pathlib import Path
+
+    import jax
+
+    from bot import features
+    from learn import valuetrain as vt
+    from learn.selfplay import load_critic
+
+    arch = {"layers": 4, "channels": 16, "residual": False, "context": False}
+    blank = {k: np.asarray(v) for k, v in
+             vt.init_params(jax.random.PRNGKey(0), arch, value_hidden=32).items()}
+    assert blank["conv0_w"].shape[1] == features.C            # built at current width
+    old = {k: np.asarray(v).copy() for k, v in blank.items()}
+    old["conv0_w"] = old["conv0_w"][:, :features.C - 1].copy()  # a plane behind
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "oldcritic.npz"
+        np.savez(p, **old)
+        got = load_critic(str(p), arch, blank)
+    assert got["conv0_w"].shape == blank["conv0_w"].shape
+    assert np.array_equal(got["conv0_w"][:, :features.C - 1], old["conv0_w"])
+    assert not got["conv0_w"][:, features.C - 1:].any()       # new plane starts neutral
+
+
 def test_frontier_field_open_board_is_reachable():
     """On open ground every owned cell has a finite distance to unowned frontier."""
     passable = np.ones((3, 3), dtype=bool)
