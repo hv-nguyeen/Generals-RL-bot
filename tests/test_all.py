@@ -14,7 +14,7 @@ import numpy as np
 
 from bot import rules
 from bot.belief import Belief
-from bot.board import bfs_field_from, room_field
+from bot.board import bfs_field_from, frontier_field, room_field
 from sim import engine, mapgen
 
 
@@ -326,6 +326,27 @@ def test_neural_strategic_planes_contain_spawn_distance_and_build_price():
                               | (obs.type_grid == rules.T_CASTLE))
         expected = np.log1p(rules.build_cost_grid(structures)) / 6.0
         assert np.allclose(x[features.BUILD_COST, :obs.H, :obs.W], expected)
+
+
+def test_frontier_plane_encodes_normalized_distance_to_open_ground():
+    from bot import board, features
+    from bot.memory import TemporalMemory
+
+    for seed in range(4):
+        grid = mapgen.generate(seed)
+        st = engine.from_grid(grid)
+        obs = engine.observe(st, 0)
+        mem = TemporalMemory(*grid.shape)
+        mem.update(obs)
+        x = features.encode(obs, mem)
+        passable = ~mem.known_mountains
+        owned = obs.owner_grid == rules.OWNER_ME
+        expected = np.clip(
+            board.frontier_field(passable, owned).astype(np.float32)
+            / (2.0 * features.PAD), 0.0, 1.0)
+        got = x[features.FRONTIER_DIST, :obs.H, :obs.W]
+        assert np.allclose(got, expected), f"seed {seed} frontier plane mismatch"
+        assert got.min() >= 0.0 and got.max() <= 1.0
 
 
 def test_legacy_encoded_rows_zero_extend_without_inventing_history():
@@ -651,8 +672,14 @@ def test_a_checkpoint_states_its_own_architecture():
         # "architecture": the head would die later in a broadcast against the
         # legal mask, the stem in a BLAS shape error inside _conv3x3 -- both
         # mid-match, from lines that name neither the file nor the reason.
+        # A width one channel short of C is only "stale" if it is not one of the
+        # migratable LEGACY_INPUT_CHANNELS -- those zero-extend on load by design.
+        # Pick the nearest width below C that has no migration, so this stays an
+        # unloadable-observation test even as legacy widths accumulate.
+        stale_cin = next(c for c in range(features.C - 1, 0, -1)
+                         if c not in features.LEGACY_INPUT_CHANNELS)
         for name, kw in (("stale_head.npz", {"per_cell": features.PER_CELL - 1}),
-                         ("stale_obs.npz", {"cin": features.C - 1})):
+                         ("stale_obs.npz", {"cin": stale_cin})):
             p = weights(4, 32, False, **kw)
             np.savez(td / name, **p, **npnet.arch_record(p))
 
@@ -804,6 +831,19 @@ def test_league_forwards_safe_neural_optimizer_settings():
     assert value("--defense-tail-turns") == "48"
     assert value("--defense-hidden-ratio") == "3.0"
     assert value("--defense-margin") == "0.1"
+
+    # Topology arm is off by default (absent flag) and forwarded when enabled.
+    assert "--topology-counterfactual" not in cmd
+    args.nn_topology_counterfactual = True
+    args.nn_topology_mobility_w = 0.2
+    args.nn_topology_min_trapped = 0.5
+    args.nn_topology_min_army = 20
+    cmd = net_oracle_command(args, Path("oracle.npz"), Path("league.json"),
+                             "maps.json", 2)
+    assert "--topology-counterfactual" in cmd
+    assert value("--topology-mobility-w") == "0.2"
+    assert value("--topology-min-trapped") == "0.5"
+    assert value("--topology-min-army") == "20"
 
 
 def test_league_default_lambda_resume_migration_is_narrow():
@@ -1302,6 +1342,105 @@ def test_ppo_dihedral_observation_and_action_relabel_commute():
             assert np.array_equal(equivariant(moved_x[0])[mapped], base[active]), \
                 f"observation gather and action relabel disagree at {h}x{w}, g={g}"
             assert moved_mask[0, moved_idx[0]], f"sampled action illegal at g={g}"
+
+
+def _pocket_obs(stack_at, stack_army=40):
+    """A tiny hand-built Obs: our stack in a 3-sided owned mountain nook, one
+    exit corridor of owned cells leading to open neutral ground on the right."""
+    from bot.obs import Obs
+    h, w = 5, 6
+    typ = np.full((h, w), rules.T_PLAIN, dtype=np.int8)
+    typ[1, 1:4] = rules.T_MOUNTAIN                      # walls of the nook
+    typ[3, 1:4] = rules.T_MOUNTAIN
+    typ[2, 3] = rules.T_MOUNTAIN
+    own = np.zeros((h, w), dtype=np.int8)
+    army = np.zeros((h, w), dtype=np.int32)
+    own[2, 0:3] = rules.OWNER_ME                        # owned corridor out of the nook
+    own[2, 0] = rules.OWNER_ME
+    typ[2, 0] = rules.T_GENERAL                         # our general at the mouth
+    army[2, 0] = 5
+    r, c = stack_at
+    own[r, c] = rules.OWNER_ME
+    army[r, c] = stack_army                             # the big stack
+    # open neutral frontier on the far right, reachable via row 2
+    return Obs(H=h, W=w, turn=200, my_land=4, my_army=int(army.sum()),
+               opp_land=4, opp_army=30, type_grid=typ,
+               owner_grid=own, army_grid=army)
+
+
+# --- frontier topology --------------------------------------------------------
+def test_topology_teaching_flags_trapped_stack():
+    """The teaching signal must read a stack deep in the nook as trapped, and the
+    same stack out on the corridor toward open ground as free."""
+    from learn import netoracle
+    trapped = _pocket_obs((2, 2))                       # deep in the dead-end
+    free = _pocket_obs((2, 0))                          # at the mouth, by the exit
+    t_trapped = netoracle._frontier_trappedness(trapped)
+    t_free = netoracle._frontier_trappedness(free)
+    assert t_trapped > t_free, (t_trapped, t_free)
+    # Default min_trapped (0.4) is scaled to a real 21x21 board; on this 5x6
+    # fixture the largest reachable distance is a few steps, so scale the gate.
+    assert netoracle._topology_risk(trapped, min_trapped=0.05, min_army=15)
+    assert not netoracle._topology_risk(free, min_trapped=0.05, min_army=15)
+
+    # A board where we own every reachable tile is a won region, not a trap: no
+    # frontier exists, so trappedness reads 0 and no label is earned.
+    from bot.obs import Obs
+    h, w = 4, 4
+    won = Obs(H=h, W=w, turn=200, my_land=h * w, my_army=h * w * 50,
+              opp_land=0, opp_army=0,
+              type_grid=np.full((h, w), rules.T_PLAIN, dtype=np.int8),
+              owner_grid=np.full((h, w), rules.OWNER_ME, dtype=np.int8),
+              army_grid=np.full((h, w), 50, dtype=np.int32))
+    assert netoracle._frontier_trappedness(won) == 0.0
+    assert not netoracle._topology_risk(won, min_trapped=0.05, min_army=15)
+
+
+def test_frontier_field_open_board_is_reachable():
+    """On open ground every owned cell has a finite distance to unowned frontier."""
+    passable = np.ones((3, 3), dtype=bool)
+    owned = np.zeros((3, 3), dtype=bool)
+    owned[0, 0] = True                                 # one owned cell, rest frontier
+    dist = frontier_field(passable, owned)
+    assert dist[0, 0] == 1                             # a frontier neighbour is one step
+    assert dist[2, 2] == 0                             # unowned cells are the frontier
+
+
+def test_frontier_field_sealed_pocket_is_unreachable():
+    """An owned cell walled off from all unowned ground gets the sentinel."""
+    h, w = 5, 5
+    passable = np.ones((h, w), dtype=bool)
+    # Ring of mountains isolating the centre cell.
+    passable[1, 1:4] = False
+    passable[3, 1:4] = False
+    passable[1:4, 1] = False
+    passable[1:4, 3] = False
+    owned = np.zeros((h, w), dtype=bool)
+    owned[2, 2] = True                                 # trapped in its own 1-cell room
+    dist = frontier_field(passable, owned)
+    assert dist[2, 2] == h * w                         # sentinel: no reachable frontier
+
+
+def test_frontier_field_dead_end_points_out():
+    """A stack deep in an owned dead-end still has a finite path to frontier."""
+    from bot.board import step_toward
+    passable = np.ones((1, 5), dtype=bool)
+    owned = np.zeros((1, 5), dtype=bool)
+    owned[0, 0:3] = True                               # owned corridor, frontier at 3,4
+    dist = frontier_field(passable, owned)
+    assert dist[0, 0] == 3                             # three steps to the nearest frontier
+    assert step_toward(dist, 0, 0) == 3                # RIGHT, toward the frontier
+
+
+def test_frontier_field_routes_around_mountains():
+    """Distance follows passable ground, never through a mountain."""
+    passable = np.ones((3, 3), dtype=bool)
+    passable[0, 1] = False                             # wall between (0,0) and (0,2)
+    passable[1, 1] = False
+    owned = np.ones((3, 3), dtype=bool)
+    owned[2, 2] = False                                # sole frontier in the far corner
+    dist = frontier_field(passable, owned)
+    assert dist[0, 0] == 4                             # (0,0)->(1,0)->(2,0)->(2,1)->(2,2)
 
 
 def main() -> None:

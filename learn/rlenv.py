@@ -221,9 +221,19 @@ def strategic_planes_jax(obs, memory, valid):
                      / (2.0 * features.PAD), 0.0, 1.0)
             * (~memory["known_mountains"]).astype(jnp.float32)
             if memory is not None else zeros)
+    # Distance to the nearest unowned passable tile; mirror of the numpy
+    # FRONTIER_DIST plane in features.strategic_planes. Same passable set and
+    # BFS as dist_home, so the clip-at-2*PAD parity argument carries over.
+    if memory is not None:
+        passable = ~memory["known_mountains"]
+        fdist = _bfs_field_jax(passable, passable & ~obs.owned_cells)
+        frontier = jnp.clip(fdist.astype(jnp.float32) / (2.0 * features.PAD),
+                            0.0, 1.0)
+    else:
+        frontier = zeros
     structures = obs.owned_cells & (obs.generals | obs.castles)
     cost = jnp.log1p(build_cost_grid_jax(structures).astype(jnp.float32)) / 6.0
-    return jnp.stack([prior, dist, cost]) * valid[None]
+    return jnp.stack([prior, dist, cost, frontier]) * valid[None]
 
 
 def encode_jax(obs, valid_h, valid_w, memory=None):

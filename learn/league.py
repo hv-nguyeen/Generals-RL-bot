@@ -616,6 +616,11 @@ def net_oracle_command(args, npz: Path, ckpt: Path,
                 "--defense-cf-stride", str(getattr(args, "nn_defense_cf_stride", 8)),
                 "--defense-cf-min-turn", str(getattr(args, "nn_defense_cf_min_turn", 80)),
                 "--defense-cf-risk-ratio", str(getattr(args, "nn_defense_cf_risk_ratio", 1.25))]
+    if getattr(args, "nn_topology_counterfactual", False):
+        cmd += ["--topology-counterfactual",
+                "--topology-mobility-w", str(getattr(args, "nn_topology_mobility_w", 0.0)),
+                "--topology-min-trapped", str(getattr(args, "nn_topology_min_trapped", 0.4)),
+                "--topology-min-army", str(getattr(args, "nn_topology_min_army", 15))]
     if args.nn_init_critic:
         cmd += ["--init-critic", args.nn_init_critic]
     if args.nn_augment:
@@ -841,6 +846,10 @@ def migrate_resume_params(saved: dict | None, current: dict) -> dict | None:
                          ("nn_defense_cf_stride", 8),
                          ("nn_defense_cf_min_turn", 80),
                          ("nn_defense_cf_risk_ratio", 1.25),
+                         ("nn_topology_counterfactual", False),
+                         ("nn_topology_mobility_w", 0.0),
+                         ("nn_topology_min_trapped", 0.4),
+                         ("nn_topology_min_army", 15),
                          ("nn_policy_scope", "all")):
         if key not in out and current.get(key) == default:
             out = {**out, key: default}
@@ -1065,6 +1074,12 @@ def main() -> None:
     ap.add_argument("--nn-defense-cf-stride", type=int, default=8)
     ap.add_argument("--nn-defense-cf-min-turn", type=int, default=80)
     ap.add_argument("--nn-defense-cf-risk-ratio", type=float, default=1.25)
+    ap.add_argument("--nn-topology-counterfactual", action="store_true",
+                    help="teach the marooned-stack backtrack via engine branches "
+                         "(needs --nn-defense-aux-weight>0 and mobility-w>0)")
+    ap.add_argument("--nn-topology-mobility-w", type=float, default=0.0)
+    ap.add_argument("--nn-topology-min-trapped", type=float, default=0.4)
+    ap.add_argument("--nn-topology-min-army", type=int, default=15)
     ap.add_argument("--nn-policy-scope", choices=("all", "head"), default="all",
                     help="neural-oracle policy weights to update")
     ap.add_argument("--nn-warm-evar", type=float, default=0.10,
@@ -1129,6 +1144,16 @@ def main() -> None:
         raise SystemExit("counterfactual stride must be positive and min-turn non-negative")
     if args.nn_defense_cf_risk_ratio < 0.0:
         raise SystemExit("--nn-defense-cf-risk-ratio must be non-negative")
+    if args.nn_topology_mobility_w < 0.0:
+        raise SystemExit("--nn-topology-mobility-w must be non-negative")
+    if not (0.0 <= args.nn_topology_min_trapped <= 1.0):
+        raise SystemExit("--nn-topology-min-trapped must be in [0, 1]")
+    if args.nn_topology_min_army < 1:
+        raise SystemExit("--nn-topology-min-army must be positive")
+    if args.nn_topology_counterfactual and (
+            args.nn_defense_aux_weight <= 0.0 or args.nn_topology_mobility_w <= 0.0):
+        raise SystemExit("--nn-topology-counterfactual needs "
+                         "--nn-defense-aux-weight>0 and --nn-topology-mobility-w>0")
 
     if args.oracle != "config":
         if not args.nn_init:

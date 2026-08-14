@@ -65,6 +65,22 @@ def bfs_field_from(passable: np.ndarray, pos: tuple[int, int]) -> np.ndarray:
     return bfs_field(passable, src)
 
 
+def frontier_field(passable: np.ndarray, owned: np.ndarray) -> np.ndarray:
+    """Step distance over passable ground to the nearest UNOWNED passable cell.
+
+    The frontier is every passable cell we do not already hold — enemy, neutral
+    and fog alike, since expanding into any of them is useful work. An owned cell
+    whose whole connected component is passable-but-fully-owned (a sealed pocket
+    with no exit to any frontier) gets the sentinel `H*W`: nothing there is ever
+    worth an army. `step_toward` on this field walks a trapped stack back out.
+
+    One definition, shared by the input encoder, the deploy-time guard and the
+    training teacher, so all three agree on what "trapped" means.
+    """
+    sources = passable & ~owned
+    return bfs_field(passable, sources)
+
+
 def _dilate4_batch(mask: np.ndarray) -> np.ndarray:
     """dilate4 over a stack of masks, shape (N, H, W)."""
     out = mask.copy()

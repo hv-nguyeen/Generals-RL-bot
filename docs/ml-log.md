@@ -1380,3 +1380,30 @@ stopped before its neural gate and is not a candidate. The later `ceiling-r2`
 neural-league pilot also failed its final gate: trained `0.539` versus init
 `0.504`, with `+0.071` required. It is negative evidence for this mixture and
 hyperparameter setting, not a replacement policy.
+
+## 2026-08-14 — topology / frontier awareness (perception + teaching, not a guard)
+
+Two ladder losses (229256, 229242) stalled a large stack in a mountain pocket:
+a valid-action failure the net cannot see, because no channel encodes
+connectivity. A deploy-time "veto entering a sealed pocket" was prototyped and
+measured a NO-OP on the real geometries — to enter a cell you must be connected
+to it, so `dist=inf` needs the whole reachable region already owned, which the
+pockets are not (measured entry distances 1 and 5, both finite). The only deploy
+fix is a forced backtrack, i.e. hard override #6; rejected on the standing
+evidence that hand-written overrides lose (worst -322).
+
+Chosen instead (raises the ceiling, does not patch it):
+* `bot/board.frontier_field` — one shared definition of distance-to-unowned-
+  ground; sentinel where none reachable.
+* Perception: a `FRONTIER_DIST` input plane (C 43->44), mirrored in
+  `rlenv.strategic_planes_jax` via the existing `_bfs_field_jax`. `verify_engine
+  --encoders` max|d| 1.2e-07 — bit-exact numpy/JAX. Champion warm-starts by
+  conv0 zero-pad (43 added to LEGACY_INPUT_CHANNELS).
+* Teaching: `--topology-counterfactual` arm on the existing counterexample-
+  defense loss — `_topology_risk` gates lost-game states, a mobility term in
+  `_branch_score` makes the engine branch label the backtrack move as safe.
+  Byte-identical when off (`topology_mobility_w=0`).
+
+Status: implemented + unit-tested + encoder-parity gated locally (58/58). NOT
+trained, NOT arena-tested, NOT promoted. Negative-until-proven by the paired
+gate; recorded here so the perception+teaching split is not re-derived.

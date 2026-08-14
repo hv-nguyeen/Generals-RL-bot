@@ -164,7 +164,7 @@ from pathlib import Path
 import numpy as np
 
 from arena import agents
-from bot import features, rules
+from bot import board, features, rules
 from bot.memory import TemporalMemory
 from bot.policy.net import (DEFAULT_CHANNELS, DEFAULT_LAYERS, Net, arch_record,
                             strategy_keys, trunk_keys)
@@ -211,6 +211,16 @@ DEFENSE_CF_HORIZON = 32
 DEFENSE_CF_STRIDE = 8
 DEFENSE_CF_MIN_TURN = 80
 DEFENSE_CF_RISK_RATIO = 1.25
+
+# Topology counterfactual arm. Same machinery, a different counterexample: a big
+# stack marooned in a captured mountain pocket, unable to reach any unowned tile
+# (replays 229256/229242). Opt-in; when the mobility weight is 0 the branch score
+# and every label are byte-identical to the defense arm, so this cannot perturb
+# an existing run. TOPOLOGY_MIN_TRAPPED/MIN_ARMY gate which loss states earn a
+# label -- a training gate on losses only, not a play-time veto.
+TOPOLOGY_MOBILITY_W = 0.0     # branch-score penalty per unit of trapped army mass
+TOPOLOGY_MIN_TRAPPED = 0.4    # army-weighted mean frontier distance to be "stuck"
+TOPOLOGY_MIN_ARMY = 15        # a stack this size marooned is worth a counterexample
 
 
 def critic_ready(it: int, evar: float, threshold: float) -> bool:
@@ -586,6 +596,51 @@ def _defense_risk(obs, ratio: float) -> bool:
     return hidden >= ratio * garrison
 
 
+def _frontier_trappedness(obs) -> float:
+    """Army-weighted mean distance from our tiles to the nearest unowned ground.
+
+    0 when all our army sits on the expansion edge, up to 1 when it is marooned
+    deep in a captured pocket with no reachable frontier (the sentinel clamps to
+    1). Same `board.frontier_field` shape as the FRONTIER_DIST input plane, but
+    on a fog-limited engine-branch observation with no memory: passability here
+    is current-visibility mountains (`type_grid`), where the plane uses remembered
+    mountains -- so a mountain seen then fogged is passable to this teacher and a
+    wall to the plane. They agree on visible ground; they are NOT identical in
+    fog. When we already own every reachable tile there is no frontier to reach,
+    which is a won region rather than a trap, so it reads 0.
+    """
+    passable = obs.type_grid != rules.T_MOUNTAIN
+    owned = obs.owner_grid == rules.OWNER_ME
+    if not (passable & ~owned).any():                  # no frontier exists at all
+        return 0.0
+    dist = board.frontier_field(passable, owned).astype(np.float32)
+    norm = np.clip(dist / (2.0 * features.PAD), 0.0, 1.0)
+    army = np.where(owned, obs.army_grid, 0).astype(np.float32)
+    total = float(army.sum())
+    if total <= 0.0:
+        return 0.0
+    return float((norm * army).sum() / total)
+
+
+def _topology_risk(obs, min_trapped: float = TOPOLOGY_MIN_TRAPPED,
+                   min_army: int = TOPOLOGY_MIN_ARMY) -> bool:
+    """A large stack of ours is stranded far from any unowned tile.
+
+    Returns False on a board with no frontier left (we own everything reachable):
+    that is a dominating position, not a trap, and must not earn a label.
+    """
+    passable = obs.type_grid != rules.T_MOUNTAIN
+    owned = obs.owner_grid == rules.OWNER_ME
+    if not owned.any() or not (passable & ~owned).any():
+        return False
+    dist = board.frontier_field(passable, owned).astype(np.float32)
+    norm = np.clip(dist / (2.0 * features.PAD), 0.0, 1.0)
+    stuck = owned & (norm >= min_trapped)
+    if not stuck.any():
+        return False
+    return int(np.where(stuck, obs.army_grid, 0).max()) >= min_army
+
+
 def _branch_score(st, seat: int) -> float:
     """Score a short engine branch from the learner's perspective.
 
@@ -604,7 +659,14 @@ def _branch_score(st, seat: int) -> float:
     safety = np.tanh((garrison - hidden) / 40.0)
     army_adv = np.tanh((int(obs.my_army) - int(obs.opp_army)) / 80.0)
     land_adv = np.tanh((int(obs.my_land) - int(obs.opp_land)) / 10.0)
-    return float(0.60 * safety + 0.25 * army_adv + 0.15 * land_adv)
+    score = 0.60 * safety + 0.25 * army_adv + 0.15 * land_adv
+    # Topology term: penalise branches that leave our army marooned from the
+    # frontier, so the counterfactual labels the move that walks it back out. 0
+    # by default -> the score is byte-identical to the defense arm.
+    mob_w = _CTX.get("topology_mobility_w", 0.0)
+    if mob_w:
+        score -= mob_w * _frontier_trappedness(obs)
+    return float(score)
 
 
 def _counterfactual_score(st, memory, foe, net, seat: int, first_action,
@@ -640,7 +702,13 @@ def _counterfactual_label(st, obs, memory, foe, net, seat: int, mask,
                           logits, idx: int, foe_action, topk: int,
                           horizon: int, risk_ratio: float) -> tuple[int, float]:
     """Return (better action, positive branch margin), or (-1, 0)."""
-    if not _defense_risk(obs, risk_ratio):
+    # A state earns a label if it is a defensive (hidden-army) risk OR, when the
+    # topology arm is on, a trapped-stack risk. Either way the branch search is
+    # what actually picks the safe action; the gate only decides where to look.
+    topo = _CTX.get("topology_counterfactual", False) and _topology_risk(
+        obs, _CTX.get("topology_min_trapped", TOPOLOGY_MIN_TRAPPED),
+        _CTX.get("topology_min_army", TOPOLOGY_MIN_ARMY))
+    if not (_defense_risk(obs, risk_ratio) or topo):
         return -1, 0.0
     legal = np.flatnonzero(mask)
     order = legal[np.argsort(np.asarray(logits)[legal])[-max(1, int(topk)):]]
@@ -675,7 +743,11 @@ def _init(live: str, specs: tuple, maps: str | None, max_turns: int,
           defense_cf_horizon: int = DEFENSE_CF_HORIZON,
           defense_cf_stride: int = DEFENSE_CF_STRIDE,
           defense_cf_min_turn: int = DEFENSE_CF_MIN_TURN,
-          defense_cf_risk_ratio: float = DEFENSE_CF_RISK_RATIO) -> None:
+          defense_cf_risk_ratio: float = DEFENSE_CF_RISK_RATIO,
+          topology_counterfactual: bool = False,
+          topology_mobility_w: float = TOPOLOGY_MOBILITY_W,
+          topology_min_trapped: float = TOPOLOGY_MIN_TRAPPED,
+          topology_min_army: int = TOPOLOGY_MIN_ARMY) -> None:
     _CTX.update(live=live, specs=specs, maps=maps, max_turns=max_turns,
                 defense_tail_turns=defense_tail_turns,
                 defense_hidden_ratio=defense_hidden_ratio,
@@ -685,7 +757,11 @@ def _init(live: str, specs: tuple, maps: str | None, max_turns: int,
                 defense_cf_horizon=defense_cf_horizon,
                 defense_cf_stride=defense_cf_stride,
                 defense_cf_min_turn=defense_cf_min_turn,
-                defense_cf_risk_ratio=defense_cf_risk_ratio)
+                defense_cf_risk_ratio=defense_cf_risk_ratio,
+                topology_counterfactual=topology_counterfactual,
+                topology_mobility_w=topology_mobility_w,
+                topology_min_trapped=topology_min_trapped,
+                topology_min_army=topology_min_army)
 
 
 def _rollout(job):
@@ -725,11 +801,18 @@ def _rollout(job):
             # the correct winning action.
             target = _CTX.get("defense_opponent", DEFENSE_OPPONENT)
             is_target = _CTX["specs"][opp].partition(":")[0] == target
+            # The old heuristic second-choice label only applies to the defense
+            # arm. Under the topology arm the counterfactual owns every label; a
+            # heuristic tail-defense label appended on a non-CF turn would leak
+            # into the full-array consumption below and mislabel a topology run
+            # whose --specs happens to include the defense opponent.
+            heuristic_defense = (is_target
+                                 and not _CTX.get("defense_counterfactual", False)
+                                 and not _CTX.get("topology_counterfactual", False))
             safe_idx = (_defense_safe_index(
                 obs, mask, lg, idx,
                 _CTX.get("defense_hidden_ratio", 0.0))
-                        if is_target and not _CTX.get("defense_counterfactual", False)
-                        else -1)
+                        if heuristic_defense else -1)
             defense_safe.append(safe_idx)
             defense_weight.append(1.0 if safe_idx >= 0 else 0.0)
         # engine.step is positional by seat. Placing these the wrong way round
@@ -751,8 +834,12 @@ def _rollout(job):
             if faults >= rules.MAX_FAULTS:
                 return None
             acts[1 - seat] = rules.PASS_ACTION
-        if (not greedy and _CTX.get("defense_counterfactual", False)
-                and is_target
+        # The defense arm only fires against its named counterexample opponent;
+        # the topology arm fires against any opponent, since a stall is our own
+        # doing. The label function itself decides which risk (if any) applies.
+        cf_here = ((_CTX.get("defense_counterfactual", False) and is_target)
+                   or _CTX.get("topology_counterfactual", False))
+        if (not greedy and cf_here
                 and turns >= _CTX.get("defense_cf_min_turn", DEFENSE_CF_MIN_TURN)
                 and turns % max(_CTX.get("defense_cf_stride", DEFENSE_CF_STRIDE), 1) == 0):
             safe_idx, margin = _counterfactual_label(
@@ -776,7 +863,8 @@ def _rollout(job):
     safe = np.full(len(ids), -1, dtype=np.int32)
     weights = np.zeros(len(ids), dtype=np.float32)
     if z < 0.0:
-        if _CTX.get("defense_counterfactual", False):
+        if (_CTX.get("defense_counterfactual", False)
+                or _CTX.get("topology_counterfactual", False)):
             safe[:] = np.asarray(defense_safe, dtype=np.int32)
             weights[:] = np.asarray(defense_weight, dtype=np.float32)
         elif _CTX.get("defense_tail_turns", 0) > 0:
@@ -1060,6 +1148,21 @@ def main() -> None:
     ap.add_argument("--defense-cf-min-turn", type=int, default=DEFENSE_CF_MIN_TURN)
     ap.add_argument("--defense-cf-risk-ratio", type=float,
                     default=DEFENSE_CF_RISK_RATIO)
+    ap.add_argument("--topology-counterfactual", action="store_true",
+                    help="label a trapped-stack loss state with the engine "
+                         "branch that walks the marooned army back to frontier "
+                         "(replays 229256/229242); needs --defense-aux-weight>0 "
+                         "and --topology-mobility-w>0")
+    ap.add_argument("--topology-mobility-w", type=float,
+                    default=TOPOLOGY_MOBILITY_W,
+                    help="branch-score penalty per unit of trapped army mass; "
+                         "0 leaves every label byte-identical to the defense arm")
+    ap.add_argument("--topology-min-trapped", type=float,
+                    default=TOPOLOGY_MIN_TRAPPED,
+                    help="army-weighted normalized frontier distance for a state "
+                         "to count as a trapped-stack risk")
+    ap.add_argument("--topology-min-army", type=int, default=TOPOLOGY_MIN_ARMY,
+                    help="smallest marooned stack that earns a topology label")
     ap.add_argument("--policy-scope", choices=("all", "head"), default="all",
                     help="train all policy weights or only the action/pass head")
     ap.add_argument("--warm-evar", type=float, default=0.10,
@@ -1123,6 +1226,16 @@ def main() -> None:
         raise SystemExit("counterfactual stride must be positive and min-turn non-negative")
     if args.defense_cf_risk_ratio < 0.0:
         raise SystemExit("--defense-cf-risk-ratio must be non-negative")
+    if args.topology_mobility_w < 0.0:
+        raise SystemExit("--topology-mobility-w must be non-negative")
+    if not (0.0 <= args.topology_min_trapped <= 1.0):
+        raise SystemExit("--topology-min-trapped must be in [0, 1]")
+    if args.topology_min_army < 1:
+        raise SystemExit("--topology-min-army must be positive")
+    if args.topology_counterfactual and (
+            args.defense_aux_weight <= 0.0 or args.topology_mobility_w <= 0.0):
+        raise SystemExit("--topology-counterfactual needs --defense-aux-weight>0 "
+                         "and --topology-mobility-w>0")
     if args.defense_aux_weight > 0.0 and args.augment:
         raise SystemExit("--defense-aux-weight cannot be combined with --augment: "
                          "action labels need an explicit dihedral transform")
@@ -1328,7 +1441,11 @@ def main() -> None:
                                          args.defense_cf_horizon,
                                          args.defense_cf_stride,
                                          args.defense_cf_min_turn,
-                                         args.defense_cf_risk_ratio))
+                                         args.defense_cf_risk_ratio,
+                                         args.topology_counterfactual,
+                                         args.topology_mobility_w,
+                                         args.topology_min_trapped,
+                                         args.topology_min_army))
 
     def play(jobs, weights):
         """Publish, then dispatch. Every sample comes from exactly one snapshot,
@@ -1650,6 +1767,10 @@ def main() -> None:
          "defense_cf_stride": args.defense_cf_stride,
          "defense_cf_min_turn": args.defense_cf_min_turn,
          "defense_cf_risk_ratio": round(args.defense_cf_risk_ratio, 6),
+         "topology_counterfactual": args.topology_counterfactual,
+         "topology_mobility_w": round(args.topology_mobility_w, 6),
+         "topology_min_trapped": round(args.topology_min_trapped, 6),
+         "topology_min_army": args.topology_min_army,
          "policy_scope": args.policy_scope}, indent=2) + "\n")
 
     print(f"\ngate on {len(gate)} fresh games ({dg} distinct): trained {score:.3f} "

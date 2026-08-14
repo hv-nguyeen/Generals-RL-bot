@@ -14,15 +14,19 @@ from __future__ import annotations
 import numpy as np
 
 from bot import rules
+from bot.board import frontier_field
 from bot.obs import Obs
 
 PAD = 21                      # every competition board fits in 21x21
 BASE_C = 24                   # one-frame channels; old checkpoints use this
 MEMORY_C = 16                 # observation-only temporal channels
-STRATEGIC_C = 3               # map prior, home distance, current build price
+STRATEGIC_C = 4               # map prior, home distance, build price, frontier dist
 STRATEGIC_OFFSET = BASE_C + MEMORY_C
 C = STRATEGIC_OFFSET + STRATEGIC_C
-LEGACY_INPUT_CHANNELS = (BASE_C, STRATEGIC_OFFSET)
+# Widths a stored tensor may have before this schema; `ensure_channels` zero-
+# extends any of them to C. 43 is the pre-frontier-plane width (the shipped
+# selfplay-champion-gen1 encoding).
+LEGACY_INPUT_CHANNELS = (BASE_C, STRATEGIC_OFFSET, 43)
 DIRS_N = 4
 SPLITS = 2
 BUILD_OFFSET = DIRS_N * SPLITS      # slot 8 of a cell is "build a castle here"
@@ -43,7 +47,7 @@ PASS_INDEX = N_ACTIONS - 1
  MY_GAINED, OPP_GAINED, MY_ARMY_DELTA, OPP_ARMY_DELTA,
  DELTA_MY_ARMY, DELTA_OPP_ARMY, DELTA_LAND_ADV) = range(BASE_C, STRATEGIC_OFFSET)
 
-(ENEMY_GENERAL_PRIOR, DIST_HOME, BUILD_COST) = range(STRATEGIC_OFFSET, C)
+(ENEMY_GENERAL_PRIOR, DIST_HOME, BUILD_COST, FRONTIER_DIST) = range(STRATEGIC_OFFSET, C)
 
 
 def scalar_features(turn, my_army, opp_army, my_land, opp_land,
@@ -163,10 +167,22 @@ def strategic_planes(obs: Obs, memory=None) -> np.ndarray:
     if memory is not None:
         p[ENEMY_GENERAL_PRIOR - STRATEGIC_OFFSET, :h, :w] = (
             memory.general_candidates)
-        reachable = (~memory.known_mountains).astype(np.float32)
+        passable = ~memory.known_mountains
+        reachable = passable.astype(np.float32)
         p[DIST_HOME - STRATEGIC_OFFSET, :h, :w] = (
             np.clip(memory.dist_home.astype(np.float32) / (2.0 * PAD), 0.0, 1.0)
             * reachable)
+        # Distance over passable ground to the nearest tile we do not yet own.
+        # A stack deep in a captured mountain dead-end reads ~1 (far from any
+        # frontier, sentinel clamps to 1); a tile on the expansion edge reads 0.
+        # This is the topology invariant the net was blind to: replays 229256/
+        # 229242 stalled a big stack in a pocket it could not perceive as a
+        # pocket. `owned` is current visibility -- our own tiles are always
+        # visible (dilate8), so it is exact for us; fog counts as frontier.
+        owned = obs.owner_grid == rules.OWNER_ME
+        fdist = frontier_field(passable, owned).astype(np.float32)
+        p[FRONTIER_DIST - STRATEGIC_OFFSET, :h, :w] = np.clip(
+            fdist / (2.0 * PAD), 0.0, 1.0)
     mine = obs.owner_grid == rules.OWNER_ME
     structures = mine & ((obs.type_grid == rules.T_GENERAL)
                           | (obs.type_grid == rules.T_CASTLE))
