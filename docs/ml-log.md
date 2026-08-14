@@ -1407,3 +1407,41 @@ Chosen instead (raises the ceiling, does not patch it):
 Status: implemented + unit-tested + encoder-parity gated locally (58/58). NOT
 trained, NOT arena-tested, NOT promoted. Negative-until-proven by the paired
 gate; recorded here so the perception+teaching split is not re-derived.
+
+## 2026-08-14 (cont.) — topology teaching MEASURED NEUTRAL/NEGATIVE on the cluster
+
+Trained on node 2 (L4, gb312 env, py3.12/numpy2.5.2/jax0.11.0; encoder parity
+re-proved on the node, max|d| 1.2e-07). Warm-started the champion
+(selfplay-champion-gen1, 43->44 conv0 zero-pad migration for BOTH policy and
+critic) via `learn.league --oracle net`. Three runs, all --nn-games 384
+--workers 32 (OPENBLAS_NUM_THREADS=1 required; 60 workers x 64 BLAS threads =
+fork storm):
+
+* topo-r1 (topology on, mobility-w 0.2, aux-weight 0.3, min-army 15,
+  min-trapped 0.4): train-wr COLLAPSED 0.55 -> 0.17 once actor updates began
+  (iter 3+), auto-rewound. Harmful.
+* topo-control (aux-weight 0.0, i.e. the 44-ch PERCEPTION PLANE alone, no aux
+  teaching): STABLE 0.58-0.65 across 50 iters. Gate vs champion: trained 0.4888
+  vs init 0.4963, +0.0707 required -> REJECTED. The plane alone is NEUTRAL
+  (a tie within 400-game noise), not an improvement.
+* topo-r2 (topology retuned to fire rarely: mobility-w 0.05, min-army 40,
+  min-trapped 0.7): labels did NOT drop (~800/iter, same as r1) and train-wr
+  collapsed again 0.58 -> 0.38. 
+
+ROOT CAUSE of the non-response to topology thresholds: `_counterfactual_label`
+gates on `_defense_risk(...) OR _topology_risk(...)`. With --defense-aux-weight
+> 0 (needed to turn the aux loss on at all) the DEFENSE hidden-army risk fires
+on ~800 states/iter irrespective of the topology thresholds, so both "topology"
+runs were really defense+topology counterfactual teaching dominated by defense
+labels, and that aux loss at weight 0.3 is what collapses a converged champion
+(the aux-weight-0 control was stable). The topology arm cannot currently be
+tested in isolation without a code change decoupling it from defense-risk when
+--defense-counterfactual is off.
+
+VERDICT: perception plane = neutral; counterfactual aux teaching at 0.3 =
+collapses; topology arm co-fires defense labels (wiring flaw). NOT PROMOTED;
+champion selfplay-champion-gen1 remains accepted. All code is on branch
+topology-frontier-safety-guard (private repo hv-nguyeen/generals-bot). To retry:
+(1) decouple topology from defense-risk in _counterfactual_label, (2) aux weight
+~0.05 not 0.3, (3) confirm labels actually drop before spending iters. Odds are
+low given the plane itself measured neutral.

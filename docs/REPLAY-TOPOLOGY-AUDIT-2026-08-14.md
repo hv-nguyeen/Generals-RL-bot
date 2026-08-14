@@ -115,3 +115,28 @@ requires a fresh independent comparison + the versioned suite. Pending:
 5. No-TTA package (`tta=false`, `tta_full=false`) only if a candidate wins.
 
 The champion `selfplay-champion-gen1` remains the accepted policy until then.
+
+## 7. RESULT (measured on the cluster, 2026-08-14) — NOT PROMOTED
+
+Trained on node 2 (L4). Encoder parity re-proved on the node (max|d| 1.2e-07).
+Warm-started the champion (43->44 conv0 zero-pad, policy + critic) via
+`learn.league --oracle net`, --nn-games 384 --workers 32
+(OPENBLAS_NUM_THREADS=1 mandatory).
+
+| run | config | outcome |
+|-----|--------|---------|
+| topo-r1 | topology on, mobility-w 0.2, aux 0.3 | train-wr collapsed 0.55->0.17, auto-rewound. Harmful. |
+| topo-control | aux 0.0 (perception plane ALONE) | stable 0.58-0.65; gate vs champion 0.4888 vs 0.4963, +0.0707 needed -> REJECTED. **Neutral.** |
+| topo-r2 | topology retuned (mobility 0.05, min-army 40, min-trapped 0.7) | labels did NOT drop (~800/iter), train-wr collapsed 0.58->0.38 again. |
+
+**Wiring flaw found:** `_counterfactual_label` gates on `_defense_risk OR
+_topology_risk`; with `--defense-aux-weight>0` (required to enable the aux loss)
+the defense hidden-army risk fires ~800x/iter regardless of the topology
+thresholds, so the topology arm could not be tested in isolation and the aux
+loss at 0.3 is what collapses the policy (aux 0.0 control was stable).
+
+**Verdict:** perception plane = neutral vs champion; counterfactual aux teaching
+at 0.3 = collapses. Champion `selfplay-champion-gen1` remains accepted. Code
+preserved on branch `topology-frontier-safety-guard` (private repo
+hv-nguyeen/generals-bot). This line of work is closed as neutral/negative; see
+`docs/ml-log.md` for the retry preconditions if ever revisited.
