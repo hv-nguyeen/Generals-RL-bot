@@ -1424,6 +1424,52 @@ def test_critic_warm_start_migrates_input_channels():
     assert not got["conv0_w"][:, features.C - 1:].any()       # new plane starts neutral
 
 
+def test_main_deploys_ensemble_from_multiple_weights():
+    """A single packaged checkpoint is the clone; several are an ensemble, both
+    under the guard. This is the shippable path for an ensemble candidate."""
+    import tempfile
+    from pathlib import Path
+
+    from bot import features
+    from bot import main as botmain
+    from bot.config import Config
+    from bot.policy.ensemble import EnsemblePolicy
+    from bot.policy.guard import GuardedPolicy
+    from bot.policy.net import ClonePolicy, arch_record
+
+    def tiny(seed):
+        rng = np.random.default_rng(seed)
+        p = {"conv0_w": (rng.normal(size=(16, features.C, 3, 3)) * 0.1).astype(np.float32),
+             "conv0_b": np.zeros(16, np.float32)}
+        for i in range(1, 4):
+            p[f"conv{i}_w"] = (rng.normal(size=(16, 16, 3, 3)) * 0.1).astype(np.float32)
+            p[f"conv{i}_b"] = np.zeros(16, np.float32)
+        p["head_w"] = (rng.normal(size=(features.PER_CELL, 16, 3, 3)) * 0.1).astype(np.float32)
+        p["head_b"] = np.zeros(features.PER_CELL, np.float32)
+        p["pass_w"] = (rng.normal(size=16) * 0.01).astype(np.float32)
+        p["pass_b"] = np.zeros((), np.float32)
+        return p
+
+    d = Path(tempfile.mkdtemp())
+    for name, seed in (("weights.npz", 0), ("weights-2.npz", 1)):
+        pp = tiny(seed)
+        np.savez(d / name, **pp, **arch_record(pp))
+
+    orig = botmain._weight_files
+    try:
+        botmain._weight_files = lambda: [str(d / "weights.npz"), str(d / "weights-2.npz")]
+        ens = botmain.make_agent(Config(), 1, 9, 9)
+        assert isinstance(ens, GuardedPolicy), "ensemble must still be guarded"
+        assert isinstance(ens.inner, EnsemblePolicy)
+        assert len(ens.inner.net.nets) == 2
+
+        botmain._weight_files = lambda: [str(d / "weights.npz")]
+        solo = botmain.make_agent(Config(), 1, 9, 9)
+        assert isinstance(solo.inner, ClonePolicy), "single weight is the clone"
+    finally:
+        botmain._weight_files = orig
+
+
 def test_frontier_field_open_board_is_reachable():
     """On open ground every owned cell has a finite distance to unowned frontier."""
     passable = np.ones((3, 3), dtype=bool)

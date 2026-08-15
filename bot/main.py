@@ -37,6 +37,22 @@ def load_config() -> Config:
 WEIGHTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights.npz")
 
 
+def _weight_files() -> list:
+    """Every packaged checkpoint, `weights.npz` first.
+
+    A single-file package is the historical clone. Extra `weights-*.npz` beside
+    it are an ENSEMBLE: `bot/main.py` averages them under one guard, which is a
+    measured, no-training way to beat a single member (see
+    `bot/policy/ensemble.py`). Fixed location, not a config field, for the same
+    reason WEIGHTS is: `Config.flatten` floats every non-bool and a path list
+    would break the tuner. The switch is still `use_net`; the layout is the file
+    set."""
+    import glob
+    here = os.path.dirname(os.path.abspath(__file__))
+    extras = sorted(p for p in glob.glob(os.path.join(here, "weights-*.npz")))
+    return ([WEIGHTS] if os.path.exists(WEIGHTS) else []) + extras
+
+
 def make_agent(cfg: Config, player_id: int, h: int, w: int):
     """The cloned net if one was packaged, the heuristic otherwise.
 
@@ -46,17 +62,28 @@ def make_agent(cfg: Config, player_id: int, h: int, w: int):
     falls back instead, and says so on stderr: a submission that quietly plays
     the wrong policy is the failure that is hard to notice from the ladder.
     """
-    if cfg.use_net and os.path.exists(WEIGHTS):
+    weights = _weight_files()
+    if cfg.use_net and weights:
         try:
-            from bot.policy.net import ClonePolicy
             from bot.policy.guard import GuardedPolicy
             # tta: average the logits over the board's dihedral group instead of
             # reading one orientation. Measured +32.8 Elo [+17.7, +48.0] on 2000
             # games with the SAME weights on both sides, so it is inference
             # compute and nothing else. Costs 5.3 ms mean, 14.3 ms worst, against
             # a 150 ms budget -- the axis this project had never spent.
-            agent = ClonePolicy(player_id, h, w, WEIGHTS, tta=cfg.tta,
-                                full=cfg.tta_full)
+            if len(weights) > 1:
+                # Ensemble: average several checkpoints under the SAME guard and
+                # tta. EnsemblePolicy exposes `.net`/`score_logits`, which is what
+                # the guard re-scores through, so the guard tier still applies.
+                from bot.policy.ensemble import EnsemblePolicy
+                agent = EnsemblePolicy(player_id, h, w, weights, tta=cfg.tta,
+                                       full=cfg.tta_full)
+                src = f"ensemble[{len(weights)}] {agent.net.arch}"
+            else:
+                from bot.policy.net import ClonePolicy
+                agent = ClonePolicy(player_id, h, w, weights[0], tta=cfg.tta,
+                                    full=cfg.tta_full)
+                src = f"net {agent.net.arch} from {weights[0]}"
             # The net is argmax over masked logits and nothing else. The
             # heuristic's hard-override tier -- win-in-one, deathtouch, the
             # narrow garrison block -- has no counterpart in it, and deathwatch
@@ -66,18 +93,17 @@ def make_agent(cfg: Config, player_id: int, h: int, w: int):
             # both sides do it.
             guarded = GuardedPolicy(agent, cfg.general_block_radius,
                                     cfg.general_block_ratio)
-            print(f"policy: net {agent.net.arch} from {WEIGHTS} "
-                  f"(guarded r={cfg.general_block_radius} "
+            print(f"policy: {src} (guarded r={cfg.general_block_radius} "
                   f"ratio={cfg.general_block_ratio})", file=sys.stderr)
             return guarded
         except Exception:                             # noqa: BLE001
             import traceback
             traceback.print_exc(file=sys.stderr)
-            print(f"policy: FALLING BACK to the heuristic, {WEIGHTS} did not load",
+            print(f"policy: FALLING BACK to the heuristic, {weights} did not load",
                   file=sys.stderr)
     else:
         print(f"policy: heuristic (use_net={cfg.use_net}, "
-              f"weights present={os.path.exists(WEIGHTS)})", file=sys.stderr)
+              f"weights present={len(weights)})", file=sys.stderr)
     return Controller(player_id, h, w, cfg)
 
 
