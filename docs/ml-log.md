@@ -1476,3 +1476,18 @@ NEXT SESSION: (1) locate the residual-tail net.py build; (2) with it, gate
 capacity win; (3) if capacity also ties, the champion is at the frontier and the
 path is a fresh larger net + exploiter-league run, not continuation. Champion
 selfplay-champion-gen1 remains the accepted policy.
+
+## 2026-08-15 — FIRST MEASURED WIN: guarded ensemble beats the champion
+
+After both training arms tied the champion (8x32 at arch ceiling), an ENSEMBLE
+(a different bot, not more training) cleared it. Bake-off then 6000-game confirm:
+
+    shipens:champion+topo-night-best@logit  vs  ship:champion
+    elo +17.4 [+2.2, +32.7]  faults 0  17.5 ms mean / 30 ms worst (budget 150)
+
+elo_lo = +2.2 > 0: significant at 95%. topo-night-best (the +20-tie league net
+with the frontier plane) is the value-add member; champion+selfplay-best added
+nothing (selfplay-best IS the champion, 984-984). Small (+17 Elo) but real,
+clean, budget-valid. Ships via bot/weights.npz + bot/weights-2.npz (EnsembleNet
+in bot/main.py, commit 0e4395d). Bigger gap likely needs the arch-diverse
+ensemble (champion + 16x96).

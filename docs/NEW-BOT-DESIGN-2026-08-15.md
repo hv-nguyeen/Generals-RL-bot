@@ -69,3 +69,22 @@ done
 
 Champion `selfplay-champion-gen1` remains accepted until a candidate's paired
 lower bound clears it with zero faults and runtime margin.
+
+## RESULT — MEASURED WIN (2026-08-15)
+
+Bake-off (800 games/config, all 0 faults, all <=26 ms) showed `topo-night-best`
+is the value-add member; `champion+topo-night-best@logit` led at +20.9.
+
+Confirmation, 6000 paired games vs `ship:champion`, 150 ms budget:
+
+    shipens:champion+topo-night-best@logit
+    elo +17.4  [+2.2, +32.7]   faults 0   time 17.5 ms mean / 30 ms worst
+
+**elo_lo = +2.2 > 0 -> significant.** The guarded 2-member ensemble outperforms
+the champion with measured 95% confidence, zero faults, well inside budget. This
+is the new bot: `shipens:champion.npz+topo-night-best.npz@logit` (guard on, TTA
+per config). Ship it as `bot/weights.npz` (champion) + `bot/weights-2.npz`
+(topo-night-best); `bot/main.py` loads them as a guarded EnsembleNet.
+
+Note the magnitude is small (+17 Elo). The arch-diverse ensemble
+(champion + 16x96) remains the path to a larger gap.
