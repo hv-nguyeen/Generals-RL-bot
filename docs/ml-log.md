@@ -1445,3 +1445,34 @@ topology-frontier-safety-guard (private repo hv-nguyeen/generals-bot). To retry:
 (1) decouple topology from defense-risk in _counterfactual_label, (2) aux weight
 ~0.05 not 0.3, (3) confirm labels actually drop before spending iters. Odds are
 low given the plane itself measured neutral.
+
+## 2026-08-15 — champion at arch ceiling; capacity gating blocked by code branch
+
+Goal shifted to "beat the champion by any means" (topology dropped). Findings:
+
+* Continuation of champion (plain PPO, aux 0, node-local files to dodge the
+  flaky shared-home read): trained stably, train-wr rose to 0.68 -- but that is
+  vs the weak-heuristic mixture. The signal that matters, `eval` vs
+  `snipe:champion`, stayed FLAT at ~0.52-0.55 across 300+ iters (topo-night) and
+  again in a continuation from its best (topo-night2, iters 0-70). Gate of
+  topo-night-best vs champion: +19 to +28 Elo point estimate BOTH blocks, but
+  the 2000-game lower bound still crosses 0.5 -> statistical TIE, not promotable.
+  Conclusion: the 8x32 arch is at its ceiling vs the champion; more iterations do
+  not convert. train-wr vs a weak mixture is a mirage; gate on `snipe:champion`
+  or tools.evaluate.
+
+* Capacity is the untested real lever, but BLOCKED: the capacity nets
+  (`candidates/capacity-16x96-best-20260813.npz` = 16 layers/96ch, and the
+  36x64) use a "residual TAIL" trunk (keys: conv0..conv7 PLUS res0a/res0b...,
+  residual=1, layers=16). The current net.py (topology branch / main) supports
+  only plain or single-stem-residual trunks, so `arch_of` raises "a residual
+  trunk has exactly one stem conv, found 8". tools.evaluate cannot load them.
+  No local branch has residual-tail support (git -S "residual tail" empty). The
+  code that wrote these checkpoints lives elsewhere (the VU/NewGame clone, or
+  pinned to the capacity run dir on the cluster).
+
+NEXT SESSION: (1) locate the residual-tail net.py build; (2) with it, gate
+16x96 and 36x64 vs champion (2000 games) + move-time -- the real shot at a
+capacity win; (3) if capacity also ties, the champion is at the frontier and the
+path is a fresh larger net + exploiter-league run, not continuation. Champion
+selfplay-champion-gen1 remains the accepted policy.
