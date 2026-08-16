@@ -82,3 +82,36 @@ distance, removing the collapse.
 bigger student wins on strength but busts the budget, **distil it down** to a
 fast net (same tool, `--layers/--channels` smaller). Capacity for strength,
 distillation for speed.
+
+## The path to NOTICEABLY better: search-based expert iteration (implemented)
+
+Distillation of the ensemble caps at ~+17 (imitation of an existing net). To
+EXCEED any net we have, add lookahead SEARCH — AlphaZero's actual mechanism.
+
+`tools/search_gen.py` (new): for each self-play state it takes the base net's
+top-K legal moves, rolls each `horizon` plies through the EXACT engine (opponent
+replies each ply, value leaf via `netoracle._branch_score`), and labels the
+argmax. That search-improved policy is stronger than the raw net. It records
+`(encode(obs), search_move)` shards; `learn/train.py` distils them into a fast
+net that PLAYS the search policy with NO search at inference (ships in budget).
+Validated locally end-to-end (shards load through `learn.train.load_shard`).
+
+Round of expert iteration (all on the node):
+1. `python -m tools.search_gen --net BASE.npz --games 1500 --topk 6 --horizon 12 --out /local/data/vng205/search-bc --workers 32`  (BASE = champion for round 1)
+2. `python -m learn.train --data /local/data/vng205/search-bc --out /local/data/vng205/searchdist-8x64.npz --layers 8 --channels 64 --epochs 20 --augment`
+3. gate `ship:searchdist-8x64.npz` vs `ship:champion.npz` (2000 games, 150ms).
+4. If it wins -> it becomes BASE for round 2. Search over a stronger base is
+   stronger still, so gains COMPOUND (unlike ensemble distillation which
+   saturates). This is expert iteration.
+
+Why it will not collapse like the RL runs: no PPO, no critic training. The
+teacher is search+engine (deterministic given the net); the student learns by
+supervised cross-entropy. The one real risk is the LEAF VALUE quality: round 1
+uses the `_branch_score` heuristic (resolved W/L dominates, else safety/army/
+land). If the gate shows the search barely improves, upgrade the leaf to the
+champion's LEARNED critic (`bot.policy.net.ValueNet`) — a one-line swap in
+`search_gen._search_move` — which typically makes search much sharper.
+
+Cost is front-loaded by design: search is O(topk × horizon) engine steps per
+move, expensive OFFLINE, but the shipped net is a single forward. Start small
+(1500 games, topk 6, horizon 12) to measure the per-round gain, then scale.
