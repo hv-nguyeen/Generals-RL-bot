@@ -95,6 +95,31 @@ def resolve_arch(init: str | None, layers=None, channels=None, residual=None,
     return arch
 
 
+def warm_params(init_path: str, cin: int = features.C) -> dict:
+    """Load a net's weights as BC starting params (warm start).
+
+    Distilling from a random net can plateau below the base; starting FROM the
+    base means the student can only shift toward the (search-improved) labels.
+    Drops the arch_record metadata, keeps the parameter tensors, and zero-pads
+    conv0's input channels if the checkpoint is narrower than the current
+    encoder (the same migration the numpy net does on load).
+    """
+    import jax.numpy as jnp
+    z = dict(np.load(init_path))
+    meta = {"residual", "layers", "channels", "context", "context_dense",
+            "dense_context", "strategy", "strategy_hidden", "input_channels",
+            "value_schema", "value_pool", "value_hidden"}
+    params = {k: v for k, v in z.items() if k not in meta}
+    w = np.asarray(params["conv0_w"])
+    if w.shape[1] != cin:
+        if w.shape[1] > cin:
+            raise SystemExit(f"--init conv0 takes {w.shape[1]} channels > encoder {cin}")
+        grown = np.zeros((w.shape[0], cin, 3, 3), np.float32)
+        grown[:, :w.shape[1]] = w
+        params["conv0_w"] = grown
+    return {k: jnp.asarray(np.asarray(v)) for k, v in params.items()}
+
+
 def init_params(key, arch: dict | None = None, cin: int = features.C):
     import jax
     import jax.numpy as jnp
@@ -426,6 +451,9 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", default="/local/data/vng205/bc")
     ap.add_argument("--out", default="/local/data/vng205/clone.npz")
+    ap.add_argument("--init", default=None,
+                    help="warm-start BC from this net (its arch is used; conv0 "
+                         "channels are migrated). Avoids fresh-net underfitting.")
     ap.add_argument("--epochs", type=int, default=20,
                     help="a ceiling, not a plan: --patience ends the run")
     ap.add_argument("--patience", type=int, default=3,
@@ -456,7 +484,7 @@ def main() -> None:
     import jax.numpy as jnp
 
     print("devices:", jax.devices())
-    arch = resolve_arch(None, args.layers, args.channels, args.residual,
+    arch = resolve_arch(args.init, args.layers, args.channels, args.residual,
                         args.context, args.dense_context, args.strategy_hidden)
     shards = shard_list(Path(args.data))
     # Held out BY SHARD, and a shard is a run of whole replays, so this is a
@@ -479,7 +507,11 @@ def main() -> None:
     rng = np.random.default_rng(args.seed)
 
     key = jax.random.PRNGKey(args.seed)
-    params = init_params(key, arch)
+    if args.init:
+        params = warm_params(args.init)
+        print(f"warm-start from {args.init}")
+    else:
+        params = init_params(key, arch)
     n_par = sum(int(np.asarray(v).size) for v in params.values())
     strategy_label = (f", strategy-{arch['strategy_hidden']}"
                       if arch.get("strategy") else "")

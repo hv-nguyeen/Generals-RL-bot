@@ -114,10 +114,12 @@ def main() -> None:
             _run([PY, "-m", "tools.search_gen", "--net", base, "--games", str(games),
                   "--topk", str(args.topk), "--horizon", str(horizon),
                   "--out", str(data), "--workers", str(args.workers)], logf)
-            note(f"round {r}: distil -> {net.name}")
+            note(f"round {r}: distil (warm-start from {Path(base).name}) -> {net.name}")
+            # Warm-start from the current base: the student starts AT base
+            # strength and can only shift toward the search-improved labels, so
+            # it never underfits below the base (the fresh-BC failure mode).
             _run([PY, "-m", "learn.train", "--data", str(data), "--out", str(net),
-                  "--layers", str(args.layers), "--channels", str(args.channels),
-                  "--epochs", str(args.epochs), "--augment"], logf)
+                  "--init", base, "--epochs", str(args.epochs), "--augment"], logf)
             if not args.keep_shards:
                 shutil.rmtree(data, ignore_errors=True)      # free disk over a long run
             g = _gate(f"ship:{net}", f"ship:{base}", args.gate_games, args.workers, logf)
