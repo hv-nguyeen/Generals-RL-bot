@@ -62,7 +62,14 @@ def main() -> None:
     ap.add_argument("--base", required=True)
     ap.add_argument("--out-dir", required=True, type=Path)
     ap.add_argument("--rounds", type=int, default=6)
-    ap.add_argument("--patience", type=int, default=2)
+    ap.add_argument("--patience", type=int, default=2,
+                    help="non-improving rounds before ESCALATING search depth")
+    ap.add_argument("--resume", action="store_true",
+                    help="continue from out-dir/best.npz + history.json if present")
+    ap.add_argument("--max-horizon", type=int, default=24)
+    ap.add_argument("--max-games", type=int, default=3000)
+    ap.add_argument("--keep-shards", action="store_true",
+                    help="do NOT delete each round's search shards after distil")
     ap.add_argument("--games", type=int, default=800, help="search self-play games/round")
     ap.add_argument("--topk", type=int, default=6)
     ap.add_argument("--horizon", type=int, default=10)
@@ -78,52 +85,84 @@ def main() -> None:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     logf = open(args.out_dir / "expert_iter.log", "a", buffering=1)
-    base = args.base
-    shutil.copy(base, args.out_dir / "best.npz")
-    history, stale = [], 0
+    hist_path = args.out_dir / "history.json"
+    best = args.out_dir / "best.npz"
 
     def note(msg):
         print(msg, flush=True); logf.write(msg + "\n"); logf.flush()
 
-    note(f"=== expert-iteration start {time.strftime('%F %T')} base={base} ===")
-    for r in range(1, args.rounds + 1):
+    # Resume: pick up from the best net + history so a week-long run survives a
+    # crash / SSH drop / relaunch without restarting from the champion.
+    history = json.loads(hist_path.read_text()) if (args.resume and hist_path.is_file()) else []
+    if args.resume and best.is_file() and history:
+        base = str(best)
+        note(f"=== RESUME {time.strftime('%F %T')}: {len(history)} rounds done, base={best} ===")
+    else:
+        base = args.base
+        shutil.copy(base, best)
+        note(f"=== expert-iteration start {time.strftime('%F %T')} base={base} ===")
+
+    horizon, games, stale = args.horizon, args.games, 0
+    r = len(history)
+    while r < args.rounds:
+        r += 1
         rd = args.out_dir / f"round_{r:02d}"; rd.mkdir(exist_ok=True)
         data, net = rd / "search-bc", rd / "net.npz"
-        note(f"\n--- round {r} {time.strftime('%T')} : search-gen from {Path(base).name} ---")
-        _run([PY, "-m", "tools.search_gen", "--net", base, "--games", str(args.games),
-              "--topk", str(args.topk), "--horizon", str(args.horizon),
-              "--out", str(data), "--workers", str(args.workers)], logf)
-        note(f"round {r}: distil -> {net.name}")
-        _run([PY, "-m", "learn.train", "--data", str(data), "--out", str(net),
-              "--layers", str(args.layers), "--channels", str(args.channels),
-              "--epochs", str(args.epochs), "--augment"], logf)
-        g = _gate(f"ship:{net}", f"ship:{base}", args.gate_games, args.workers, logf)
+        try:
+            note(f"\n--- round {r} {time.strftime('%T')} : search-gen from {Path(base).name} "
+                 f"(topk {args.topk} horizon {horizon} games {games}) ---")
+            _run([PY, "-m", "tools.search_gen", "--net", base, "--games", str(games),
+                  "--topk", str(args.topk), "--horizon", str(horizon),
+                  "--out", str(data), "--workers", str(args.workers)], logf)
+            note(f"round {r}: distil -> {net.name}")
+            _run([PY, "-m", "learn.train", "--data", str(data), "--out", str(net),
+                  "--layers", str(args.layers), "--channels", str(args.channels),
+                  "--epochs", str(args.epochs), "--augment"], logf)
+            if not args.keep_shards:
+                shutil.rmtree(data, ignore_errors=True)      # free disk over a long run
+            g = _gate(f"ship:{net}", f"ship:{base}", args.gate_games, args.workers, logf)
+        except Exception as e:                               # noqa: BLE001
+            note(f"round {r}: ERROR ({e!r}); skipping, base unchanged")
+            continue
         improved = (g["lo"] is not None and g["lo"] > args.margin
                     and g["faults"] == 0
                     and (g["max_ms"] is None or g["max_ms"] < args.max_ms))
         ens = None
         if args.ensemble:
-            mem = "+".join(args.ensemble.split(",") + [str(net)])
-            base_ens = "+".join(args.ensemble.split(","))
-            ens = _gate(f"shipens:{mem}@logit", f"shipens:{base_ens}@logit",
-                        args.gate_games, args.workers, logf)
-        rec = {"round": r, "net": str(net), "vs_base": g, "as_member": ens,
-               "promoted": improved}
-        history.append(rec)
-        (args.out_dir / "history.json").write_text(json.dumps(history, indent=2))
+            try:
+                mem = "+".join(args.ensemble.split(",") + [str(net)])
+                base_ens = "+".join(args.ensemble.split(","))
+                ens = _gate(f"shipens:{mem}@logit", f"shipens:{base_ens}@logit",
+                            args.gate_games, args.workers, logf)
+            except Exception as e:                           # noqa: BLE001
+                note(f"round {r}: member-gate error ({e!r})")
+        history.append({"round": r, "net": str(net), "topk": args.topk,
+                        "horizon": horizon, "games": games,
+                        "vs_base": g, "as_member": ens, "promoted": improved})
+        hist_path.write_text(json.dumps(history, indent=2))
         note(f"round {r}: vs-base elo {g['elo']} [{g['lo']},{g['hi']}] faults {g['faults']} "
              f"max_ms {g['max_ms']} -> {'PROMOTE' if improved else 'reject'}")
         if ens:
-            note(f"round {r}: as member#3 vs shipped ensemble elo {ens['elo']} "
+            note(f"round {r}: as member vs shipped ensemble elo {ens['elo']} "
                  f"[{ens['lo']},{ens['hi']}] faults {ens['faults']}")
         if improved:
-            base = str(net); shutil.copy(net, args.out_dir / "best.npz"); stale = 0
+            base = str(net); shutil.copy(net, best); stale = 0
         else:
             stale += 1
             if stale >= args.patience:
-                note(f"stop: {stale} non-improving rounds"); break
+                # Plateaued at this search depth: ESCALATE (deeper/more search
+                # finds moves the shallow search missed) instead of stopping, so
+                # a week-long run keeps making real attempts.
+                if horizon < args.max_horizon or games < args.max_games:
+                    horizon = min(int(horizon * 1.5) + 1, args.max_horizon)
+                    games = min(int(games * 1.5), args.max_games)
+                    stale = 0
+                    note(f"plateau -> ESCALATE search to horizon {horizon}, games {games}")
+                else:
+                    note(f"stop: plateaued at max search depth "
+                         f"(horizon {horizon}, games {games})"); break
 
-    note(f"\n=== done. best net -> {args.out_dir/'best.npz'} (base lineage: {Path(base).name}) ===")
+    note(f"\n=== done round {r}. best net -> {best} ===")
 
 
 if __name__ == "__main__":
