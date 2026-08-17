@@ -40,7 +40,9 @@ def _run(cmd: list[str], log) -> str:
     p = subprocess.run(cmd, capture_output=True, text=True)
     log.write(p.stdout); log.write(p.stderr); log.flush()
     if p.returncode:
-        raise SystemExit(f"command failed ({p.returncode}): {' '.join(cmd[:4])}...")
+        # RuntimeError (not SystemExit) so the per-round try/except catches it
+        # and skips the round instead of killing the whole loop.
+        raise RuntimeError(f"command failed ({p.returncode}): {' '.join(cmd[:5])}")
     return p.stdout + p.stderr
 
 

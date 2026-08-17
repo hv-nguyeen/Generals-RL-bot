@@ -34,7 +34,10 @@ from bot.policy.net import ClonePolicy, Net
 from learn.netoracle import _counterfactual_score
 from sim import engine, mapgen
 
-SHARD = 200_000
+# Small shards on purpose: train.py holds out 3 whole shards for validation, so
+# a round needs >=4. At ~350 examples/game one round of a few hundred games must
+# still write several shards, or the distil errors with "cannot hold 3 out".
+SHARD = 30_000
 _CTX: dict = {}
 
 
