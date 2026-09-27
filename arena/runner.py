@@ -1,8 +1,8 @@
 """Headless match runner.
 
-Plays agents in-process against the numpy mirror — no subprocesses, no string
-encoding — which is roughly two orders of magnitude faster than the starter
-kit's `matchup.py` and is what makes SPRT-gated iteration practical.
+Plays agents in-process against the numpy mirror — no subprocesses or string
+encoding. Paired, fixed-sample evaluation makes repeated local comparisons
+practical.
 
 Every seed is played twice with the colours swapped, so a result can never be an
 artifact of who moved first or which spawn was better.

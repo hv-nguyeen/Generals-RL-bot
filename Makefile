@@ -1,4 +1,5 @@
 PY := .venv/bin/python
+PYTHON ?= python3
 WORKERS ?= $(shell (nproc 2>/dev/null || sysctl -n hw.ncpu) | awk '{print ($$1>2)?$$1-2:1}')
 OUT ?= runs/tune-big
 GROUPS ?= opening,castle,combat
@@ -15,11 +16,12 @@ setup:  ## create the venv and install deps (uv if present, else stdlib venv)
 	@if command -v uv >/dev/null 2>&1; then \
 	  uv venv --python 3.12 .venv && uv pip install --python $(PY) -e .; \
 	else \
-	  python3 -m venv .venv && $(PY) -m pip install -q --upgrade pip && $(PY) -m pip install -q -e .; \
+	  $(PYTHON) -c 'import sys; assert sys.version_info >= (3, 12), "Python 3.12+ required"' && \
+	  $(PYTHON) -m venv .venv && $(PY) -m pip install -q --upgrade pip && $(PY) -m pip install -q -e .; \
 	fi
 	@$(PY) -c "import sys,numpy;print('python',sys.version.split()[0],'numpy',numpy.__version__)"
 
-setup-cpu: setup  ## install the CPU JAX stack for local training and verification
+setup-cpu: setup  ## install the CPU JAX stack for tests, training, and verification
 	@if command -v uv >/dev/null 2>&1; then \
 	  uv pip install --python $(PY) -e '.[verify]'; \
 	else \
@@ -27,7 +29,7 @@ setup-cpu: setup  ## install the CPU JAX stack for local training and verificati
 	fi
 	@$(PY) -c "import jax;print('jax',jax.__version__,jax.devices())"
 
-test:  ## rule and belief tests
+test:  ## rule, policy, and training-seam tests (requires setup-cpu)
 	$(PY) -m tests.test_all
 
 verify:  ## official-engine differential + stateless/temporal encoder parity

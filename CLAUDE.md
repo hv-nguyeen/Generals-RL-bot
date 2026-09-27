@@ -1,15 +1,15 @@
 # generals.bot competition bot
 
 Read `README.md` first and then
-`docs/CURRENT-STATUS-2026-08-11.md` for the live operational state.
+`docs/CURRENT-STATUS-2026-08-11.md` for the archived August 2026 operational state.
 `docs/superpowers/specs/2026-08-03-generals-bot-design.md` contains the rules
 analysis. `third_party/generals-bots` is the official starter kit — it is the
 ground truth for every rule; read the engine source, not the rules page.
 
-**Start with `docs/CURRENT-STATUS-2026-08-11.md`**, then
-`docs/TOP3-V2-HANDOFF.md` for implementation gates and `docs/STATE.md` for
-the measured history and non-starters. `docs/CLUSTER.md` is how to install
-and run on the VU box.
+For the historical training setup, start with
+`docs/CURRENT-STATUS-2026-08-11.md`, then `docs/TOP3-V2-HANDOFF.md` for
+implementation gates and `docs/STATE.md` for measured history and non-starters.
+`docs/CLUSTER.md` records the original VU cluster setup.
 
 Three things that cost the most time when forgotten:
 
@@ -49,15 +49,15 @@ reason. The log exists so none of them gets tried a seventh time.
 `bot/memory.py` is the neural temporal state, while `bot/belief.py` remains the
 richer heuristic belief. `tools.evaluate.py` owns promotion.
 
-## Current training split
+## Training split recorded in August 2026
 
-The accepted local champion is
+The accepted local champion at that date was
 `/local/data/vng205/top3-v3/selfplay-stage4-1000-node1/selfplay.npz` with its
 matched critic (policy SHA-256
 `3b3b707fc064635ae0448f021e0e0bef8136d963369b09caffe0c1aed637c028`). The
-active arm grows that pair function-preservingly to 8x64 and trains from stage 4
-for 1,500 iterations with 256 games per iteration. It is a capacity experiment,
-not a replacement yet.
+experiment at that date grew that pair function-preservingly to 8x64 and trained from stage 4
+for 1,500 iterations with 256 games per iteration. It was a capacity experiment,
+not an accepted replacement.
 
 `learn.selfplay --opp` is evaluation-only; the training seats are mirror
 self-play. `learn.league --oracle net` is the separate adversarial-mixture arm

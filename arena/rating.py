@@ -1,9 +1,8 @@
-"""Elo and SPRT.
+"""Elo estimates and tests for match results.
 
-The point of this module is to stop us celebrating noise. A heuristic tweak that
-"looks better over 40 games" is usually nothing: the standard error on a 40-game
-match is around 80 Elo. `sprt` answers the only question that matters — is B at
-least `elo1` better than A — and tells you to keep playing when it cannot decide.
+Current evaluations use fixed-sample intervals over paired boards; both seats
+on one board form a single independent observation. Legacy SPRT helpers remain
+for older callers, but they must not be used to label paired results.
 """
 
 from __future__ import annotations
